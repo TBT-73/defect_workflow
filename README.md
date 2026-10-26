@@ -17,9 +17,11 @@ Two more files go in the same directory:
 
 - `dwf_core.py`: the code the five scripts share: the project file, checkpoints, the CASTEP job
   runner interface, structures, parsers, MACE. It is not run on its own.
-- `supercell_convergence.py`: the job runner. Every CASTEP job of every phase goes through its
-  batch mode (dry runs, layouts, walltimes, restarts), and phase B runs its size series. See its
-  own `README.md`.
+- `supercell_convergence.py`: the job runner (dry runs, layouts, walltimes, restarts). Every
+  CASTEP job goes through it: the B3 size series in its usual mode, which builds its own cells,
+  and every other step in its batch mode, which runs the structures the scripts build. See
+  [How the scripts use supercell_convergence.py](#how-the-scripts-use-supercell_convergencepy)
+  and its own `README.md`.
 
 Each script has its own README: `README_dwf_core.md`, `README_dwf_host.md`,
 `README_dwf_candidates.md`, `README_dwf_screen.md`, `README_dwf_production.md`,
@@ -31,13 +33,14 @@ Each script has its own README: `README_dwf_core.md`, `README_dwf_host.md`,
 
 1. [Requirements](#requirements)
 2. [Quick start](#quick-start)
-3. [The project file](#the-project-file)
-4. [Checkpoints, stopping and rerunning](#checkpoints-stopping-and-rerunning)
-5. [Command line](#command-line)
-6. [The work directory](#the-work-directory)
-7. [Flowchart steps and files](#flowchart-steps-and-files)
-8. [Keyword reference](#keyword-reference)
-9. [Testing so far, and what to check first](#testing-so-far-and-what-to-check-first)
+3. [How the scripts use supercell_convergence.py](#how-the-scripts-use-supercell_convergencepy)
+4. [The project file](#the-project-file)
+5. [Checkpoints, stopping and rerunning](#checkpoints-stopping-and-rerunning)
+6. [Command line](#command-line)
+7. [The work directory](#the-work-directory)
+8. [Flowchart steps and files](#flowchart-steps-and-files)
+9. [Keyword reference](#keyword-reference)
+10. [Testing so far, and what to check first](#testing-so-far-and-what-to-check-first)
 
 ---
 
@@ -88,6 +91,40 @@ earlier phase hasn't finished, so the chain stops at the first problem.
 
 The scripts wait for their jobs (polling every `poll` seconds), so run them with `nohup` or in
 `tmux`/`screen`. MACE runs where the script runs (the login node): keep `mace_threads` modest.
+
+---
+
+## How the scripts use supercell_convergence.py
+
+The workflow uses `supercell_convergence.py` in two ways, and only one of them builds supercells:
+
+| | Batch mode | Size series (its usual mode) |
+|---|---|---|
+| Used by | every CASTEP step except B3: A1–A3, C2, C5, C6, D1 | B3 only |
+| Builds the structures | the `dwf_*.py` scripts (`dwf_core.build_defect`, `host_supercell`); the runner only runs them | `supercell_convergence.py` itself, from the defect tokens B3 writes into `B_candidates/series/series.conv` |
+| Used later | each job's energy, spin and final structure | the cell size (B5) and, with `finetune : true`, the steps of its smallest relaxation as MACE training data (B4) |
+
+So every structure that is screened (C) or relaxed for production (D) comes from one builder,
+`dwf_core.build_defect`. The size series is a check on the cell size: none of its relaxed
+structures or energies is used in C or D.
+
+The two builders make the same cells because they share the code: `dwf_core.build_defect` calls
+the runner's own `build_supercell`, `anchor_site` and `translation_copies`. Both build
+n × `transform` of the relaxed host (A2.1) and centre the defect the same way, and the tokens B3
+writes name the primitive-cell site each component sits on, so the series has the same
+arrangement as B2 and C1.
+
+They can differ in one way: the orientation of a complex. The series chooses the direction from
+the first component to each of the others by its own rule (the first nearest site of that kind
+it finds), so its complex can be a rotated, symmetry-equivalent copy of the one B2 and C1 use.
+That is the same calculation in an n × n × n supercell of the primitive cell, and with a
+`transform` that keeps the host's symmetry (such as the cubic cells in the example). Only a
+supercell shape that breaks the host's symmetry (an elongated `transform`, say) makes the two
+orientations see their periodic images differently; B3's E_f*(n) can then differ slightly from
+that of the same defect in the C and D cells.
+
+On its own, outside the workflow, `supercell_convergence.py` is the size-series tool described in
+its `README.md`.
 
 ---
 

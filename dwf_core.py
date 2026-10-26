@@ -33,17 +33,20 @@ with a fingerprint of everything it used (its settings, the files it read and th
 results of the steps before it), and is skipped when the script is run again. So a
 script can be stopped at any point (Ctrl-C, the STOP file, --no-wait, a crash) and
 rerun with the same command: finished steps are skipped and a step that was part-way
-through carries on, because its CASTEP jobs are run by supercell_convergence.py's batch
-mode, which picks up submitted and finished jobs rather than repeating them.
+through carries on, because its CASTEP jobs are run by supercell_convergence.py, which
+picks up submitted and finished jobs rather than repeating them.
 If you change a setting, the steps that use it (and the steps after them) run again;
 jobs whose inputs did not change are reused, and a job that already ran with other
 inputs stops the script, so results from two sets of settings are never mixed. Start
 a step again from scratch with --redo STEP (its old directory is kept, renamed).
 
 All CASTEP jobs go through supercell_convergence.py (which must be in the same
-directory as these scripts): its runner settings (jobscript, partitions, cores_per_node,
-max_nodes, walltime, max_restarts, ...) go in the project file too, and
-%block runner_<group> changes them for one group of steps (host, screen, production).
+directory as these scripts): the B3 size series is a normal size-series run, which builds
+its own cells, and every other step uses its batch mode, which runs the structures the
+scripts build (build_defect uses the same supercell and centring code, so the cells
+match). Its runner settings (jobscript, partitions, cores_per_node, max_nodes, walltime,
+max_restarts, ...) go in the project file too, and %block runner_<group> changes them for
+one group of steps (host, series, screen, production).
 """
 
 import argparse

@@ -107,7 +107,8 @@ Every defect cell of the workflow (B2, B3, C1) is built the same way:
    makes identical to it, such as all four Ca of a conventional rocksalt cell), the one that
    puts the mean position of the components nearest the centre; ties go to the one whose
    farthest component is nearest the centre;
-3. the complex is only ever moved, never turned, so it is identical in every cell size.
+3. the complex is only ever moved, never turned, so it is identical in every cell size (B3's
+   size series picks its own orientation, the same at every size: see [B3 series](#b3-series)).
 
 `supercell_convergence.py` prints the distance between the defect's centre and the cell centre
 for each size in its size table (`off-centre/A`). It is not always zero: a defect can only sit
@@ -145,6 +146,15 @@ writes its input, `series.conv`, from the project:
 - `series_charge`, with `charge_correction` and the A2.3 dielectric constant if it is not 0;
 - with `mace : true`, `prerelax : mace` and the project's MACE settings;
 - the runner settings: the project's runner keywords and `%block runner_series`.
+
+This is the only step in which `supercell_convergence.py` builds its own defect cells; every
+other CASTEP step runs structures the scripts build. They are the same cells as B2 and C1 use:
+the same relaxed host, `transform` and centring, and the tokens name the primitive-cell site each
+component sits on. The complex can be a rotated, symmetry-equivalent copy of the candidate's,
+because the series picks the direction to the nearest site of each kind by its own rule. That is
+the same calculation unless the supercell shape breaks the host's symmetry (see "How the scripts
+use supercell_convergence.py" in `README_workflow.md`). Only the chosen size and B4's training
+data are used later; the series' structures and energies are not.
 
 A charged or odd-electron defect runs with `spin_polarized : true` and a starting spin (the
 lowest its electron count allows, also put on the first component as `@s`); a neutral

@@ -106,6 +106,12 @@ text, and the project's STOP file. Each job is a dict (`name`, `atoms`, `kind` g
 comment in `supercell_convergence.py`. It returns `{'complete', 'jobs', 'calcs'}`; a step returns
 `None` while `complete` is false.
 
+In batch mode the runner builds no structures: each job runs the Atoms it is given. Defect cells
+come from `build_defect`, which uses the runner's own `build_supercell`, `anchor_site` and
+`translation_copies`, so they are the same cells as the B3 size series, the one step where
+`supercell_convergence.py` builds its own (see "How the scripts use supercell_convergence.py" in
+`README_workflow.md`).
+
 `Project.production_param()` is A1's `production.param` once A1 has finished (the project's
 `.param` before). `Project.kspacing()` is A1's spacing, else `kspacing`, else the spacing of the
 host `.cell`'s grid.

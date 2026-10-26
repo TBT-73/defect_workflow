@@ -159,8 +159,9 @@ start which node it runs on.
 Batch mode
 ----------
 The same machinery can run any list of CASTEP calculations instead of a size series.
-The defect-workflow scripts (dwf_*.py) use it for every CASTEP step, and you can use it
-directly:
+It runs the structures it is given and builds no supercells of its own. The
+defect-workflow scripts (dwf_*.py) use it for every CASTEP step except their size series
+(B3, a normal size-series run), and you can use it directly:
 
     python3 supercell_convergence.py --batch jobs.batch
 
