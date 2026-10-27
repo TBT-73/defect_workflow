@@ -1,5 +1,4 @@
-# Defect workflow project file    run:  python3 dwf_host.py <name>, then dwf_candidates.py,
-#                                       dwf_screen.py, dwf_production.py, dwf_thermo.py
+# Defect workflow project file    run:  nohup python3 dwf.py <this file> > run.log 2>&1 &
 # Written like a CASTEP .param/.cell file: "keyword : value", %block ... %endblock, keywords
 # in any case, # or ! starts a comment. Lines starting with ! are optional settings with an
 # example value: delete the ! to use one. File names are relative to this file: the example
@@ -7,8 +6,8 @@
 
 # ======================================================================= general
 host_cell : CaO_prim.cell      # host primitive cell: species_pot, symmetry_generate, k-points
-param     : CaO.param          # production settings (functional, cut-off, ...); the scripts
-                               #   set task, charge and spin, and A1 sets cut_off_energy
+param     : CaO.param          # production settings (functional, cut-off, ...); dwf.py
+                               #   sets task, charge and spin, and A1 sets cut_off_energy
 !workdir  : dwf_CaO_Sb         # where everything goes (default dwf_<file name>)
 # Supercell shape: size n uses n x transform x (primitive cell). This one gives cubic cells
 # (8 n^3 atoms) from an FCC primitive cell; leave it out for n x n x n primitive cells.
@@ -27,16 +26,17 @@ mace        : true             # MACE for the size scan (B2) and pre-relaxations
 # How the CASTEP jobs run: any supercell_convergence.py runner keyword (see its --example).
 jobscript      : archer2.sh    # template with {SEED} and {NODES}/{TASKS_PER_NODE} or {NCORES}
 cores_per_node : 128
-max_nodes      : 4
+max_nodes      : 12            # most nodes per job (fewer for screening: runner_screen)
 %block partitions
-standard   1.9
-highmem    3.9    --qos=highmem
+standard   2   --qos=standard
+highmem    4   --qos=highmem
 %endblock partitions
-dryrun_partition : serial
-dryrun_time      : 0:20:0
-max_jobs  : 16                 # most jobs queued at once (ARCHER2 standard QoS: 16 running)
+dryrun_on  : login             # dry runs where dwf.py runs (not ARCHER2's shared serial
+dryrun_cmd : castep.serial --dryrun {seed}   #  partition, which rejects whole-node jobs)
+max_jobs  : 16                 # most jobs of one step queued at once
+max_restarts : 20              # a relaxation that runs out of time carries on this many times
 poll      : 300
-delete_check : true
+delete_check : true            # delete each .check once its calculation has finished
 # ... and for one group of steps (host, series, screen, production) only:
 %block runner_screen
 max_nodes    : 1               # Gamma-only screening jobs are small

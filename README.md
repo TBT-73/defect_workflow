@@ -1,61 +1,81 @@
-# Defect workflow scripts (dwf_*.py)
+# Defect workflow (dwf.py)
 
-Five scripts run the defect screening pipeline from a relaxed host to formation energies and
-transition levels, one script per phase of the flowchart (`defect_workflow_flowchart_A1.pdf`).
-This README covers the whole workflow; each script also has its own (below), and
-`example_CaO_Sb/` is a complete example project ([Quick start](#quick-start)).
+`dwf.py` runs the defect workflow of the flowchart (`defect_workflow_flowchart_A1.pdf`), phases
+A to E, with one command: from a host crystal and its dopants to formation energies, transition
+levels and a short list of defects for the optical calculations (phase F, not scripted yet).
 
-| Phase | Script | What it does |
-|---|---|---|
-| A | `dwf_host.py` | converge cut-off and k-points, relax the host, band edges, dielectric constant, competing phases, chemical-potential limits |
-| B | `dwf_candidates.py` | candidate defects (yours, or generated), MACE size scan, CASTEP size series, MACE fine-tuning data, choice of supercell |
-| C | `dwf_screen.py` | MACE pre-relaxation, cheap CASTEP screen of every candidate, defect hull and property filters, ZPL filter, ShakeNBreak distortions, ranking |
-| D | `dwf_production.py` | production relaxations of the survivors in each charge state |
-| E | `dwf_thermo.py` | finite-size corrections, formation energies, transition levels, Fermi level, which defects go on to phase F |
+Two files go in one directory:
 
-Phase F (optical lineshapes) is not scripted yet.
+- `dwf.py`: the workflow;
+- `supercell_convergence.py`: runs the CASTEP jobs (dry runs, node layouts, walltimes,
+  restarts). It has its own README, `README_supercell_convergence.md`.
 
-Two more files go in the same directory:
-
-- `dwf_core.py`: the code the five scripts share: the project file, checkpoints, the CASTEP job
-  runner interface, structures, parsers, MACE. It is not run on its own.
-- `supercell_convergence.py`: the job runner (dry runs, layouts, walltimes, restarts). Every
-  CASTEP job goes through it: the B3 size series in its usual mode, which builds its own cells,
-  and every other step in its batch mode, which runs the structures the scripts build. See
-  [How the scripts use supercell_convergence.py](#how-the-scripts-use-supercell_convergencepy)
-  and its own README, `README_supercell_convergence.md`.
-
-Each script has its own README: `README_dwf_core.md`, `README_dwf_host.md`,
-`README_dwf_candidates.md`, `README_dwf_screen.md`, `README_dwf_production.md`,
-`README_dwf_thermo.md`, and `README_supercell_convergence.md` for the job runner.
+`example_CaO_Sb/` is a complete example project.
 
 ---
 
 ## Contents
 
-1. [Requirements](#requirements)
-2. [Quick start](#quick-start)
-3. [How the scripts use supercell_convergence.py](#how-the-scripts-use-supercell_convergencepy)
-4. [The project file](#the-project-file)
-5. [Checkpoints, stopping and rerunning](#checkpoints-stopping-and-rerunning)
-6. [Command line](#command-line)
-7. [The work directory](#the-work-directory)
-8. [Flowchart steps and files](#flowchart-steps-and-files)
-9. [Keyword glossary](#keyword-glossary)
-10. [Testing so far, and what to check first](#testing-so-far-and-what-to-check-first)
+1. [Quick start](#quick-start)
+2. [Requirements](#requirements)
+3. [How a run works](#how-a-run-works)
+4. [Command line](#command-line)
+5. [Files](#files)
+6. [The phases](#the-phases)
+7. [Keyword glossary](#keyword-glossary)
+8. [Testing so far, and what to check first](#testing-so-far-and-what-to-check-first)
+
+---
+
+## Quick start
+
+With `DWF` the directory that holds `dwf.py` and `supercell_convergence.py`:
+
+```bash
+cd example_CaO_Sb
+python3 $DWF/dwf.py CaO_Sb.dwf --prepare-only     # write the first jobs' inputs, submit nothing
+nohup python3 $DWF/dwf.py CaO_Sb.dwf > run.log 2>&1 &
+python3 $DWF/dwf.py CaO_Sb.dwf --status           # which steps have finished
+```
+
+The run goes through every step, A1 to E3, and waits for its CASTEP jobs, so run it with
+`nohup` (or in `tmux`/`screen`). If it stops for any reason, the same command carries on where
+it stopped. Each phase's `summary.txt` shows its results as it goes, and
+`E_thermo/summary.txt` has the formation energies and transition levels at the end.
+
+The first time, stop after phase B (`--until B`) and read the candidate list in
+`B_candidates/summary.txt` before the screening: each candidate costs about
+2 × (number of `screen_charges`) screening runs.
+
+The example folder holds the project file and every file it names:
+
+| File | What it is |
+|---|---|
+| `CaO_Sb.dwf` | the project file, annotated (the same as `python3 dwf.py --example`) |
+| `CaO_prim.cell` | the host primitive cell (rocksalt, a = 4.8105 Å); A2.1 relaxes it |
+| `CaO.param` | production settings (PBE; A1 sets the cut-off) |
+| `archer2.sh` | jobscript template |
+| `CaO_ncp.cell`, `CaO_ncp.param` | the DFPT dielectric run (A2.3): norm-conserving potentials, fixed occupancies |
+| `Ca.cell`, `O2.cell`, `Sb.cell`, `Sb2O3.cell` | competing phases (A3): fcc Ca, O₂ in a box, A7 Sb, senarmontite Sb₂O₃, near their experimental structures |
+
+Before running it, check: the account and CASTEP module in `archer2.sh`; the pseudopotentials
+(`CaO_prim.cell` has no `species_pot`, so CASTEP uses its default on-the-fly ones); the cut-off
+in `CaO_ncp.param`; and the competing phases (add any other that could limit Sb).
+
+For a project of your own, `python3 dwf.py --example > <name>.dwf` prints the annotated project
+file to start from.
 
 ---
 
 ## Requirements
 
-- Python 3.9+ with `numpy` and `ase` (all phases);
+- Python 3.9+ with `numpy` and `ase`;
 - `spglib` (B1: symmetry), `pymatgen` (A3 limits, C3/C6 structure matching, the oxidation-state
   guess in C4), `shakenbreak` (C4), `matplotlib` (E2 plot);
 - `mace-torch` for the MACE steps (B2, the B3 pre-relaxation, C1), or set `mace : false`;
 - optional: `pymatgen-analysis-defects` for Voronoi interstitials, `doped` and a Materials
   Project API key for `phases_from : doped`;
-- CASTEP and Slurm (other schedulers through `submit_cmd` / `status_cmd`, as in
-  `supercell_convergence.py`).
+- CASTEP and Slurm (other schedulers through `submit_cmd` / `status_cmd`).
 
 On ARCHER2:
 
@@ -65,251 +85,404 @@ python -m venv ~/dwfenv && source ~/dwfenv/bin/activate
 pip install ase spglib pymatgen shakenbreak matplotlib mace-torch
 ```
 
-All seven `.py` files go in one directory; run the scripts from anywhere.
+MACE runs where `dwf.py` runs (usually a login node): keep `mace_threads` modest.
 
 ---
 
-## Quick start
+## How a run works
 
-`input_files/` is a complete set of example input files for the antimony vacancy complex in CaO run on Archer 2:
+**Order.** The steps run in order, A1 to E3 ([The phases](#the-phases) lists them). Each step
+uses the results of the steps before it, so a step only starts once those have finished.
 
-| File | What it is |
-|---|---|
-| `CaO_Sb.dwf` | the project file, annotated (the same as `python3 dwf_host.py --example`) |
-| `CaO_prim.cell` | the host primitive cell (rocksalt, a = 4.8105 Å); A2.1 relaxes it |
-| `CaO.param` | production settings (PBE; A1 sets the cut-off) |
-| `archer2.sh` | jobscript template |
-| `CaO_ncp.cell`, `CaO_ncp.param` | the DFPT dielectric run (A2.3): norm-conserving potentials, fixed occupancies |
-| `Ca.cell`, `O2.cell`, `Sb.cell`, `Sb2O3.cell` | competing phases (A3): fcc Ca, O₂ in a box, A7 Sb, senarmontite Sb₂O₃, near their experimental structures (A3.1 relaxes them) |
-
-Before running it, check: the account and CASTEP module in `archer2.sh`; the pseudopotentials
-(`CaO_prim.cell` has no `species_pot`, so CASTEP uses its default on-the-fly ones); the cut-off
-in `CaO_ncp.param`; and the competing phases (add any other that could limit Sb). Then, with
-`DWF` the directory holding the seven `.py` files:
-
-```bash
-cd example_CaO_Sb
-python3 $DWF/dwf_host.py CaO_Sb.dwf --prepare-only   # check the first inputs, submit nothing
-nohup python3 $DWF/dwf_host.py CaO_Sb.dwf > A.log 2>&1 &
-```
-
-then, each when the one before has finished:
-
-```bash
-nohup python3 $DWF/dwf_candidates.py CaO_Sb.dwf > B.log 2>&1 &
-nohup python3 $DWF/dwf_screen.py     CaO_Sb.dwf > C.log 2>&1 &
-nohup python3 $DWF/dwf_production.py CaO_Sb.dwf > D.log 2>&1 &
-python3 $DWF/dwf_thermo.py CaO_Sb.dwf                 # quick: no CASTEP jobs
-```
-
-or all in one go: `nohup sh -c "python3 $DWF/dwf_host.py CaO_Sb && python3
-$DWF/dwf_candidates.py CaO_Sb && python3 $DWF/dwf_screen.py CaO_Sb && python3
-$DWF/dwf_production.py CaO_Sb && python3 $DWF/dwf_thermo.py CaO_Sb" > run.log 2>&1 &`. Each
-script exits with an error if the step it needs from an earlier phase hasn't finished, so the
-chain stops at the first problem.
-
-For a new project, `python3 $DWF/dwf_host.py --example > <name>.dwf` prints the annotated
-project file to start from; it names the same input files.
-
-The scripts wait for their jobs (polling every `poll` seconds), so run them with `nohup` or in
-`tmux`/`screen`. MACE runs where the script runs (the login node): keep `mace_threads` modest.
-
----
-
-## How the scripts use supercell_convergence.py
-
-The workflow uses `supercell_convergence.py` in two ways, and only one of them builds supercells:
-
-| | Batch mode | Size series (its usual mode) |
-|---|---|---|
-| Used by | every CASTEP step except B3: A1–A3, C2, C5, C6, D1 | B3 only |
-| Builds the structures | the `dwf_*.py` scripts (`dwf_core.build_defect`, `host_supercell`); the runner only runs them | `supercell_convergence.py` itself, from the defect tokens B3 writes into `B_candidates/series/series.conv` |
-| Used later | each job's energy, spin and final structure | the cell size (B5) and, with `finetune : true`, the steps of its smallest relaxation as MACE training data (B4) |
-
-So every structure that is screened (C) or relaxed for production (D) comes from one builder,
-`dwf_core.build_defect`. The size series is a check on the cell size: none of its relaxed
-structures or energies is used in C or D.
-
-The two builders make the same cells because they share the code: `dwf_core.build_defect` calls
-the runner's own `build_supercell`, `anchor_site` and `translation_copies`. Both build
-n × `transform` of the relaxed host (A2.1) and centre the defect the same way, and the tokens B3
-writes name the primitive-cell site each component sits on, so the series has the same
-arrangement as B2 and C1.
-
-They can differ in one way: the orientation of a complex. The series chooses the direction from
-the first component to each of the others by its own rule (the first nearest site of that kind
-it finds), so its complex can be a rotated, symmetry-equivalent copy of the one B2 and C1 use.
-That is the same calculation in an n × n × n supercell of the primitive cell, and with a
-`transform` that keeps the host's symmetry (such as the cubic cells in the example). Only a
-supercell shape that breaks the host's symmetry (an elongated `transform`, say) makes the two
-orientations see their periodic images differently; B3's E_f*(n) can then differ slightly from
-that of the same defect in the C and D cells.
-
-On its own, outside the workflow, `supercell_convergence.py` is the size-series tool described in
-`README_supercell_convergence.md`.
-
----
-
-## The project file
-
-One file, `<name>.dwf`, holds everything, written like a CASTEP `.param` file:
-`keyword : value`, `%block name … %endblock name`, any case, `#` or `!` comments. File names
-are relative to it. A misspelt keyword is rejected with the closest match suggested.
-
-It has three kinds of setting:
-
-1. **Project keywords** for each phase, e.g. `dopants`, `screen_charges`, `hull_margin`
-   ([Keyword glossary](#keyword-glossary)).
-2. **Runner keywords**: any `supercell_convergence.py` keyword that controls how jobs run
-   (`jobscript`, `cores_per_node`, `max_nodes`, `%block partitions`, `walltime`,
-   `max_restarts`, `delete_check`, `dryrun_*`, `poll`, `max_jobs`, `tolerate_failures`, ...).
-3. **Runner overrides** for one group of steps, in `%block runner_<group>` with group `host`
-   (phase A), `series` (B3), `screen` (C2, C5, C6) or `production` (D1). Inside, runner keywords
-   only:
-
-   ```
-   %block runner_screen
-   max_nodes : 1          # Gamma-only screening jobs are small
-   %endblock runner_screen
-   ```
-
-   Screening defaults to `max_restarts : 0` and `tolerate_failures : true` (a run that fails is
-   flagged, not rescued); production defaults to `tolerate_failures : true`. A runner block
-   overrides those defaults.
-
-Your `.param` holds the production settings (functional, cut-off, SCF settings, smearing,
-`geom_preconditioner`, ...). The scripts set `task`, and per job `charge`, `spin`,
-`spin_polarized` and the k-points; A1 sets `cut_off_energy`. Any `charge` or `spin` in it is
-left out of the production `.param` (A1 says so). Your host `.cell` gives `species_pot` (list
-the dopants' potentials too), `symmetry_generate` and anything else every job copies.
-
-Every defect cell is built with the defect as close to the cell centre as it can be: the mean
-position of its components nearest the centre, with the complex in the same orientation in every
-cell (see `README_dwf_candidates.md`).
-
----
-
-## Checkpoints, stopping and rerunning
-
-Each phase is a list of steps. When a step finishes, `<workdir>/state.json` records it with a
+**Checkpoints.** When a step finishes, `state.json` in the work directory records it with a
 fingerprint of everything it used: its settings (as written in the project file), the files it
-read, and the outputs (and output files) of the steps it needs.
+read and the results of the steps it needs. A finished step with the same fingerprint is
+skipped the next time.
 
-- **Rerun after any stop** (Ctrl-C, `touch <workdir>/STOP`, `--no-wait`, a crash, a lost
-  login session): finished steps are skipped; a step that was part-way through carries on,
-  because the job runner picks up submitted and finished jobs instead of repeating them.
-- **Change a setting:** the steps that use it, and the steps after them, run again. CASTEP jobs
-  whose own inputs did not change are reused, so e.g. raising `hull_margin` re-runs C3 onwards
-  and only submits the jobs for the extra survivors. A job that already ran with different
-  inputs stops the script, so results from two sets of settings never mix: start that step
-  again with `--redo STEP` (or keep the old results with `--force`).
-- **`--redo STEP`** moves the step's files aside (`<name>.old-<time>`, delete them when you no
-  longer need them) and runs it from scratch.
-- **`--status`** lists every step of every phase that has run, when, and its one-line result.
-- **`--no-wait`** submits what is needed and exits; run it from cron (or by hand) until the
-  phase reports done.
+**Stopping and carrying on.** Ctrl-C, `touch <workdir>/STOP`, `--no-wait`, a crash or a lost
+login session: run the same command again. Finished steps are skipped and a step that was
+part-way through carries on: submitted jobs keep running, and finished ones are picked up rather
+than repeated.
+
+**Changing a setting.** The steps that use it run again the next time, and the steps after them
+too if their results change. CASTEP jobs whose own inputs have not changed are reused, so e.g.
+raising `hull_margin` re-runs C3 onwards and submits only the jobs of the extra survivors. A job
+that already ran with different inputs stops the run, so results from two sets of settings never
+mix: start that step again with `--redo STEP` (its old folders are kept, renamed
+`<name>.old-<time>`), or keep the old results with `--force`.
+
+**The CASTEP jobs** all go through `supercell_convergence.py`, which plans each job (dry run,
+nodes, memory, walltime), submits it, waits and restarts a relaxation that runs out of time.
+Every step uses its batch mode, which runs the structures `dwf.py` builds, except the B3 size
+series: that is a normal `supercell_convergence.py` size series, which builds its own cells (the
+same cells as the rest of the workflow, see [B3](#phase-b-candidate-defects-and-cell-size)).
+Only the size it chooses, and its relaxation as B4's training data, are used later.
+
+**Runner groups.** The jobs of each group of steps run with the project's runner settings
+([Runner settings](#runner-settings)), changed by these defaults and then by
+`%block runner_<group>` in the project file:
+
+| Group | Steps | Defaults that differ |
+|---|---|---|
+| `host` | A1–A3 | — |
+| `series` | B3 | (`max_jobs` and `tolerate_failures` don't apply) |
+| `screen` | C2, C5, C6 | `max_restarts : 0`, `tolerate_failures : true` (a run that fails is flagged, not rescued) |
+| `production` | D1 | `tolerate_failures : true` |
 
 ---
 
 ## Command line
 
-The same for every phase script:
-
 ```
-python3 dwf_<phase>.py <project>.dwf [STEP ...] [--redo STEP] [--status] [--example]
-                       [--prepare-only] [--no-wait] [--resubmit-failed] [--force]
+python3 dwf.py <project>.dwf [STEP ...] [--until STEP] [--redo STEP] [--status] [--example]
+                             [--prepare-only] [--no-wait] [--resubmit-failed] [--force]
 ```
 
 | Option | Effect |
 |---|---|
-| `STEP ...` | run only these steps, by name or label (`relax`, `A2.1`); default all of the phase |
-| `--redo STEP` | start that step again from scratch (can be repeated) |
-| `--status` | show which steps have finished |
+| `STEP ...` | run only these steps: names (`relax`), labels (`A2.1`) or phase letters (`C`); default all |
+| `--until STEP` | stop after this step or phase (`--until B`) |
+| `--redo STEP` | start this step again from scratch (can be repeated) |
+| `--status` | list every step: finished (when, and its one-line result), still running, or not run |
 | `--example` | print the annotated project file |
-| `--prepare-only` | write the inputs of the next CASTEP jobs (with dry runs), submit nothing |
-| `--no-wait` | submit what is needed and exit; rerun later |
+| `--prepare-only` | write the inputs of the next CASTEP jobs (with their dry runs), submit nothing |
+| `--no-wait` | submit what is needed and exit; run it again later to carry on |
 | `--resubmit-failed` | start failed CASTEP jobs again |
 | `--force` | keep the results of jobs whose inputs have changed |
 
-The project can be given as `CaO_Sb.dwf` or `CaO_Sb`.
+The project can be given as `CaO_Sb.dwf` or `CaO_Sb`. For example:
+
+```bash
+python3 dwf.py CaO_Sb B1            # just the candidate list (quick), to check it
+python3 dwf.py CaO_Sb --until B     # phases A and B, then stop
+python3 dwf.py CaO_Sb E             # phase E again, e.g. after changing gap
+python3 dwf.py CaO_Sb --redo filter # C3 from scratch, then whatever its results change
+```
 
 ---
 
-## The work directory
+## Files
 
-`dwf_<name>/` next to the project file (or `workdir`):
+### What you give it
+
+| File | Named by | Used for |
+|---|---|---|
+| project file `<name>.dwf` | the command line | every setting ([glossary](#1-the-project-file-namedwf)) |
+| production `.param` | `param` | the settings of every CASTEP job ([2](#2-the-production-param-param)) |
+| host `.cell` | `host_cell` | the host structure, and `species_pot` etc. for every job ([3](#3-the-host-cell-host_cell)) |
+| dielectric `.param` and `.cell` | `dielectric_param`, `dielectric_cell` | the A2.3 DFPT run (optional, [4](#4-the-dielectric-param-and-cell-dielectric_param-dielectric_cell)) |
+| competing-phase structures | `%block phases` | A3 ([5](#5-competing-phase-structure-files-block-phases)) |
+| jobscript template | `jobscript` | every CASTEP job ([6](#6-the-jobscript-template-jobscript)) |
+
+File names are relative to the project file.
+
+### What it writes
+
+Everything goes in the work directory, `dwf_<name>/` next to the project file (`workdir`
+changes it):
 
 ```
 dwf_CaO_Sb/
-  state.json              checkpoints
-  STOP                    touch it to stop the running script
-  A_host/                 converge/ relax/ bands/ dielectric/ phases/ (job directories),
-                          production.param, host_relaxed.json/.cell, converge.txt, limits.txt
-  B_candidates/           candidates.json/.txt, scan/, scan.txt, series/ (size series),
-                          finetune/
-  C_screen/               structures/, screen/, screen.json, filter.json/.txt, zpl.json/.txt,
-                          distortions/, drelax/, drelax.json, share_<n>/, rank.json/.txt
-  D_production/           relax/, production.json, structures/
-  E_thermo/               corrections.txt, formation.txt/.json/.png, levels.txt, fermi.txt,
-                          interest.txt, for_F.json
+  state.json              which steps have finished, and with what inputs
+  STOP                    touch it to stop a running dwf.py
+  A_host/                 results.json, summary.txt,
+                          production.param (your .param with the converged cut-off),
+                          host_relaxed.cell (the relaxed host),
+                          jobs/ (converge, relax, bands, dielectric, phases)
+  B_candidates/           results.json, summary.txt,
+                          series/ (the size series), finetune/ (B4), mace/ (B2's MACE caches)
+  C_screen/               results.json, summary.txt,
+                          structures/ (candidates, screen, distortions, drelax, share),
+                          jobs/ (screen, drelax, share_1, ...), mace/ (C1's MACE caches)
+  D_production/           results.json, summary.txt, structures/, jobs/production/
+  E_thermo/               results.json, summary.txt, formation.png
 ```
 
-Every job directory (under `relax/`, `screen/`, ...) is a `supercell_convergence.py` batch job:
-CASTEP inputs and outputs, `job.sh`, `dryrun.sh` and `job_info.json`, and each batch has a
-`batch_results.json`.
+Each phase has one folder with the same layout:
+
+- **`results.json`**: everything the later steps use from this phase, under the name of the
+  step that worked it out. **A step reads only the `results.json` of earlier phases**, and the
+  files named in them (the relaxed host, `production.param`, structures).
+- **`summary.txt`**: the same results for you to read: for each step, when it finished, its
+  one-line result and its table (the convergence test, the candidates, the filter verdicts, the
+  ranking, the formation energies, ...). No step reads it, so editing it changes nothing.
+- **`structures/`**: the structures the phase made, as CASTEP `.cell` files (lattice, positions,
+  `SPIN=` where a starting spin is set): look at one with `ase gui`, or turn it into another
+  format with `ase convert` (e.g. to `.cif`).
+- **`jobs/<step>/<job>/`**: one CASTEP calculation each: `.cell`, `.param`, `.castep`,
+  `-out.cell`, `.check` (unless `delete_check`), `job.sh`, `dryrun.sh` and `job_info.json`
+  (what the runner decided and how it went). Each `jobs/<step>/` has a `batch_results.json`.
+
+What each phase's `results.json` holds:
+
+| Phase | Results (by step) | Used by |
+|---|---|---|
+| A | `converge`: cut-off, k-point spacing, `production.param`; `relax`: `host_relaxed.cell`, `e_bulk`; `bands`: VBM, CBM, gap, the `.bands` file; `dielectric`: ε₀, ε∞; `phases`: their energies; `limits`: μ at each limit | every later phase |
+| B | `generate`: the candidates (id, components, composition group, orientations, sites); `scan`: the size cap; `series`: E_f* per size and the choice; `finetune`: `train.xyz`, `finetune.sh`; `choose`: the supercell (size, matrix, shortest image distance) | C, D, E |
+| C | `prerelax`: each candidate's starting structure and where its defect is; `screen`: every run (energy, final spin, gap levels, first ZPL estimate, structure) and the host's band edges at Γ; `filter`, `zpl`: the survivors; `distort`: the distorted structures; `drelax`: their runs; `rank`: the structures for D | D, E |
+| D | `production`: E_host, and every run's energy, final spin, status and relaxed structure | E |
+| E | `corrections`: E_corr per charge; `formation`: formation energies at each limit, transition levels, Fermi level; `interest`: the defects for phase F (`for_F`) | phase F |
+
+Job names say what they are: `d001_qm1_s0` is candidate d001 in charge state −1 starting with
+spin 0 (C2), `d001_qm1_bm0.40` the same with the bonds around the defect 40 % shorter (C4, C5),
+`..._to_q0` a structure found in another charge state tried in q = 0 (C6), and `d001_qm1_k0`
+the lowest structure of d001 in q = −1 at the production settings (D1).
 
 ---
 
-## Flowchart steps and files
+## The phases
 
-| Flowchart | Script, step | Output |
-|---|---|---|
-| A1 | `dwf_host.py converge` | `A_host/production.param`, `converge.txt` |
-| A2 (cell, e_bulk) | `dwf_host.py relax` | `A_host/host_relaxed.json/.cell` |
-| A2 (VBM, gap) | `dwf_host.py bands` | `A_host/bands/` |
-| A2 (dielectric) | `dwf_host.py dielectric` | in `state.json` (`--status`) |
-| A3 | `dwf_host.py phases`, `limits` | `A_host/limits.txt` |
-| B1 | `dwf_candidates.py generate` | `B_candidates/candidates.txt` |
-| B2 | `dwf_candidates.py scan` | `B_candidates/scan.txt` |
-| B3 | `dwf_candidates.py series` | `B_candidates/series/run/convergence.txt` |
-| B4 | `dwf_candidates.py finetune` | `B_candidates/finetune/` |
-| B5 | `dwf_candidates.py choose` | in `state.json` |
-| C1 | `dwf_screen.py prerelax` | `C_screen/structures/` |
-| C2 | `dwf_screen.py screen` | `C_screen/screen.json` |
-| C3 | `dwf_screen.py filter` | `C_screen/filter.txt` |
-| C3b | `dwf_screen.py zpl` | `C_screen/zpl.txt` |
-| C4 | `dwf_screen.py distort` | `C_screen/distortions/` |
-| C5 | `dwf_screen.py drelax` | `C_screen/drelax.json` |
-| C6 | `dwf_screen.py rank` | `C_screen/rank.txt` |
-| D1, D2 | `dwf_production.py production` | `D_production/production.json` |
-| E1 | `dwf_thermo.py corrections` | `E_thermo/corrections.txt` |
-| E2 | `dwf_thermo.py formation` | `E_thermo/formation.txt`, `levels.txt`, `formation.png`, `fermi.txt` |
-| E3 | `dwf_thermo.py interest` | `E_thermo/interest.txt`, `for_F.json` |
+Each phase's steps, what they do and what they decide. The settings are in the
+[Keyword glossary](#keyword-glossary), grouped the same way.
+
+### Phase A: the host
+
+The reference calculations every later phase depends on.
+
+| Label | Step | What it does | Stops if |
+|---|---|---|---|
+| A1 | `converge` | single points of the primitive cell over cut-offs and k-point spacings; writes `production.param` | a single point has no converged energy; only the finest value is within tolerance |
+| A2.1 | `relax` | variable-cell relaxation of the host | it doesn't finish |
+| A2.2 | `bands` | single point on a denser Γ-centred grid: VBM, CBM, gap | no `.bands` file |
+| A2.3 | `dielectric` | DFPT for the static and optical dielectric constants, or the value you give | no permittivity in the output, or only the optical one |
+| A3.1 | `phases` | relaxes the competing phases | a phase doesn't finish |
+| A3.2 | `limits` | chemical-potential limits | a pure element of the host is missing; the host is above the hull |
+
+Every job copies the host `.cell`'s `species_pot` (and anything else in it apart from the
+structure and k-points), so list the dopants' potentials there too.
+
+**A1 converge.** Every cut-off in `converge_cutoffs` on the finest k-grid, and every spacing in
+`converge_kspacings` at the highest cut-off (skipped if `kspacing` is set; spacings that give the
+same grid run once). The converged value is the smallest cut-off (and the largest spacing) whose
+energy per atom, and that of every finer setting, is within `converge_tol` of the finest one. If
+only the finest value qualifies, the step stops: add higher cut-offs (or smaller spacings) and
+rerun; the finished single points are reused. `A_host/production.param` is your `.param` with the
+converged `cut_off_energy`, and without any `charge` or `spin` (every job sets its own). With
+`converge : false`, nothing runs: your `.param` is used as it is, and the k-point spacing is
+`kspacing`, or that of the host `.cell`'s grid.
+
+**A2.1 relax** relaxes lattice and positions (with symmetry) at the production settings;
+`host_relaxed.cell` is the cell every later phase builds on, and `e_bulk` its energy per atom.
+**A2.2 bands** runs a single point of it on a Γ-centred grid at `bands_kspacing` (default half
+the production spacing): VBM, CBM and gap are the highest occupied and lowest empty eigenvalues
+over that grid. E2 uses its `.bands` file again for the free carriers.
+
+**A2.3 dielectric.** The charge corrections need the static dielectric constant (electronic +
+ionic). With `dielectric` set, nothing runs. Otherwise one DFPT job on the relaxed host
+(`dielectric_task`, default `phonon+efield`, at q = Γ); ε₀ is the average of the diagonal of
+CASTEP's DC permittivity (a warning if it varies by more than 10 %). CASTEP's DFPT needs
+norm-conserving pseudopotentials, fixed occupancies and no spin polarisation: give
+`dielectric_cell` (a `.cell` with an NCP `species_pot`) and `dielectric_param` (a `.param` with a
+cut-off suited to it), or `dielectric`. Without them the production settings are used with
+`fix_occupancy : true` and `spin_polarized : false`, and the step warns if the potentials don't
+look norm-conserving.
+
+**A3.1 phases.** The competing phases come from, in this order: `%block chemical_potentials`
+(the limits themselves: nothing runs); `%block phases` (your structure files, one per line, with
+options such as `molecule`, `metal`, `kspacing=`); `phases_from : doped` (the Materials Project,
+through doped); or none (no limits: E2 then leaves out the μ terms, and only defects of one
+composition can be compared). Solids relax lattice and positions at the production settings;
+molecules relax in their fixed box at Γ.
+
+**A3.2 limits.** A pymatgen phase diagram of the host and the phases made of its own elements
+(it needs a phase of each pure element, and stops if the host lies above the hull). Each corner
+of the host's stability region is a limit, named after the phases there (`CaO-Ca`, `CaO-O2`).
+Each dopant X then gets, at every corner, the highest μ_X its phases allow,
+μ_X = min over phases P containing X of (E_P − Σ_{i≠X} n_i μ_i) / n_X, with the limiting
+phase recorded. `summary.txt` shows the limits as Δμ against the pure elements;
+`results.json` has the absolute values (CASTEP's energy scale), which E2 uses.
+
+### Phase B: candidate defects and cell size
+
+| Label | Step | What it does | Decision |
+|---|---|---|---|
+| B1 | `generate` | the candidate defects | `%block defects` given (flowchart "yes"), or generate them ("no") |
+| B2 | `scan` | MACE relaxations of one defect in growing cells | the size where its relaxation energy levels off caps B3 |
+| B3 | `series` | CASTEP size series of that defect | converged when E_f* of two sizes agree within `series_tol` |
+| B4 | `finetune` | optional: MACE training data from B3's CASTEP steps | — |
+| B5 | `choose` | the supercell for phases C and D | the smaller (or larger) of the two sizes that agree, or `supercell` |
+
+With `supercell : n`, B2 and B3 are skipped and B5 takes that size.
+
+**B1 generate.** Your defects, one per line of `%block defects`, components joined by `+`:
+`Sb_Ca`, `Sb_Ca + Vac_O` (the partner on its nearest O site), `Sb_Ca + Vac_O  all` (every
+arrangement up to `pair_max_distance`), `Vac_O:2` (the 2nd O site of the primitive cell),
+`Sb_Ca@2` (a starting spin of 2 on the Sb). Without the block, on each symmetry-inequivalent site
+of the primitive cell: a vacancy (`vacancies`), a substitution by each dopant, antisites
+(`antisites`), Voronoi interstitials (`interstitials`), and pairs: dopant + native (`pairs`),
+native + native (`native_pairs`), dopant + dopant (`dopant_pairs`), never two interstitials. Each
+pair type gives every symmetry-distinct arrangement up to `pair_max_distance` apart. Candidates
+get ids `d001`, `d002`, ... and a composition group, e.g. `+Sb-Ca-O` for Sb_Ca + Vac_O: those with
+the same group (Sb_Ca + Vac_O and Sb_O + Vac_Ca) are compared directly in C3. The number of
+candidates grows quickly with each option and with `pair_max_distance`: check the list
+(`python3 dwf.py <project> B1`) before screening.
+
+**Where a defect goes in the supercell.** Every defect cell (B2, B3, C1) is built the same way:
+the first component (the anchor) and the vectors from it to the others fix the complex, and the
+complex is put as close to the cell centre as it can be (the mean position of its components
+nearest the centre), only ever moved, never turned. It can't always be exactly at the centre: a
+defect sits on lattice sites.
+
+**B2 scan** (`mace`, `scan`): the representative defect (`series_defect`, or the nearest
+arrangement of the first pair with a dopant) in each of `scan_sizes`, relaxed with MACE. The scan
+stops at the first size whose relaxation energy is within `scan_tol` of the size before; that
+size caps the CASTEP series.
+
+**B3 series.** A normal `supercell_convergence.py` size series of the representative defect, in
+`B_candidates/series/`. Its input, `series.conv`, is written from the project
+([glossary, section 7](#7-seriesconv-written-by-b3)): the relaxed host, `production.param` with
+the series' charge and spin, `e_bulk`, the production k-points, `transform`, `series_sizes` up to
+the B2 cap, `series_tol`, MACE pre-relaxation, and the runner settings. Its cells are the same as
+the rest of the workflow's: the same relaxed host, `transform` and centring. The complex can be a
+rotated, symmetry-equivalent copy of the candidate's, which only matters for a supercell shape
+that breaks the host's symmetry. Converged when the last two sizes' E_f* differ by less than
+`series_tol`; if not, B5 stops and asks for bigger sizes (or `supercell`).
+
+**B4 finetune** (`finetune : true`): every geometry step of the series' smallest-cell relaxation,
+with its energy and forces, goes into `B_candidates/finetune/train.xyz`, and `finetune.sh` runs
+`mace_run_train` on it from `mace_model`. To use it: stop after phase B (`--until B`), run
+`finetune.sh` (on a GPU if you can), set `finetuned_model` to the model it writes, then carry on;
+C1 uses it. One relaxation is a small training set: compare a few MACE and CASTEP energies
+before trusting it.
+
+**B5 choose:** `supercell` if given, otherwise the size series' choice (`series_choice`). Every
+arrangement of a composition is built in this one cell, so their energies can be compared
+directly.
+
+### Phase C: screening and ground states
+
+Every candidate goes through cheap CASTEP relaxations; the ones that are competitive and have
+the properties you ask for get a search for their ground-state structure.
+
+| Label | Step | What it does | Decision |
+|---|---|---|---|
+| C1 | `prerelax` | builds every candidate in the B5 supercell and relaxes it with MACE | pairs too far apart for the cell are left out; `triage` drops arrangements far above the lowest |
+| C2 | `screen` | one cheap CASTEP relaxation per candidate, charge state and starting spin | — |
+| C3 | `filter` | defect hull, duplicates, property filters | within `hull_margin` of the hull; the `require_*` filters |
+| C3b | `zpl` | optional ZPL window | first ZPL estimate inside `zpl_window` |
+| C4 | `distort` | ShakeNBreak distortions of the survivors | which charge states (`distort_charges`) |
+| C5 | `drelax` | cheap relaxations of the distortions | — |
+| C6 | `rank` | ranks the structures, shares winning distortions between charge states | a distortion counts if it beats the screened structure by `distortion_min_gain` |
+
+The CASTEP jobs of C2, C5 and C6 run as runner group `screen`: no restarts, and a job that fails
+is flagged while the others carry on (`--resubmit-failed` tries it again).
+
+**C1 prerelax.** Each candidate is built in the chosen supercell; a pair whose components are
+more than half the shortest image distance apart is left out. With `mace : true` it is relaxed
+with MACE (positions only), with `finetuned_model` if set, else `mace_model`. With
+`triage : true`, arrangements whose MACE energy is more than `triage_window` above the lowest of
+their composition group are dropped before any CASTEP run (MACE knows nothing of charge or spin,
+so keep the window generous).
+
+**C2 screen.** For each candidate, charge state (`screen_charges`) and starting spin, one CASTEP
+relaxation at Γ, without symmetry, at `screen_cutoff` (default the production cut-off), with at
+most `screen_max_steps` geometry steps and any `%block screen_overrides`. The starting spins
+(`screen_spins`): the lowest the electron count allows (0 or 1) and, with `both`, that + 2, set
+as `spin` and as `SPIN=` on the anchor atom. They are starting values: CASTEP may end elsewhere,
+and the results keep the final spin. The pristine supercell gets a single point at the same
+settings: its band edges at Γ are the reference for the gap levels. Each run records its energy
+(only if the last SCF cycle converged), final spin, the defect levels in the gap (more than
+`level_margin` inside the band edges) and the first ZPL estimate (the smallest step from an
+occupied to an empty gap level in one spin channel).
+
+**C3 filter.**
+
+1. *Best state:* for each candidate and charge state, the lowest energy over its starting spins.
+2. *Defect hull:* within a composition group, the formation energy of every arrangement and
+   charge state across the gap, E + E_corr + q (E_VBM + E_F), without the host energy and
+   chemical potentials (the same for all of them). An arrangement is kept if its lowest comes
+   within `hull_margin` of the group's lowest somewhere in the gap. Its *stable* charge states
+   are those that are its lowest somewhere in the gap.
+3. *Duplicates:* an arrangement that relaxed into the same structure as a lower one of its group
+   is dropped.
+4. *Property filters,* each met by a stable charge state: `require_gap_states` (occupied, empty
+   or both kinds of gap level), `require_spin` (the final spin), `require_bound` (pairs bound
+   against their isolated components somewhere in the gap).
+
+The charge states carried on are the stable ones (`distort_charges : stable`) or every one with a
+usable energy (`screened`). `summary.txt` gives every candidate's verdict and why.
+
+**C3b zpl** (`zpl_window`): a survivor is kept if one of its first ZPL estimates is inside the
+window. Kohn–Sham eigenvalue differences at the screening settings are a rough guide: keep the
+window wide.
+
+**C4 distort, C5 drelax.** For each survivor and charge state, from its screened structure,
+ShakeNBreak moves the nearest neighbours of the defect (ShakeNBreak's count, from the oxidation
+states in `%block oxidation_states` or pymatgen's guess) in or out by each factor in
+`distortions`, around the anchor atom or, with `distort_around : vacancy`, the vacant site, and
+rattles the other atoms (`rattle_stdev`, `rattle_dmin`). C5 relaxes every distorted structure at
+the C2 settings, starting from the screened run's final spin.
+
+**C6 rank.** For each survivor and charge state, the screened structure and every distortion
+relaxation are pooled, identical structures merged (pymatgen's StructureMatcher with tight
+tolerances) and ranked by energy. A distortion that wins in one charge state (by
+`distortion_min_gain`) is also relaxed in the other charge states of that defect, for up to
+`share_rounds` rounds. The lowest `keep_structures` distinct structures of each charge state go
+on to phase D.
+
+### Phase D: production relaxations
+
+**D1 production.** One relaxation per structure C6 kept, at the production settings: A1's
+cut-off and k-point spacing, `%block production_overrides`, its charge, and its starting spin
+from phase C (`spin_polarized : true` with that spin; a spin-0 state runs without spin
+polarisation unless `production_overrides` sets `spin_polarized`). Positions only (the cell stays
+at the host's relaxed lattice), no symmetry. Plus a single point of the pristine supercell at
+the same settings: E_host for the formation energies. The jobs run as runner group `production`:
+a relaxation that runs out of walltime is carried on from its `.check`, and a job that fails is
+flagged and left out of phase E (fix the cause and use `--resubmit-failed`). The run stops if the
+pristine single point fails.
+
+**D2** (an untested idea): with `freeze_radius : r`, every atom further than r Å from all of the
+defect's components is held fixed. That cuts the geometry steps of large cells but changes the
+relaxation energy; compare it with full relaxations on one defect before relying on it.
+
+### Phase E: thermodynamics
+
+No CASTEP jobs: it runs in seconds once phase D has finished.
+
+**E1 corrections.** For each charge state that reached phase D, the image-charge correction of
+the chosen supercell with ε₀ from A2.3: `lz` (Lany–Zunger, the default), `mp` (first-order
+Makov–Payne) or `none`. No potential alignment.
+
+**E2 formation.** For each defect, its lowest production energy in each charge state gives
+
+  E_f(q, E_F) = E_D − E_host − Σᵢ nᵢ μᵢ + q (E_VBM + E_F) + E_corr
+
+at every chemical-potential limit, with E_VBM from A2.2 and μᵢ from A3.2. The transition levels
+are the Fermi levels where the lowest-energy charge state changes, between the VBM and the gap
+(`gap`, if set, else A2.2's). `formation.png` plots each defect's lowest charge state against E_F,
+one panel per limit. With `fermi_temperature`, the self-consistent Fermi level at each limit: the
+E_F where the charges of the defects and the free electrons and holes balance (concentrations
+from the formation energies, the sites, orientations and the final spin's degeneracy; carriers
+from A2.2's band energies). With `quench_temperature`, the concentrations are frozen at
+`fermi_temperature` and shared out again between charge states at the lower temperature. Only
+the defects that reached phase D take part, so native defects dropped earlier can move the real
+Fermi level.
+
+**E3 interest.** A defect goes on to phase F if one of its transition levels lies at least
+`deep_level_margin` from both band edges, or if phase C found an internal transition for it.
 
 ---
 
 ## Keyword glossary
 
 Every keyword of every input file, sorted by file. The project file (section 1) is the only file
-the workflow scripts are given; it names the others. For the CASTEP files (sections 2 to 4) the
-tables list only the keywords the workflow sets, changes or removes; every other keyword is
-passed on to the jobs as you wrote it.
+`dwf.py` is given; it names the others. For the CASTEP files (sections 2 to 4) the tables list
+only the keywords the workflow sets, changes or removes; every other keyword is passed on to the
+jobs as you wrote it.
 
-| Input file | Named by | Written by | Section |
-|---|---|---|---|
-| Project file `<name>.dwf` | the command line | you (`--example` writes a template) | [1](#1-the-project-file-namedwf) |
-| Production `.param` | `param` | you | [2](#2-the-production-param-param) |
-| Host `.cell` | `host_cell` | you | [3](#3-the-host-cell-host_cell) |
-| Dielectric `.param` and `.cell` (optional) | `dielectric_param`, `dielectric_cell` | you | [4](#4-the-dielectric-param-and-cell-dielectric_param-dielectric_cell) |
-| Competing-phase structures | `%block phases` | you | [5](#5-competing-phase-structure-files-block-phases) |
-| Jobscript template | `jobscript` | you | [6](#6-the-jobscript-template-jobscript) |
-| `series.conv` | — | B3 (for reference: don't edit it) | [7](#7-seriesconv-written-by-b3) |
-| `.conv` and batch files | the command line | you, when running `supercell_convergence.py` on its own | [8](#8-supercell_convergencepy-on-its-own-conv-and-batch-files) |
+Sections: [1. The project file](#1-the-project-file-namedwf) ·
+[2. The production `.param`](#2-the-production-param-param) ·
+[3. The host `.cell`](#3-the-host-cell-host_cell) ·
+[4. The dielectric files](#4-the-dielectric-param-and-cell-dielectric_param-dielectric_cell) ·
+[5. Competing phases](#5-competing-phase-structure-files-block-phases) ·
+[6. The jobscript](#6-the-jobscript-template-jobscript) ·
+[7. `series.conv`, written by B3](#7-seriesconv-written-by-b3) ·
+[8. The runner's own files](#8-supercell_convergencepy-on-its-own-conv-and-batch-files)
 
 ### 1. The project file (`<name>.dwf`)
 
-The file you pass to every `dwf_*.py` script. Its keywords are grouped below by the phase that
-uses them.
+The file you give `dwf.py`. Its keywords are grouped below by the phase that uses them.
 
 **Writing them.** `keyword : value` (or `=`, or a space), in any case, each keyword once; `#` or
 `!` starts a comment. File names are relative to the project file.
@@ -325,7 +498,7 @@ uses them.
   `keyword : value` lines; the others take the rows described below.
 
 **Changing them.** The Steps column lists the steps that use a keyword. Change it and those steps
-run again the next time you run their script; the steps after them run again only if their
+run again the next time you run `dwf.py`; the steps after them run again only if their
 results change. CASTEP jobs whose inputs have not changed are reused, not repeated.
 
 **Alphabetical index** (the group in brackets):
@@ -364,7 +537,7 @@ Groups: [General](#general) · [MACE](#mace) · [A: host](#a-host) ·
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
 | `host_cell` | required | A1, A2.1 | The host cell, normally the primitive cell (a conventional cell also works); A2.1 relaxes it. Everything in it apart from the structure and k-points (`species_pot`, `symmetry_generate`, any other `.cell` keyword) is copied into every job's `.cell`; defect cells lose the symmetry keywords. List the dopants in `species_pot` too, or leave the block out to use CASTEP's default on-the-fly potentials for every species. |
-| `param` | required | A1 | The production settings: functional, SCF and geometry settings, smearing, and so on. A1 writes `production.param` from it, with the converged `cut_off_energy` and without any `charge` or `spin`, and every later job starts from that file. The scripts set `task`, and per job `charge`, `spin`, `spin_polarized` and the k-points. |
+| `param` | required | A1 | The production settings: functional, SCF and geometry settings, smearing, and so on. A1 writes `production.param` from it, with the converged `cut_off_energy` and without any `charge` or `spin`, and every later job starts from that file. `dwf.py` sets `task`, and per job `charge`, `spin`, `spin_polarized` and the k-points. |
 | `transform` | identity | B2, B3, B5 | The supercell shape: 9 integers, row by row, each row a supercell vector in terms of the primitive vectors (determinant > 0). Size n is n × `transform`. The example's matrix turns an FCC primitive cell into cubic cells of 8n³ atoms. Without it, size n is n × n × n primitive cells. Everything after B5 uses the chosen cell. |
 | `energy` | `auto` | A1, A2.1, A3.1, B3, C2, C5, C6, D1 | Which CASTEP energy every step reads: `final` (Final energy), `free` (E − TS), `0K` (the 0 K estimate) or `auto` (the 0 K estimate when CASTEP prints one, else the final energy). They differ only with smearing. |
 | `name` | the file name | — | The project's name: the default work directory is `dwf_<name>`, and it titles the E2 plot. |
@@ -372,7 +545,7 @@ Groups: [General](#general) · [MACE](#mace) · [A: host](#a-host) ·
 
 #### MACE
 
-MACE runs on the machine where the script runs, usually a login node. It has no charge or spin:
+MACE runs where `dwf.py` runs, usually a login node. It has no charge or spin:
 it only prepares structures and never ranks charge states.
 
 | Keyword | Default | Steps | What it does |
@@ -387,7 +560,7 @@ it only prepares structures and never ranks charge states.
 
 #### A: host
 
-`dwf_host.py`; details in `README_dwf_host.md`.
+Details: [Phase A](#phase-a-the-host).
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
@@ -410,7 +583,7 @@ it only prepares structures and never ranks charge states.
 
 #### B: candidates and cell size
 
-`dwf_candidates.py`; details in `README_dwf_candidates.md`.
+Details: [Phase B](#phase-b-candidate-defects-and-cell-size).
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
@@ -437,7 +610,7 @@ it only prepares structures and never ranks charge states.
 
 #### C: screening
 
-`dwf_screen.py`; details in `README_dwf_screen.md`. The screening runs are cheap on purpose:
+Details: [Phase C](#phase-c-screening-and-ground-states). The screening runs are cheap on purpose:
 Γ point only, possibly a lower cut-off, few geometry steps. Their energies rank candidates;
 phase D redoes the survivors properly.
 
@@ -468,7 +641,7 @@ phase D redoes the survivors properly.
 
 #### D: production
 
-`dwf_production.py`; details in `README_dwf_production.md`.
+Details: [Phase D](#phase-d-production-relaxations).
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
@@ -477,7 +650,7 @@ phase D redoes the survivors properly.
 
 #### E: thermodynamics
 
-`dwf_thermo.py`; details in `README_dwf_thermo.md`.
+Details: [Phase E](#phase-e-thermodynamics).
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
@@ -491,16 +664,9 @@ phase D redoes the survivors properly.
 
 These are `supercell_convergence.py`'s keywords for how jobs run (see
 `README_supercell_convergence.md` for the details). In the project file they apply to every
-group of steps; `%block runner_<group>` changes them for one group, holding runner keywords only:
-
-| Group | Steps | Defaults that differ |
-|---|---|---|
-| `host` | A1–A3 | — |
-| `series` | B3 | — (written into `series.conv`; `max_jobs` and `tolerate_failures` don't apply) |
-| `screen` | C2, C5, C6 | `max_restarts : 0`, `tolerate_failures : true` |
-| `production` | D1 | `tolerate_failures : true` |
-
-These group defaults take precedence over the project-wide settings, and a
+group of steps; `%block runner_<group>`, holding runner keywords only, changes them for one group
+(`host`, `series`, `screen` or `production`). The groups' own defaults
+([How a run works](#how-a-run-works)) take precedence over the project-wide settings, and a
 `%block runner_<group>` setting over both.
 
 | Keyword | Default | What it does |
@@ -521,7 +687,7 @@ These group defaults take precedence over the project-wide settings, and a
 | `sp_walltime` | — | The walltime (`H:MM:SS`) of the first single points, before there is anything to estimate from. One that runs out is resubmitted with the full time. |
 | `max_restarts` | `10` (`0` for `screen`) | How many times a job that runs out of time, or stops in a way the runner can recover from, is resubmitted; a relaxation carries on from its `.check`. |
 | `delete_check` | `false` | Delete each calculation's `.check` file once it has finished; they can be large. |
-| `dryrun_on` | `compute` | Where the dry runs go (one per distinct input, for the k-points and memory): `compute`, as small batch jobs from your template; `login`, where the script runs, with `dryrun_cmd`. On ARCHER2, don't send them to the shared `serial` partition with a whole-node template, which it rejects: use `login`, or `dryrun_partition : standard`. |
+| `dryrun_on` | `compute` | Where the dry runs go (one per distinct input, for the k-points and memory): `compute`, as small batch jobs from your template; `login`, where `dwf.py` runs, with `dryrun_cmd`. On ARCHER2, don't send them to the shared `serial` partition with a whole-node template, which it rejects: use `login`, or `dryrun_partition : standard`. |
 | `dryrun_cmd` | `castep.mpi --dryrun {seed}` | The command for `dryrun_on : login`, e.g. `castep.serial --dryrun {seed}`. |
 | `dryrun_timeout` | `900 s` | How long a login dry run may take. |
 | `dryrun_jobscript` | the jobscript | A separate template for dry-run jobs. |
@@ -531,7 +697,7 @@ These group defaults take precedence over the project-wide settings, and a
 | `status_cmd` | `squeue` or `qstat` | The command that lists queued and running jobs. |
 | `poll` | `120 s` | Seconds between checks of the queue. |
 | `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once. |
-| `tolerate_failures` | `false` (`true` for `screen` and `production`) | A job that fails is marked as failed and the others carry on, instead of the script stopping. `--resubmit-failed` starts failed jobs again. |
+| `tolerate_failures` | `false` (`true` for `screen` and `production`) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
 
 `--prepare-only`, `--no-wait`, `--resubmit-failed` and `--force` are command-line switches
 ([Command line](#command-line)), not project-file keywords.
@@ -697,6 +863,8 @@ mode). The others:
 
 ---
 
+---
+
 ## Testing so far, and what to check first
 
 Everything has been run against a mock CASTEP and a mock Slurm, with the real MACE
@@ -705,42 +873,43 @@ energies, spins and band structures, so these runs check the workflow's logic, n
 
 | Test project | What it covered |
 |---|---|
-| `CaO_Sb` | A to E with MACE: cut-off and k-point convergence, DFPT, competing phases and limits, generated candidates, MACE scan, size series, fine-tuning data (B4), `require_gap_states`, `zpl_window`, `hull_margin`, distortions and sharing, Fermi level with a quench |
-| `Final` | B to E again on the final code: the centred defect placement, `triage`, a MACE model file for C1 (`finetuned_model`) |
-| `Opts2` | B to E with `mace : false`, antisites, native and dopant pairs, a charged size series, `series_choice : larger`, `screen_cutoff`, `%block screen_overrides`, `require_spin`, `require_bound`, `distort_charges : screened`, `distort_around : vacancy`, `%block oxidation_states`, `keep_structures : 2`, `%block production_overrides`, `freeze_radius`, `charge_correction : mp`, `gap`, `fermi_temperature` |
-| `Opts` | phase A with `converge : false`, `kspacing`, `dielectric`, `%block chemical_potentials`; `supercell` |
-| `User` | Voronoi interstitials (`interstitials : dopants`), through screening |
-| `Async` | `--no-wait`, rerun until the steps finish |
+| `Final` | A to E with MACE: convergence, DFPT, competing phases and limits, generated candidates, MACE scan, size series, fine-tuning data (B4), `triage`, a MACE model file for C1 (`finetuned_model`), `require_gap_states`, `zpl_window`, `hull_margin`, distortions and sharing, Fermi level with a quench |
+| `Opts2` | A to E with `mace : false`, antisites, native and dopant pairs, a charged size series, `series_choice : larger`, `screen_cutoff`, `%block screen_overrides`, `require_spin`, `require_bound`, `distort_charges : screened`, `distort_around : vacancy`, `%block oxidation_states`, `keep_structures : 2`, `%block production_overrides`, `freeze_radius`, `charge_correction : mp`, `gap`, `fermi_temperature` |
+| `User` | A to E with Voronoi interstitials (`interstitials : dopants`), `supercell`, `zpl_window`, a quench |
+| `Opts` | phase A with `converge : false`, `kspacing`, `dielectric`, `%block chemical_potentials` |
+| `Async` | `--no-wait`, run again until the steps finish |
 
-Also tested: stopping (STOP file, Ctrl-C, a killed script) and rerunning; changed settings
-(only the steps that use them run again, and finished jobs are reused); `--redo`; failed jobs
-and `--resubmit-failed`; shared dry runs; `max_jobs`; `%block defects` with `all`, `:k` and
-`@s` (the candidate list and defect cells); the example folder's phase A, with dry runs on the
-login node; and the defect placement on CaO (primitive and conventional cells), wurtzite GaN
-and a monoclinic cell, against a brute-force search for the most central position.
-`supercell_convergence.py`'s own regression tests give the same results as before; the only
-new output is the `off-centre/A` column of its size table.
+`dwf.py` replaces five scripts (one per phase) that passed results on through more files. The
+`Final`, `Opts2` and `User` projects were run from scratch with both, and give the same results at
+every step: the energies, spins and gap levels of every run, the survivors, distortions and
+rankings, the production energies, the formation energies, levels and Fermi levels. Also tested
+with `dwf.py`: carrying on after it was killed part-way through a step; a changed setting
+(`require_spin`), which re-ran C3 onwards and reused the finished jobs; `--redo`; running single
+steps and phases; `--until`; `--status`; and the example folder's phase A, with dry runs on the
+login node.
 
 Not tested: `phases_from : doped` (no Materials Project access here), a real fine-tuned model
-(`finetune.sh` is written but was not run), and real CASTEP output for the DFPT permittivity
-and the `.bands` of spin-polarised runs.
+(`finetune.sh` is written but was not run), and real CASTEP output for the DFPT permittivity and
+the `.bands` of spin-polarised runs.
 
 On the first real runs, check:
 
 1. **A2.3 dielectric:** CASTEP's DFPT needs norm-conserving pseudopotentials, fixed occupancies
    and no spin polarisation. Give `dielectric_cell` (with an NCP `species_pot`) and
-   `dielectric_param`, or set `dielectric` yourself. The script warns if the potentials don't
-   look norm-conserving.
+   `dielectric_param`, or set `dielectric` yourself. `dwf.py` warns if the potentials don't
+   look norm-conserving. Check that the `.castep` has both "Optical Permittivity
+   (f->infinity)" and "DC Permittivity (f=0)", and that `A_host/summary.txt` shows the values
+   printed there.
 2. **The `.bands` reader** (A2.2, C2): the electron count per spin channel of a spin-polarised
    run is taken from the header when CASTEP gives one number per channel, otherwise from the
-   Fermi energy. Compare the gap levels in `C_screen/screen.json` with the `.bands` of one run.
-3. **The screening spins** (C2): each run starts from a total spin (`spin`) and SPIN= on the
+   Fermi energy. Compare the gap levels of one run (`screen` in `C_screen/results.json`) with
+   its `.bands`.
+3. **The screening spins** (C2): each run starts from a total spin (`spin`) and `SPIN=` on the
    dopant. With `fix_occupancy : false` (smearing) CASTEP holds it only for its first `spin_fix`
    SCF cycles (10 by default) and then lets it relax, so both starting spins can end in the
    same state; the results record the final spin. With `fix_occupancy : true` the spin is not
    freed.
-4. **Gap levels** are compared with the host's band edges at the same settings without
-   potential alignment: fine for sorting candidates, not for production levels (those come
-   from E2).
-5. **The permittivity table** (A2.3) is read from the lines after "Optical Permittivity
-   (f->infinity)"; check `--status` shows the values CASTEP printed.
+4. **Gap levels** are compared with the host's band edges at the same settings without potential
+   alignment: fine for sorting candidates, not for production levels (those come from E2).
+5. **The band edges** come from A2.2's uniform Γ-centred grid, not a band-structure path: lower
+   `bands_kspacing` if the edges may lie between grid points, or give `gap`.

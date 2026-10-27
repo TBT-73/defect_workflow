@@ -159,9 +159,9 @@ start which node it runs on.
 Batch mode
 ----------
 The same machinery can run any list of CASTEP calculations instead of a size series.
-It runs the structures it is given and builds no supercells of its own. The
-defect-workflow scripts (dwf_*.py) use it for every CASTEP step except their size series
-(B3, a normal size-series run), and you can use it directly:
+It runs the structures it is given and builds no supercells of its own. The defect
+workflow (dwf.py) uses it for every CASTEP step except its size series (B3, a normal
+size-series run), and you can use it directly:
 
     python3 supercell_convergence.py --batch jobs.batch
 
@@ -234,7 +234,7 @@ from ase.geometry import cellpar_to_cell, get_distances
 #       report                         charged defect), the results table and the
 #                                      convergence test
 #
-# Batch mode (--batch, and the dwf_*.py workflow scripts) runs a list of calculations instead:
+# Batch mode (--batch, and the dwf.py workflow) runs a list of calculations instead:
 #   read_batch_file / batch_args     the runner settings (and, for --batch, the jobs)
 #   run_batch                        a Calc per job (any task, fixed or variable cell, own
 #                                      k-points and .param keywords: cell_options, dryrun_key,
@@ -649,7 +649,7 @@ def parse_defect(tokens, prim):
 # The pure translations of a crystal (fractional vectors, the zero one first): the shifts that map
 # every atom of the cell onto an atom of the same element, such as the face-centring vectors of a
 # conventional FCC cell. A primitive cell has only the zero one. tol is in Angstrom.
-#   Called by: translation_copies(), the dwf_*.py scripts
+#   Called by: translation_copies(), dwf.py
 def pure_translations(prim, tol=1e-3):
     frac, cell = prim.get_scaled_positions(), np.asarray(prim.cell)
     syms = np.array(prim.get_chemical_symbols())
@@ -667,7 +667,7 @@ def pure_translations(prim, tol=1e-3):
 
 # The sites of a cell that a pure translation of the crystal (pure_translations) maps site i onto,
 # i included: a defect on any of them is the same defect, moved. Just [i] in a primitive cell.
-#   Called by: parse_defect(), the dwf_*.py scripts
+#   Called by: parse_defect(), dwf.py
 #   Calls:     pure_translations()
 def translation_copies(prim, i):
     frac, cell = prim.get_scaled_positions(), np.asarray(prim.cell)
@@ -715,7 +715,7 @@ def candidates(sc, comp):
 # component; of equally good sites, the one whose farthest component is nearest the centre wins
 # (then the lowest index). Only the site changes, never the orientation of the complex, so it is
 # the same complex in every size. With no vecs: the candidate nearest the centre.
-#   Called by: defect_vectors(), insert_defect(), main(), the dwf_*.py scripts
+#   Called by: defect_vectors(), insert_defect(), main(), dwf.py
 #   Calls:     candidates()
 def anchor_site(sc, comp, vecs=()):
     cand = candidates(sc, comp)
@@ -2482,8 +2482,8 @@ def last_lattice(text):
 # positions and, for a variable-cell relaxation, the lattice CASTEP ended with.
 # From <seed>-out.cell if CASTEP wrote it, otherwise from the last lattice and 'Fractional
 # coordinates' table in the .castep (for a single point that is its starting structure). None if
-# neither can be read. The workflow scripts use it to carry a relaxed structure on to the next step.
-#   Called by: the dwf_*.py scripts
+# neither can be read. dwf.py uses it to carry a relaxed structure on to the next step.
+#   Called by: dwf.py
 #   Calls:     Calc.output(), last_lattice(), parse_castep_input(), read_primitive(),
 #              written_order()
 def final_atoms(calc):
@@ -2598,7 +2598,7 @@ def job_spec(job, base):
 
 
 # Runs a list of CASTEP calculations of any kind and returns what they gave: batch mode, used by
-# the dwf_*.py workflow scripts and by --batch.
+# the dwf.py workflow and by --batch.
 # jobs is a list of dicts, one per calculation:
 #   name           unique; its directory and seedname (letters, digits, - _ . only)
 #   atoms          the structure (ASE Atoms; initial magnetic moments are written as SPIN=)
@@ -2628,7 +2628,7 @@ def job_spec(job, base):
 # Returns {'complete': True/False, 'jobs': {name: job_result}, 'calcs': {name: Calc}}, and writes
 # the results to <workdir>/batch_results.json; 'complete' is False after --prepare-only, or with
 # --no-wait while jobs are still queued.
-#   Called by: batch_main(), the dwf_*.py scripts
+#   Called by: batch_main(), dwf.py
 #   Calls:     Calc(), Calc.done(), Calc.err_files(), calibrate(), check_templates(), finalize(),
 #              job_result(), job_spec(), measure_times(), parse_castep_input(), prepare_all(),
 #              remove_check(), submit(), wait_for()
@@ -2759,7 +2759,7 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
 # tolerate_failures, ...), converted and checked as read_input does (convert_settings,
 # check_runner); the size-series keywords (defect, sizes, e_bulk, ...) aren't needed. File names
 # are relative to base. Returns the settings namespace run_batch takes.
-#   Called by: read_batch_file(), the dwf_*.py scripts
+#   Called by: read_batch_file(), dwf.py
 #   Calls:     check_runner(), convert_settings()
 def batch_args(items, base, name="batch settings"):
     vals, raw_vals, templates = convert_settings(items, name)

@@ -16,8 +16,8 @@ a neutral defect and an image-charge correction for a charged one (see
 |E_f*(n) - E_f*(previous n)| < `tol`, and prints the full expression for E_f.
 
 The same machinery can also run any list of CASTEP calculations ([Batch mode](#batch-mode)):
-the defect-workflow scripts (`dwf_*.py`) run all their CASTEP jobs that way except their size
-series.
+the defect workflow (`dwf.py`) runs all its CASTEP jobs that way except its size series. The
+workflow has its own README, `README.md`.
 
 ---
 
@@ -433,9 +433,9 @@ Each deletion is logged with its size.
 
 The same machinery (dry runs, layouts, partitions, walltimes, restarts, STOP, resuming) can run
 any list of CASTEP calculations instead of a size series. In batch mode the script builds no
-supercells or defects: each job runs the structure it is given. The defect-workflow scripts
-(`dwf_*.py`) run every CASTEP job this way except their size series (step B3), which is a normal
-size-series run that builds its own cells. They build their structures with this script's own
+supercells or defects: each job runs the structure it is given. The defect workflow (`dwf.py`)
+runs every CASTEP job this way except its size series (step B3), which is a normal size-series
+run that builds its own cells. It builds its structures with this script's own
 `build_supercell`, `anchor_site` and `translation_copies`, so the cells match. You can also use
 batch mode directly:
 
