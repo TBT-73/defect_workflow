@@ -69,25 +69,46 @@ All seven `.py` files go in one directory; run the scripts from anywhere.
 
 ## Quick start
 
+`example_CaO_Sb/` is a complete example (CaO:Sb on ARCHER2): the project file `CaO_Sb.dwf` and
+every file it names.
+
+| File | What it is |
+|---|---|
+| `CaO_Sb.dwf` | the project file, annotated (the same as `python3 dwf_host.py --example`) |
+| `CaO_prim.cell` | the host primitive cell (rocksalt, a = 4.8105 Å); A2.1 relaxes it |
+| `CaO.param` | production settings (PBE; A1 sets the cut-off) |
+| `archer2.sh` | jobscript template |
+| `CaO_ncp.cell`, `CaO_ncp.param` | the DFPT dielectric run (A2.3): norm-conserving potentials, fixed occupancies |
+| `Ca.cell`, `O2.cell`, `Sb.cell`, `Sb2O3.cell` | competing phases (A3): fcc Ca, O₂ in a box, A7 Sb, senarmontite Sb₂O₃, near their experimental structures (A3.1 relaxes them) |
+
+Before running it, check: the account and CASTEP module in `archer2.sh`; the pseudopotentials
+(`CaO_prim.cell` has no `species_pot`, so CASTEP uses its default on-the-fly ones); the cut-off
+in `CaO_ncp.param`; and the competing phases (add any other that could limit Sb). Then, with
+`DWF` the directory holding the seven `.py` files:
+
 ```bash
-python3 dwf_host.py --example > CaO_Sb.dwf      # annotated project file: edit it
-python3 dwf_host.py CaO_Sb.dwf --prepare-only   # check the first inputs, submit nothing
-nohup python3 dwf_host.py CaO_Sb.dwf > A.log 2>&1 &
+cd example_CaO_Sb
+python3 $DWF/dwf_host.py CaO_Sb.dwf --prepare-only   # check the first inputs, submit nothing
+nohup python3 $DWF/dwf_host.py CaO_Sb.dwf > A.log 2>&1 &
 ```
 
 then, each when the one before has finished:
 
 ```bash
-nohup python3 dwf_candidates.py CaO_Sb.dwf > B.log 2>&1 &
-nohup python3 dwf_screen.py     CaO_Sb.dwf > C.log 2>&1 &
-nohup python3 dwf_production.py CaO_Sb.dwf > D.log 2>&1 &
-python3 dwf_thermo.py CaO_Sb.dwf                 # quick: no CASTEP jobs
+nohup python3 $DWF/dwf_candidates.py CaO_Sb.dwf > B.log 2>&1 &
+nohup python3 $DWF/dwf_screen.py     CaO_Sb.dwf > C.log 2>&1 &
+nohup python3 $DWF/dwf_production.py CaO_Sb.dwf > D.log 2>&1 &
+python3 $DWF/dwf_thermo.py CaO_Sb.dwf                 # quick: no CASTEP jobs
 ```
 
-or all in one go: `nohup sh -c 'python3 dwf_host.py CaO_Sb && python3 dwf_candidates.py CaO_Sb
-&& python3 dwf_screen.py CaO_Sb && python3 dwf_production.py CaO_Sb && python3 dwf_thermo.py
-CaO_Sb' > run.log 2>&1 &`. Each script exits with an error if the step it needs from an
-earlier phase hasn't finished, so the chain stops at the first problem.
+or all in one go: `nohup sh -c "python3 $DWF/dwf_host.py CaO_Sb && python3
+$DWF/dwf_candidates.py CaO_Sb && python3 $DWF/dwf_screen.py CaO_Sb && python3
+$DWF/dwf_production.py CaO_Sb && python3 $DWF/dwf_thermo.py CaO_Sb" > run.log 2>&1 &`. Each
+script exits with an error if the step it needs from an earlier phase hasn't finished, so the
+chain stops at the first problem.
+
+For a new project, `python3 $DWF/dwf_host.py --example > <name>.dwf` prints the annotated
+project file to start from; it names the same input files.
 
 The scripts wait for their jobs (polling every `poll` seconds), so run them with `nohup` or in
 `tmux`/`screen`. MACE runs where the script runs (the login node): keep `mace_threads` modest.

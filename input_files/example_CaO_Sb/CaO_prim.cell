@@ -1,0 +1,25 @@
+# CaO primitive cell (rocksalt, a = 4.8105 A); A2.1 relaxes it
+%BLOCK LATTICE_CART
+ang
+      0.00000000      2.40525000      2.40525000
+      2.40525000      0.00000000      2.40525000
+      2.40525000      2.40525000      0.00000000
+%ENDBLOCK LATTICE_CART
+
+%BLOCK POSITIONS_FRAC
+  Ca     0.0000000000    0.0000000000    0.0000000000
+  O      0.5000000000    0.5000000000    0.5000000000
+%ENDBLOCK POSITIONS_FRAC
+# k-points: A1 converges the spacing (converge_kspacings); this grid is only used if you
+# set converge : false and give no kspacing
+KPOINTS_MP_GRID : 8 8 8
+SYMMETRY_GENERATE
+
+# Every job copies what follows the structure (species_pot, symmetry_generate, ...).
+# No SPECIES_POT block: CASTEP generates its default on-the-fly (ultrasoft) potentials for
+# every species, Sb included. To use your own, list Ca, O and Sb here, e.g.
+#   %BLOCK SPECIES_POT
+#   Ca  Ca_00PBE.usp
+#   O   O_00PBE.usp
+#   Sb  Sb_00PBE.usp
+#   %ENDBLOCK SPECIES_POT

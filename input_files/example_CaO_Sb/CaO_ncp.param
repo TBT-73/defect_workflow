@@ -1,0 +1,10 @@
+# Settings for the DFPT dielectric run (A2.3, task phonon+efield, set by the script).
+# CASTEP's DFPT needs norm-conserving potentials (CaO_ncp.cell), fixed occupancies and no spin
+# polarisation. Norm-conserving potentials need a higher cut-off than ultrasoft ones: check
+# that epsilon has converged with it (run A2.3 again with a higher value: --redo dielectric).
+xc_functional   : PBE
+cut_off_energy  : 900 eV
+elec_energy_tol : 1e-9 eV
+fix_occupancy   : true
+spin_polarized  : false
+max_scf_cycles  : 200

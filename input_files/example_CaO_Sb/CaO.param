@@ -1,0 +1,8 @@
+# Production settings, used by every job of the workflow. The scripts set task, and per job
+# charge, spin, spin_polarized and the k-points; A1 replaces cut_off_energy with the converged
+# value. Leave charge and spin out (A1 drops them from production.param if they are here).
+xc_functional   : PBE
+cut_off_energy  : 600 eV
+elec_energy_tol : 1e-7 eV
+max_scf_cycles  : 200
+# ... your other settings (mixing, smearing, grid_scale, ...) go here

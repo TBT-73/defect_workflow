@@ -1165,7 +1165,8 @@ EXAMPLE_PROJECT = """\
 #                                       dwf_screen.py, dwf_production.py, dwf_thermo.py
 # Written like a CASTEP .param/.cell file: "keyword : value", %block ... %endblock, keywords
 # in any case, # or ! starts a comment. Lines starting with ! are optional settings with an
-# example value: delete the ! to use one. File names are relative to this file.
+# example value: delete the ! to use one. File names are relative to this file: the example
+# inputs (CaO:Sb on ARCHER2) are in example_CaO_Sb/, this file and every file it names.
 
 # ======================================================================= general
 host_cell : CaO_prim.cell      # host primitive cell: species_pot, symmetry_generate, k-points
@@ -1212,17 +1213,20 @@ converge_kspacings : 0.08 0.06 0.05 0.04 0.03   # 1/Ang (CASTEP's 2*pi units)
 converge_tol       : 0.001 eV/atom
 !kspacing          : 0.04      # use this k-point spacing instead of converging it
 !bands_kspacing    : 0.02      # A2 band edges (default: half the production spacing)
-# Dielectric constant for the charge corrections: DFPT phonon+efield, or give it yourself
+# Dielectric constant for the charge corrections: DFPT phonon+efield, or give it yourself.
+# CASTEP's DFPT needs norm-conserving potentials, fixed occupancies and no spin polarisation:
+dielectric_param   : CaO_ncp.param   # its own .param (NCP cut-off, fix_occupancy : true)
+dielectric_cell    : CaO_ncp.cell    # its own .cell (species_pot: NCP)
 !dielectric        : 11.95     # static (electronic + ionic): skips the DFPT run
-!dielectric_param  : CaO_ncp.param   # its own .param (e.g. norm-conserving settings)
-!dielectric_cell   : CaO_ncp.cell    # its own .cell (species_pot with NCP potentials)
 # Competing phases for the chemical-potential limits (A3): your own structure files...
 %block phases
-Ca      Ca.cell       metal  smearing_width=0.1  fix_occupancy=false
+Ca      Ca.cell       metal  smearing_width=0.1  kspacing=0.03
 O2      O2.cell       molecule  spin=2  spin_polarized=true
-Sb      Sb.cell       metal  smearing_width=0.1  fix_occupancy=false
+Sb      Sb.cell       metal  smearing_width=0.1  kspacing=0.03
 Sb2O3   Sb2O3.cell
 %endblock phases
+# (add any other phase that could limit Sb, e.g. valentinite Sb2O3, Sb2O4, CaSb2O6,
+#  Ca2Sb2O7 or a Ca-Sb compound: phases_from : doped would find them)
 !phases_from : doped           # ...or from the Materials Project via doped (needs mp_api_key)
 !mp_api_key  : <your key>
 # ...or the limits themselves (eV per atom, absolute: the same reference as your CASTEP runs)

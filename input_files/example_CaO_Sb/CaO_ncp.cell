@@ -1,0 +1,20 @@
+# For the DFPT dielectric run (A2.3) only: its structure is replaced by the relaxed host
+# (A2.1); what matters here is the norm-conserving potentials CASTEP's DFPT needs.
+%BLOCK LATTICE_CART
+ang
+      0.00000000      2.40525000      2.40525000
+      2.40525000      0.00000000      2.40525000
+      2.40525000      2.40525000      0.00000000
+%ENDBLOCK LATTICE_CART
+
+%BLOCK POSITIONS_FRAC
+  Ca      0.0000000000    0.0000000000    0.0000000000
+  O       0.5000000000    0.5000000000    0.5000000000
+%ENDBLOCK POSITIONS_FRAC
+
+SYMMETRY_GENERATE
+
+# NCP: CASTEP's on-the-fly norm-conserving library, for every species
+%BLOCK SPECIES_POT
+NCP
+%ENDBLOCK SPECIES_POT
