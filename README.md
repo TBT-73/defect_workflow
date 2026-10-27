@@ -71,8 +71,7 @@ All seven `.py` files go in one directory; run the scripts from anywhere.
 
 ## Quick start
 
-`example_CaO_Sb/` is a complete example (CaO:Sb on ARCHER2): the project file `CaO_Sb.dwf` and
-every file it names.
+`input_files/` is a complete set of example input files for the antimony vacancy complex in CaO run on Archer 2:
 
 | File | What it is |
 |---|---|
