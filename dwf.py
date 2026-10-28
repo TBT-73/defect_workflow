@@ -133,7 +133,8 @@ PROJECT_KEYWORDS = {
     "mace_steps": (sc._num(cast=int), 500),
     # A: host
     "converge": (_b, True), "converge_cutoffs": (_floats(), [300, 400, 500, 600, 700, 800]),
-    "converge_kspacings": (_floats(), [0.1, 0.08, 0.06, 0.05, 0.04, 0.03]),
+    "converge_kgrid_min": (sc._ints(), [4]), "converge_kgrid_max": (sc._ints(), [12]),
+    "converge_kgrid_step": (sc._ints(), [2]),
     "converge_tol": (sc._num("eV/atom", "eV"), 0.001), "kspacing": (sc._num("1/ang"), None),
     "converge_kcutoff": (sc._num("eV"), None),
     "bands_kspacing": (sc._num("1/ang"), None),
@@ -181,7 +182,7 @@ PROJECT_KEYWORDS = {
     "fermi_temperature": (sc._num("K"), None), "quench_temperature": (sc._num("K"), None),
     "deep_level_margin": (sc._num("eV"), 0.5),
 }
-LIST_KEYS = {"transform", "converge_cutoffs", "converge_kspacings", "dopants", "scan_sizes",
+LIST_KEYS = {"transform", "converge_cutoffs", "dopants", "scan_sizes",
              "series_sizes", "screen_charges", "distortions", "zpl_window"}   # block or keyword
 # supercell_convergence keywords that control how jobs run (allowed in the project file and in
 # %block runner_<group>)
@@ -199,13 +200,41 @@ GROUP_DEFAULTS = {"host": "", "series": "",
                   "production": "tolerate_failures : true"}
 
 
+# The k-point grids of A1's scan, coarse to fine: from converge_kgrid_min to converge_kgrid_max
+# in steps of converge_kgrid_step. Each is one number (the same in all three directions: n x n x n)
+# or three (one per reciprocal-lattice direction, for a non-cubic grid such as 4 4 2 to 12 12 6 in
+# steps of 2 2 1); a step of 0 keeps that direction fixed (e.g. 1 for a slab). Every direction
+# that moves must take the same number of steps. Stops with what is wrong otherwise.
+#   Called by: read_project()
+def kgrid_list(name, lo, hi, step):
+    three = [v * 3 if len(v) == 1 else v for v in (lo, hi, step)]
+    if any(len(v) != 3 for v in three):
+        die(f"{name}: converge_kgrid_min, _max and _step take one number or three")
+    lo, hi, step = three
+    counts = set()
+    for a, b, d in zip(lo, hi, step):
+        if a < 1 or b < a or d < 0 or (d == 0 and a != b) or (d and (b - a) % d):
+            die(f"{name}: converge_kgrid_min {' '.join(map(str, lo))} to _max "
+                f"{' '.join(map(str, hi))} in steps of {' '.join(map(str, step))} does not work: "
+                "each direction needs 1 <= min <= max, with max - min a multiple of its step "
+                "(a step of 0 needs min = max)")
+        if d:
+            counts.add((b - a) // d)
+    if len(counts) > 1:
+        die(f"{name}: converge_kgrid_min/_max/_step take different numbers of steps in different "
+            f"directions ({' '.join(map(str, lo))} to {' '.join(map(str, hi))} in steps of "
+            f"{' '.join(map(str, step))}): make them the same")
+    k = counts.pop() if counts else 0
+    return [[a + j * d for a, d in zip(lo, step)] for j in range(k + 1)]
+
+
 # Reads the project file into a namespace of settings.
 # Every keyword must be a project keyword (PROJECT_KEYWORDS) or a runner keyword (RUNNER_KEYS,
 # passed to supercell_convergence.batch_args); %block runner_<group> holds runner keywords for one
 # group of steps. A typo gets the closest keyword suggested. Returns (settings, the text each
 # setting was given as, the runner items, {group: runner items}).
 #   Called by: Project.__init__()
-#   Calls:     sc.block_rows(), sc.parse_castep_input()
+#   Calls:     kgrid_list(), sc.block_rows(), sc.parse_castep_input()
 def read_project(path):
     name = path.name
     vals, raw, runner, groups = {}, {}, [], {}
@@ -278,6 +307,8 @@ def read_project(path):
                 "mace_fmax"):
         if getattr(s, key) is not None and getattr(s, key) <= 0:
             die(f"{name}: {key} must be greater than 0")
+    s.converge_kgrids = kgrid_list(name, s.converge_kgrid_min, s.converge_kgrid_max,
+                                   s.converge_kgrid_step)
     if s.zpl_window and s.zpl_window[0] >= s.zpl_window[1]:
         die(f"{name}: zpl_window is  lowest highest  (eV)")
     return s, raw, runner, groups
@@ -1287,6 +1318,15 @@ def production_param_text(text, cutoff=None):
     return out, [k for k in gone if k in ("charge", "spin")]
 
 
+# The k-point spacing (1/Ang, CASTEP's 2*pi units) that a Monkhorst-Pack grid of a cell gives: the
+# finest of its three directions, so that every later cell (sc.kgrid) is sampled at least as
+# densely as this grid in each direction (and exactly as densely for a cell like the host's).
+#   Called by: step_converge()
+#   Calls:     sc.recip_lengths()
+def grid_spacing(cell, grid):
+    return float(min(L / n for L, n in zip(sc.recip_lengths(cell), grid)))
+
+
 # The smallest setting whose energy per atom, and that of every better setting, is within tol of
 # the best one (the last of values, which must be ordered from worst to best). None if only the
 # best one is (the list does not show convergence).
@@ -1299,18 +1339,20 @@ def converged_value(values, energies, tol):
     return None
 
 
-# A1: converges the k-point spacing, then the plane-wave cut-off, with single points of the host
-# primitive cell as given. First every spacing in converge_kspacings (spacings that give the same
-# grid run once) at the cheap cut-off converge_kcutoff (default the lowest of converge_cutoffs),
-# in A_host/jobs/converge/kpoints; then every cut-off in converge_cutoffs on the grid of the
-# converged spacing, in A_host/jobs/converge/cutoff. Each picks the largest spacing (smallest
-# cut-off) whose energy per atom, and that of every finer value, is within converge_tol of the
-# finest. With kspacing set, the k-point scan is skipped and the cut-offs run at that spacing.
+# A1: converges the k-point grid, then the plane-wave cut-off, with single points of the host
+# primitive cell as given. First every Monkhorst-Pack grid of kgrid_list at the cheap cut-off
+# converge_kcutoff (default the lowest of converge_cutoffs), in A_host/jobs/converge/kpoints; then
+# every cut-off in converge_cutoffs on the converged grid, in A_host/jobs/converge/cutoff. Each
+# picks the coarsest grid (smallest cut-off) whose energy per atom, and that of every finer value,
+# is within converge_tol of the finest. The production k-point spacing, which every later cell
+# uses, is the one the converged grid has (grid_spacing). With kspacing set, the k-point scan is
+# skipped and the cut-offs run on the grid that spacing gives.
 # Writes A_host/production.param (any charge or spin in the .param left out: every job sets its
 # own). With converge : false, the .param and k-points are used as given.
 #   Called by: main() (step A1)
 #   Calls:     Project.batch(), Project.file(), Project.kspacing(), converged_value(),
-#              format_table(), production_param_text(), read_structure_file(), sc.kgrid()
+#              format_table(), grid_spacing(), production_param_text(), read_structure_file(),
+#              sc.kgrid()
 def step_converge(p):
     d = p.phase_dir("A")
     text = p.file("param").read_text()
@@ -1350,43 +1392,43 @@ def step_converge(p):
     def table():
         how = (f"cut-offs at kspacing {p.s.kspacing:g}" if p.s.kspacing else
                f"k-points at {kcut:g} eV, then cut-offs on the converged grid")
-        return format_table(["cut-off", "k-grid (spacing)", "E/atom (eV)", "vs best"], rows,
+        return format_table(["cut-off", "k-grid", "E/atom (eV)", "vs best"], rows,
                             f"Energy per atom: {how} (tolerance {tol:g} eV/atom)")
 
     kspacing = p.s.kspacing
-    if not kspacing:
-        grids = {}
-        for s in sorted(p.s.converge_kspacings, reverse=True):        # coarse to fine
-            grids.setdefault(tuple(sc.kgrid(prim.cell, s)), s)        # one job per distinct grid
+    if kspacing:
+        grid = tuple(sc.kgrid(prim.cell, kspacing))
+    else:
+        grids = [tuple(g) for g in p.s.converge_kgrids]                      # coarse to fine
         names = {g: "k_" + "x".join(map(str, g)) for g in grids}
         e = run("kpoints", [(names[g], g, kcut) for g in grids])
         if e is None:
             return None
         e_k = [e[names[g]] for g in grids]
-        kspacing = converged_value(list(grids.values()), e_k, tol)
-        rows += [[f"{kcut:g} eV", "x".join(map(str, g)) + f" ({s:g})", x, x - e_k[-1]]
-                 for (g, s), x in zip(grids.items(), e_k)]
-        if kspacing is None:
+        grid = converged_value(grids, e_k, tol)
+        rows += [[f"{kcut:g} eV", "x".join(map(str, g)), x, x - e_k[-1]]
+                 for g, x in zip(grids, e_k)]
+        if grid is None:
             print(table())
-            die(f"the k-points have not converged: only the finest spacing is within {tol:g} "
-                "eV/atom of itself (table above). Add smaller spacings to converge_kspacings "
-                "and rerun")
-    grid = tuple(sc.kgrid(prim.cell, kspacing))
+            die(f"the k-points have not converged: only the finest grid is within {tol:g} "
+                "eV/atom of itself (table above). Raise converge_kgrid_max and rerun")
+        kspacing = grid_spacing(prim.cell, grid)
     e = run("cutoff", [(f"cut_{c:g}", grid, c) for c in cuts])
     if e is None:
         return None
     e_cut = [e[f"cut_{c:g}"] for c in cuts]
     cutoff = converged_value(cuts, e_cut, tol)
-    rows += [[f"{c:g} eV", "x".join(map(str, grid)) + f" ({kspacing:g})", x, x - e_cut[-1]]
+    rows += [[f"{c:g} eV", "x".join(map(str, grid)), x, x - e_cut[-1]]
              for c, x in zip(cuts, e_cut)]
     if cutoff is None:
         print(table())
         die(f"the cut-off has not converged: only the highest is within {tol:g} eV/atom of "
             "itself (table above). Add higher cut-offs to converge_cutoffs and rerun")
     (d / "production.param").write_text(production_param_text(text, cutoff)[0])
-    return {"cutoff": cutoff, "kspacing": kspacing, "production_param": "A_host/production.param",
-            "energies": energies, "_table": table(),
-            "_note": f"k-point spacing {kspacing:g} 1/A, cut-off {cutoff:g} eV"}
+    return {"cutoff": cutoff, "kgrid": list(grid), "kspacing": kspacing,
+            "production_param": "A_host/production.param", "energies": energies,
+            "_table": table(), "_note": f"k-point grid {'x'.join(map(str, grid))} (spacing "
+                                        f"{kspacing:.4f} 1/A), cut-off {cutoff:g} eV"}
 
 
 # --------------------------------------------------------------------------
@@ -1869,30 +1911,43 @@ def parse_token(tok, prim):
 # The candidates from %block defects (B1 'yes'): one line per defect, components joined by '+'
 # (e.g. Sb_Ca + Vac_O). A pair with 'all' on its line gives every arrangement up to
 # pair_max_distance; otherwise each further component goes on the nearest site of its kind (as in
-# the size series).
+# the size series). q=... on a line (q=-1, or q=+1,0) gives the charge states of that line's
+# candidates, used instead of screen_charges.
 #   Called by: step_generate()
 #   Calls:     candidate(), pair_arrangements(), parse_token(), sc.defect_vectors(),
 #              sc.parse_defect()
 def user_defects(p, prim):
     out = []
     for row in p.s.defects:
-        words = [w for w in row if w.lower() != "all"]
-        every = len(words) < len(row)
+        every = any(w.lower() == "all" for w in row)
+        qwords = [w for w in row if w.lower().startswith("q=")]
+        words = [w for w in row if w.lower() != "all" and w not in qwords]
+        try:
+            charges = sorted({int(x) for w in qwords for x in w[2:].split(",") if x})
+        except ValueError:
+            die(f"%block defects: bad charge in '{' '.join(row)}' (write e.g. q=-1 or q=+1,0)")
+        if qwords and not charges:
+            die(f"%block defects: no charge after q= in '{' '.join(row)}'")
         toks = [t for t in " ".join(words).replace("+", " ").split() if t]
         comps = [parse_token(t, prim) for t in toks]
+        found = []
         if len(comps) == 1:
-            out.append(candidate(prim, comps, None, 1))
-            continue
-        if every and len(comps) == 2:
+            found.append(candidate(prim, comps, None, 1))
+        elif every and len(comps) == 2:
             for v, d, m in pair_arrangements(prim, comps[0], comps[1], p.s.pair_max_distance):
-                out.append(candidate(prim, [comps[0], dict(comps[1], vec=v.tolist())], d, m))
-            continue
-        if every:
+                found.append(candidate(prim, [comps[0], dict(comps[1], vec=v.tolist())], d, m))
+        elif every:
             die(f"%block defects: 'all' works for pairs only ({' + '.join(toks)})")
-        vecs = sc.defect_vectors(prim, sc.parse_defect(toks, prim))
-        full = [comps[0]] + [dict(c, vec=np.asarray(v).tolist()) for c, v in zip(comps[1:], vecs)]
-        sep = float(np.linalg.norm(vecs[0])) if vecs else None
-        out.append(candidate(prim, full, sep, 1))
+        else:
+            vecs = sc.defect_vectors(prim, sc.parse_defect(toks, prim))
+            full = [comps[0]] + [dict(c, vec=np.asarray(v).tolist())
+                                 for c, v in zip(comps[1:], vecs)]
+            sep = float(np.linalg.norm(vecs[0])) if vecs else None
+            found.append(candidate(prim, full, sep, 1))
+        for c in found:
+            if charges:
+                c["charges"] = charges
+        out += found
     return out
 
 
@@ -1956,11 +2011,14 @@ def step_generate(p):
     for k, c in enumerate(cands):
         c["id"] = f"d{k + 1:03d}"
     groups = sorted({c["group"] for c in cands})
+    own = any(c.get("charges") for c in cands)       # q= in %block defects: show them
     rows = [[c["id"], c["name"], c["group"],
              f"{c['separation']:.3f}" if c["separation"] is not None else "",
-             c["multiplicity"], c["sites"]] for c in cands]
+             c["multiplicity"], c["sites"]]
+            + ([" ".join(f"{q:+d}" for q in c["charges"]) if c.get("charges")
+                else "screen_charges"] if own else []) for c in cands]
     table = format_table(["id", "defect", "composition", "separation/A", "orientations",
-                          "sites/cell"], rows,
+                          "sites/cell"] + (["charges"] if own else []), rows,
                          f"{len(cands)} candidates in {len(groups)} composition groups")
     return {"candidates": {c["id"]: c for c in cands}, "groups": groups,
             "_note": f"{len(cands)} candidates in {len(groups)} groups", "_table": table}
@@ -1971,7 +2029,8 @@ def step_generate(p):
 # --------------------------------------------------------------------------
 # The defect the size scan and series use: series_defect (tokens, e.g. Sb_Ca@1 + Vac_O) or the
 # nearest arrangement of the first pair with a dopant (else the first candidate). Returns
-# (component dicts for build_defect, tokens for supercell_convergence.py, its name). A token names
+# (component dicts for build_defect, tokens for supercell_convergence.py, its name, the charge
+# states of its line in %block defects or None). A token names
 # the primitive-cell site (:k) its component sits on when its element has more than one, so that
 # supercell_convergence.py builds the same arrangement.
 #   Called by: step_scan(), step_series()
@@ -1983,7 +2042,7 @@ def representative(p, prim):
         vecs = sc.defect_vectors(prim, comps)
         full = [parse_token(toks[0], prim)] + [
             dict(parse_token(t, prim), vec=np.asarray(v).tolist()) for t, v in zip(toks[1:], vecs)]
-        return full, toks, " + ".join(toks)
+        return full, toks, " + ".join(toks), None
     cands = list(p.out("generate")["candidates"].values())
     pairs = [c for c in cands if len(c["comps"]) == 2 and any(x["new"] in p.s.dopants
                                                               for x in c["comps"])]
@@ -2005,7 +2064,7 @@ def representative(p, prim):
         if len(same) > 1:
             tok += f":{same.index(site) + 1}"
         toks.append(tok)
-    return c["comps"], toks, c["name"]
+    return c["comps"], toks, c["name"], c.get("charges")
 
 
 # B2: MACE size scan. Builds the representative defect in each of scan_sizes, relaxes it with
@@ -2024,7 +2083,7 @@ def step_scan(p):
                                                     "mace or scan is false") + ")"}
     d = p.phase_dir("B")
     prim = p.host()
-    comps, _, name = representative(p, prim)
+    comps, _, name, _ = representative(p, prim)
     rows, out, prev, cap = [], [], None, None
     for n in sorted(p.s.scan_sizes):
         P = p.supercell_matrix(n)
@@ -2087,7 +2146,8 @@ def runner_conv_lines(p, group):
 # B3: the CASTEP size series of the representative defect, run by supercell_convergence.py in
 # B_candidates/series: its .conv is written from the project (relaxed host cell, production
 # .param and k-points, e_bulk, transform, series_sizes up to the B2 cap, series_tol, MACE
-# pre-relaxation with mace : true, series_charge with its correction), then the script runs in
+# pre-relaxation with mace : true, the charge with its correction: series_charge if given, else
+# the defect's own q= in %block defects (0 if it allows it), else 0), then the script runs in
 # a subprocess (output to this terminal) and its convergence.json is read. A charged or
 # odd-electron defect runs spin-polarised with a starting spin (the lowest its electron count
 # allows, also put on the first component); otherwise the .param's own spin_polarized is kept.
@@ -2102,14 +2162,16 @@ def step_series(p):
     d = p.phase_dir("B") / "series"
     d.mkdir(parents=True, exist_ok=True)
     prim = p.host()
-    _, toks, name = representative(p, prim)
+    comps, toks, name, qs = representative(p, prim)
     cap = p.out("scan").get("cap")
     sizes = [n for n in sorted(p.s.series_sizes) if cap is None or n <= cap]
     if len(sizes) < 2:
         sizes = sorted(p.s.series_sizes)[:2]
     q = p.s.series_charge
-    spin = electron_parity(build_defect(prim, p.supercell_matrix(sizes[0]),
-                                        representative(p, prim)[0], name)[0], q)
+    if qs and "series_charge" not in p.raw:      # its own q= in %block defects: 0 if allowed
+        q = 0 if 0 in qs else qs[0]
+        log(f"B3: series in charge state {q:+d} (from q= in %block defects)")
+    spin = electron_parity(build_defect(prim, p.supercell_matrix(sizes[0]), comps, name)[0], q)
     drop = (r"(charge|spin|spin_polari[sz]ed)" if spin or q       # set below (either spelling)
             else r"(charge|spin)")
     param = "\n".join(line for line in p.production_param().splitlines()
@@ -2396,7 +2458,7 @@ def step_screen(p):
     plan = {}
     for cid, info in defects.items():
         atoms = load_cell(p, info["structure"])
-        for q in p.s.screen_charges:
+        for q in cands[cid].get("charges") or p.s.screen_charges:
             for S in spin_states(atoms, q, p.s.screen_spins):
                 name = f"{cid}_{qtag(q)}_s{S}"
                 jobs.append(screen_job(p, name, atoms, info, q, S))
@@ -3312,7 +3374,8 @@ def step_interest(p):
 STEPS = [
     # A: the host
     Step("converge", "A1", "converge the k-point spacing, then the cut-off", step_converge,
-         keys=("converge", "converge_cutoffs", "converge_kspacings", "converge_tol",
+         keys=("converge", "converge_cutoffs", "converge_kgrid_min", "converge_kgrid_max",
+               "converge_kgrid_step", "converge_tol",
                "converge_kcutoff", "kspacing", "energy"), files=("host_cell", "param"),
          owns=("A_host/jobs/converge", "A_host/production.param")),
     Step("relax", "A2.1", "relax the host (cell and positions)", step_relax,
@@ -3340,7 +3403,8 @@ STEPS = [
     Step("series", "B3", "CASTEP size series", step_series,
          keys=("series_defect", "series_charge", "series_sizes", "series_tol", "series_choice",
                "supercell", "transform", "mace", "mace_model", "charge_correction", "energy"),
-         needs=("scan", "relax", "converge", "dielectric"), owns=("B_candidates/series",)),
+         needs=("generate", "scan", "relax", "converge", "dielectric"),
+         owns=("B_candidates/series",)),
     Step("finetune", "B4", "MACE fine-tuning data", step_finetune,
          keys=("finetune", "finetune_args", "mace_model"), needs=("series",),
          owns=("B_candidates/finetune",)),
@@ -3434,11 +3498,13 @@ max_restarts : 0               # (the default for screening: a job that fails is
 %endblock runner_screen
 
 # ======================================================================= A: host
-converge : true                # A1: converge the k-point spacing, then the cut-off
-converge_kspacings : 0.08 0.06 0.05 0.04 0.03   # 1/Ang (CASTEP's 2*pi units), run first ...
-converge_kcutoff   : 400 eV    # ... at this cheap cut-off (default: the lowest cut-off below)
-converge_cutoffs   : 400 500 600 700 800 900 eV   # then these, on the converged k-grid
-converge_tol       : 0.001 eV/atom
+converge : true                # A1: converge the k-point grid, then the cut-off
+converge_kgrid_min  : 4        # primitive-cell k-point grids from this to this in these steps
+converge_kgrid_max  : 14       #   (n = n x n x n; three numbers each for a non-cubic grid,
+converge_kgrid_step : 2        #   e.g. 4 4 2 / 12 12 6 / 2 2 1), run first ...
+converge_kcutoff    : 400 eV   # ... at this cheap cut-off (default: the lowest cut-off below)
+converge_cutoffs    : 400 500 600 700 800 900 eV   # then these, on the converged grid
+converge_tol        : 0.001 eV/atom
 !kspacing          : 0.04      # use this k-point spacing instead of converging it
 !bands_kspacing    : 0.02      # A2 band edges (default: half the production spacing)
 # Dielectric constant for the charge corrections: DFPT phonon+efield, or give it yourself.
@@ -3466,9 +3532,10 @@ Sb2O3   Sb2O3.cell
 # ======================================================================= B: candidates
 dopants : Sb                   # extrinsic elements, as in the flowchart's B1
 # A known defect (B1 'yes'): list it and generation is skipped. 'all' screens every
-# arrangement within pair_max_distance, not just the nearest one.
+# arrangement within pair_max_distance, not just the nearest one; q= gives its charge states
+# (e.g. q=-1, or q=-1,0), instead of screen_charges.
 !%block defects
-!Sb_Ca + Vac_O   all
+!Sb_Ca + Vac_O   all   q=-1
 !%endblock defects
 vacancies     : true           # native vacancies
 antisites     : false
@@ -3482,7 +3549,7 @@ scan_sizes    : 2 3 4 5
 scan_tol      : 0.02 eV
 !series_defect : Sb_Ca@1 + Vac_O   # B3: the defect for the CASTEP size series (default:
                                #   the first dopant pair, nearest arrangement)
-series_charge : 0
+!series_charge : 0             # default: 0, or the defect's own q= in %block defects
 series_sizes  : 2 3 4
 series_tol    : 0.05 eV
 !supercell    : 3              # skip B2-B5 and use this size

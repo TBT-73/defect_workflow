@@ -241,7 +241,7 @@ The reference calculations every later phase depends on.
 
 | Label | Step | What it does | Stops if |
 |---|---|---|---|
-| A1 | `converge` | single points of the primitive cell: k-point spacings at a cheap cut-off, then cut-offs on the converged grid; writes `production.param` | a single point has no converged energy; only the finest value is within tolerance |
+| A1 | `converge` | single points of the primitive cell: k-point grids at a cheap cut-off, then cut-offs on the converged grid; writes `production.param` and the k-point spacing | a single point has no converged energy; only the finest value is within tolerance |
 | A2.1 | `relax` | variable-cell relaxation of the host | it doesn't finish |
 | A2.2 | `bands` | single point on a denser Γ-centred grid: VBM, CBM, gap | no `.bands` file |
 | A2.3 | `dielectric` | DFPT for the static and optical dielectric constants, or the value you give | no permittivity in the output, or only the optical one |
@@ -251,18 +251,27 @@ The reference calculations every later phase depends on.
 Every job copies the host `.cell`'s `species_pot` (and anything else in it apart from the
 structure and k-points), so list the dopants' potentials there too.
 
-**A1 converge.** Two scans, one after the other. First the k-points: every spacing in
-`converge_kspacings` (spacings that give the same grid run once) at the cheap cut-off
+**A1 converge.** Two scans, one after the other. First the k-points: Monkhorst–Pack grids of
+the primitive cell from `converge_kgrid_min` to `converge_kgrid_max` in steps of
+`converge_kgrid_step` (one number each for n × n × n grids, e.g. 4, 6, ..., 14; three each for a
+non-cubic grid, e.g. `4 4 2` to `12 12 6` in steps of `2 2 1`), at the cheap cut-off
 `converge_kcutoff` (default the lowest of `converge_cutoffs`), in `jobs/converge/kpoints/`. Then
-the cut-off: every value in `converge_cutoffs` on the grid of the converged spacing, in
-`jobs/converge/cutoff/`. With `kspacing` set, the k-point scan is skipped and the cut-offs run at
-that spacing. Each scan takes the largest spacing (smallest cut-off) whose energy per atom, and
-that of every finer value, is within `converge_tol` of the finest. If only the finest value
-qualifies, the step stops: add smaller spacings (or higher cut-offs) and rerun; the finished
-single points are reused. `A_host/production.param` is your `.param` with the
-converged `cut_off_energy`, and without any `charge` or `spin` (every job sets its own). With
-`converge : false`, nothing runs: your `.param` is used as it is, and the k-point spacing is
-`kspacing`, or that of the host `.cell`'s grid.
+the cut-off: every value in `converge_cutoffs` on the converged grid, in `jobs/converge/cutoff/`.
+Each scan takes the coarsest grid (smallest cut-off) whose energy per atom, and that of every
+finer value, is within `converge_tol` of the finest. If only the finest value qualifies, the step
+stops: raise `converge_kgrid_max` (or add higher cut-offs) and rerun; the finished single points
+are reused.
+
+Every later cell (the relaxed host, the competing phases, the supercells) gets its k-points from
+a spacing, so A1 turns the converged grid into one: the spacing halfway between that grid and the
+next coarser one, along the reciprocal vector that needs the finest spacing. That gives the same
+grid for the host even after A2.1 changes its lattice a little, the grid divided by m for an
+m × m × m supercell, and never fewer points than the converged grid in any direction.
+`summary.txt` gives both the grid and the spacing. With `kspacing` set, the k-point scan is
+skipped and the cut-offs run on the grid that spacing gives. `A_host/production.param` is your
+`.param` with the converged `cut_off_energy`, and without any `charge` or `spin` (every job sets
+its own). With `converge : false`, nothing runs: your `.param` is used as it is, and the k-point
+spacing is `kspacing`, or that of the host `.cell`'s grid.
 
 **A2.1 relax** relaxes lattice and positions (with symmetry) at the production settings;
 `host_relaxed.cell` is the cell every later phase builds on, and `e_bulk` its energy per atom.
@@ -310,7 +319,9 @@ With `supercell : n`, B2 and B3 are skipped and B5 takes that size.
 **B1 generate.** Your defects, one per line of `%block defects`, components joined by `+`:
 `Sb_Ca`, `Sb_Ca + Vac_O` (the partner on its nearest O site), `Sb_Ca + Vac_O  all` (every
 arrangement up to `pair_max_distance`), `Vac_O:2` (the 2nd O site of the primitive cell),
-`Sb_Ca@2` (a starting spin of 2 on the Sb). Without the block, on each symmetry-inequivalent site
+`Sb_Ca@2` (a starting spin of 2 on the Sb), and `q=` for the charge states of that line's
+defects (`Sb_Ca + Vac_O  all  q=-1`, `Vac_O  q=+2,+1`): those are screened instead of
+`screen_charges`. Without the block, on each symmetry-inequivalent site
 of the primitive cell: a vacancy (`vacancies`), a substitution by each dopant, antisites
 (`antisites`), Voronoi interstitials (`interstitials`), and pairs: dopant + native (`pairs`),
 native + native (`native_pairs`), dopant + dopant (`dopant_pairs`), never two interstitials. Each
@@ -377,7 +388,8 @@ with MACE (positions only), with `finetuned_model` if set, else `mace_model`. Wi
 their composition group are dropped before any CASTEP run (MACE knows nothing of charge or spin,
 so keep the window generous).
 
-**C2 screen.** For each candidate, charge state (`screen_charges`) and starting spin, one CASTEP
+**C2 screen.** For each candidate, charge state (its own `q=` from `%block defects`, else
+`screen_charges`) and starting spin, one CASTEP
 relaxation at Γ, without symmetry, at `screen_cutoff` (default the production cut-off), with at
 most `screen_max_steps` geometry steps and any `%block screen_overrides`. The starting spins
 (`screen_spins`): the lowest the electron count allows (0 or 1) and, with `both`, that + 2, set
@@ -508,7 +520,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 
 - **A**: [`antisites`](#b-candidates-and-cell-size) (B)
 - **B**: [`bands_kspacing`](#a-host) (A) · [`baseline_mb`](#runner-settings) (runner)
-- **C**: [`charge_correction`](#e-thermodynamics) (E) · [`%block chemical_potentials`](#a-host) (A) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kspacings`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
+- **C**: [`charge_correction`](#e-thermodynamics) (E) · [`%block chemical_potentials`](#a-host) (A) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kgrid_max`](#a-host) (A) · [`converge_kgrid_min`](#a-host) (A) · [`converge_kgrid_step`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
 - **D**: [`deep_level_margin`](#e-thermodynamics) (E) · [`%block defects`](#b-candidates-and-cell-size) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#c-screening) (C) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-and-cell-size) (B) · [`dopants`](#b-candidates-and-cell-size) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
 - **E**: [`energy`](#general) (general)
 - **F**: [`fermi_temperature`](#e-thermodynamics) (E) · [`finetune`](#b-candidates-and-cell-size) (B) · [`finetune_args`](#b-candidates-and-cell-size) (B) · [`finetuned_model`](#mace) (MACE) · [`freeze_radius`](#d-production) (D)
@@ -567,12 +579,12 @@ Details: [Phase A](#phase-a-the-host).
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
-| `converge` | `true` | A1 | Converge the k-point spacing, then the plane-wave cut-off, first. With `false`, A1 runs nothing: `production.param` is your `.param` (without `charge` or `spin`), and the k-point spacing is `kspacing`, or that of the host `.cell`'s grid. |
-| `converge_cutoffs` | `300 400 500 600 700 800 eV` (*list*) | A1 | The cut-offs tried, after the k-point scan: a single point of the host cell at each, on the grid of the converged spacing (or of `kspacing`). |
-| `converge_kspacings` | `0.1 0.08 0.06 0.05 0.04 0.03 1/ang` (*list*) | A1 | The k-point spacings tried first, at `converge_kcutoff`; spacings that give the same grid run once. Not used with `kspacing`. |
+| `converge` | `true` | A1 | Converge the k-point grid, then the plane-wave cut-off, first. With `false`, A1 runs nothing: `production.param` is your `.param` (without `charge` or `spin`), and the k-point spacing is `kspacing`, or that of the host `.cell`'s grid. |
+| `converge_cutoffs` | `300 400 500 600 700 800 eV` (*list*) | A1 | The cut-offs tried, after the k-point scan: a single point of the host cell at each, on the converged grid (or the grid of `kspacing`). |
+| `converge_kgrid_min`, `converge_kgrid_max`, `converge_kgrid_step` | `4`, `12`, `2` | A1 | The Monkhorst–Pack grids of the primitive cell tried first, at `converge_kcutoff`: from min to max in steps of step. One number each gives n × n × n grids; three each give a non-cubic grid, one number per reciprocal-lattice direction (e.g. `4 4 2`, `12 12 6`, `2 2 1`). A step of 0 keeps a direction fixed (min = max, e.g. 1 for a slab); every direction that moves must take the same number of steps. Not used with `kspacing`. |
 | `converge_kcutoff` | the lowest of `converge_cutoffs` | A1 | The cheap cut-off of the k-point scan. The k-point convergence barely depends on the cut-off, so a low one is enough. |
-| `converge_tol` | `0.001 eV/atom` | A1 | A1 takes the smallest cut-off, and the largest spacing, whose energy per atom (and that of every finer value) is within this of the finest one. If only the finest one is, A1 stops and asks for higher cut-offs or smaller spacings; the finished single points are reused. |
-| `kspacing` | from A1 | A1 | The production k-point spacing, in 1/Å as CASTEP's `kpoints_mp_spacing`. Every job without its own grid uses it. Setting it skips the k-point part of A1 (the cut-off is still converged). |
+| `converge_tol` | `0.001 eV/atom` | A1 | A1 takes the smallest cut-off, and the coarsest k-point grid, whose energy per atom (and that of every finer value) is within this of the finest one. If only the finest one is, A1 stops and asks for higher cut-offs or a higher `converge_kgrid_max`; the finished single points are reused. |
+| `kspacing` | from A1 | A1 | The production k-point spacing, in 1/Å as CASTEP's `kpoints_mp_spacing`. Every job without its own grid uses it; A1 works it out from the converged grid. Setting it skips the k-point part of A1 (the cut-off is still converged). |
 | `bands_kspacing` | half the production spacing | A2.2 | The spacing of the Γ-centred grid on which A2.2 finds the VBM, CBM and gap. Make it smaller if the band edges may lie between grid points. |
 | `dielectric` | from A2.3 | A2.3 | The static dielectric constant (electronic + ionic), ε₀, for every charge correction (B3, C3, E1). Setting it skips the DFPT run. |
 | `dielectric_inf` | — | A2.3 | The optical constant ε∞, recorded with `dielectric`. The corrections don't use it. |
@@ -592,7 +604,7 @@ Details: [Phase B](#phase-b-candidate-defects-and-cell-size).
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
 | `dopants` | — (*list*) | A3.1, A3.2, B1 | The extrinsic elements. B1 puts each on every inequivalent host site, and on the interstitial sites with `interstitials`; A3 limits their chemical potentials; C4 guesses their oxidation states. |
-| `%block defects` | — | B1 | Your own defects, one per line, components joined by `+`: `Sb_Ca` (Sb on a Ca site), `Vac_O`, `Vac_O:2` (the 2nd O site of the primitive cell), `Sb_Ca@2` (starting spin 2 on the Sb). Each later component goes on its nearest site of that kind to the first one; with `all` on the line (pairs only), every arrangement up to `pair_max_distance` becomes a candidate. With this block, nothing is generated. |
+| `%block defects` | — | B1 | Your own defects, one per line, components joined by `+`: `Sb_Ca` (Sb on a Ca site), `Vac_O`, `Vac_O:2` (the 2nd O site of the primitive cell), `Sb_Ca@2` (starting spin 2 on the Sb). Each later component goes on its nearest site of that kind to the first one; with `all` on the line (pairs only), every arrangement up to `pair_max_distance` becomes a candidate. `q=-1` (or `q=+1,0`) on a line gives its defects' charge states, used instead of `screen_charges` from C2 on (and by the size series, below). With this block, nothing is generated. |
 | `vacancies` | `true` | B1 | A vacancy on each inequivalent host site. |
 | `antisites` | `false` | B1 | Each other host element on each inequivalent host site. |
 | `interstitials` | `none` | B1 | `dopants`: the dopants on each Voronoi interstitial site (pymatgen-analysis-defects); `all`: every element there. |
@@ -604,7 +616,7 @@ Details: [Phase B](#phase-b-candidate-defects-and-cell-size).
 | `scan_sizes` | `2 3 4 5` (*list*) | B2 | The sizes n the scan tries, smallest first. |
 | `scan_tol` | `0.02 eV` | B2 | The scan stops at the first size whose MACE relaxation energy is within this of the size before. That size caps the CASTEP series; if the energy never levels off, there is no cap. |
 | `series_defect` | see text | B2, B3 | The defect of the size scan and series, as tokens like those of `%block defects` (e.g. `Sb_Ca@1 + Vac_O`). By default, the nearest arrangement of the first pair that contains a dopant, else the first candidate. It can't contain an interstitial. |
-| `series_charge` | `0` | B3 | The charge of the series defect. If it isn't 0, the series corrects E_f* with `charge_correction` and the A2.3 dielectric constant; a charged E_f* converges more slowly with size. |
+| `series_charge` | `0`, or the series defect's `q=` | B3 | The charge of the series defect. Without it, the series defect's own `q=` in `%block defects` is used (0 if that allows it, else the first listed). If it isn't 0, the series corrects E_f* with `charge_correction` and the A2.3 dielectric constant; a charged E_f* converges more slowly with size. |
 | `series_sizes` | `2 3 4` (*list*) | B3 | The sizes of the CASTEP series: those up to the B2 cap, and at least two. |
 | `series_tol` | `0.05 eV` | B3 | The series has converged when E_f* changes by less than this from one size to the next. If it doesn't converge, B5 stops: add sizes and rerun. |
 | `series_choice` | `smaller` | B3 | Which of the two sizes that agreed becomes the cell from B5 on: `smaller` or `larger`. |
@@ -622,7 +634,7 @@ phase D redoes the survivors properly.
 |---|---|---|---|
 | `triage` | `false` | C1 | Before any CASTEP run, drop arrangements whose MACE energy is more than `triage_window` above the lowest of their composition group (needs `mace : true`). |
 | `triage_window` | `1.0 eV` | C1 | How far above the group's lowest MACE energy an arrangement may be. MACE has no charge or spin, so keep it generous. |
-| `screen_charges` | `-1 0 1` (*list*) | C2 | The charge states every candidate is screened in. |
+| `screen_charges` | `-1 0 1` (*list*) | C2 | The charge states every candidate is screened in, except one with its own `q=` in `%block defects`. |
 | `screen_spins` | `both` | C2 | The starting spins: `low` is the lowest the electron count allows (0 or 1); `both` adds that + 2. They are starting values: the results keep the final spin. |
 | `screen_cutoff` | the production cut-off | C2, C5, C6 | The cut-off of the screening runs. |
 | `screen_max_steps` | `50` | C2, C5, C6 | `geom_max_iter` of the screening relaxations. A run that reaches it is logged as failed but keeps its last energy, marked as not converged. |
@@ -891,6 +903,17 @@ with `dwf.py`: carrying on after it was killed part-way through a step; a change
 (`require_spin`), which re-ran C3 onwards and reused the finished jobs; `--redo`; running single
 steps and phases; `--until`; `--status`; and the example folder's phase A, with dry runs on the
 login node.
+
+Since then, A1 converges k-point grids (from `converge_kgrid_min` to `_max`) instead of spacings,
+and `%block defects` takes `q=`. Run again, the test projects choose the same 8 × 8 × 8 grid and
+cut-off as before, and phases B to D give the same results. The production spacing worked out
+from the grid (about 0.045 1/Å) is finer than the 0.05 the old list of spacings gave, so A2.2's
+grid and the competing phases' k-points are a little denser, which moves their energies (and the
+chemical potentials) by a few meV. A project with `q=` on its lines (`Sb_Ca + Vac_O  all
+q=-1`, `Vac_O  q=+2,+1`, `Sb_Ca` without) screened, relaxed and analysed each defect in only its
+own charge states, and ran the size series in q = −1. A non-cubic grid list (`6 6 4` to
+`16 16 14` in steps of `2 2 2`) was tested through A1 and A2.1, and the checks on the three
+keywords on their own.
 
 Not tested: `phases_from : doped` (no Materials Project access here), a real fine-tuned model
 (`finetune.sh` is written but was not run), and real CASTEP output for the DFPT permittivity and
