@@ -31,8 +31,10 @@ max_nodes      : 12            # most nodes per job (fewer for screening: runner
 standard   2   --qos=standard
 highmem    4   --qos=highmem
 %endblock partitions
-dryrun_on  : login             # dry runs where dwf.py runs (not ARCHER2's shared serial
-dryrun_cmd : castep.serial --dryrun {seed}   #  partition, which rejects whole-node jobs)
+dryrun_on        : compute
+dryrun_partition : standard
+dryrun_time      : 0:10:0
+dryrun_options   : --qos=standard
 max_jobs  : 16                 # most jobs of one step queued at once
 max_restarts : 20              # a relaxation that runs out of time carries on this many times
 poll      : 30
