@@ -45,9 +45,11 @@ max_restarts : 0               # (the default for screening: a job that fails is
 
 # ======================================================================= A: host
 converge : true                # A1: converge the cut-off and k-point spacing first
-converge_kspacings : 0.07 0.06 0.05 0.04 0.03 0.02  # 1/Ang (CASTEP's 2*pi units)
-converge_kcutoff   : 400 eV                     # run k-points convergence at this cut-off
-converge_cutoffs   : 600 650 700 750 800 850 900 eV # then these, on the converged k-grid
+converge_kgrid_min  : 10        # 4x4x4, 6x6x6, ... 14x14x14
+converge_kgrid_max  : 18
+converge_kgrid_step : 1
+converge_kcutoff    : 400 eV   # the cheap cut-off for the grid scan
+converge_cutoffs    : 600 650 700 750 800 850 900 eV
 converge_tol       : 0.001 eV/atom
 !kspacing          : 0.04      # use this k-point spacing instead of converging it
 !bands_kspacing    : 0.02      # A2 band edges (default: half the production spacing)
