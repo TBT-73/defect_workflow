@@ -241,7 +241,7 @@ The reference calculations every later phase depends on.
 
 | Label | Step | What it does | Stops if |
 |---|---|---|---|
-| A1 | `converge` | single points of the primitive cell over cut-offs and k-point spacings; writes `production.param` | a single point has no converged energy; only the finest value is within tolerance |
+| A1 | `converge` | single points of the primitive cell: k-point spacings at a cheap cut-off, then cut-offs on the converged grid; writes `production.param` | a single point has no converged energy; only the finest value is within tolerance |
 | A2.1 | `relax` | variable-cell relaxation of the host | it doesn't finish |
 | A2.2 | `bands` | single point on a denser Γ-centred grid: VBM, CBM, gap | no `.bands` file |
 | A2.3 | `dielectric` | DFPT for the static and optical dielectric constants, or the value you give | no permittivity in the output, or only the optical one |
@@ -251,12 +251,15 @@ The reference calculations every later phase depends on.
 Every job copies the host `.cell`'s `species_pot` (and anything else in it apart from the
 structure and k-points), so list the dopants' potentials there too.
 
-**A1 converge.** Every cut-off in `converge_cutoffs` on the finest k-grid, and every spacing in
-`converge_kspacings` at the highest cut-off (skipped if `kspacing` is set; spacings that give the
-same grid run once). The converged value is the smallest cut-off (and the largest spacing) whose
-energy per atom, and that of every finer setting, is within `converge_tol` of the finest one. If
-only the finest value qualifies, the step stops: add higher cut-offs (or smaller spacings) and
-rerun; the finished single points are reused. `A_host/production.param` is your `.param` with the
+**A1 converge.** Two scans, one after the other. First the k-points: every spacing in
+`converge_kspacings` (spacings that give the same grid run once) at the cheap cut-off
+`converge_kcutoff` (default the lowest of `converge_cutoffs`), in `jobs/converge/kpoints/`. Then
+the cut-off: every value in `converge_cutoffs` on the grid of the converged spacing, in
+`jobs/converge/cutoff/`. With `kspacing` set, the k-point scan is skipped and the cut-offs run at
+that spacing. Each scan takes the largest spacing (smallest cut-off) whose energy per atom, and
+that of every finer value, is within `converge_tol` of the finest. If only the finest value
+qualifies, the step stops: add smaller spacings (or higher cut-offs) and rerun; the finished
+single points are reused. `A_host/production.param` is your `.param` with the
 converged `cut_off_energy`, and without any `charge` or `spin` (every job sets its own). With
 `converge : false`, nothing runs: your `.param` is used as it is, and the k-point spacing is
 `kspacing`, or that of the host `.cell`'s grid.
@@ -505,7 +508,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 
 - **A**: [`antisites`](#b-candidates-and-cell-size) (B)
 - **B**: [`bands_kspacing`](#a-host) (A) · [`baseline_mb`](#runner-settings) (runner)
-- **C**: [`charge_correction`](#e-thermodynamics) (E) · [`%block chemical_potentials`](#a-host) (A) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kspacings`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
+- **C**: [`charge_correction`](#e-thermodynamics) (E) · [`%block chemical_potentials`](#a-host) (A) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kspacings`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
 - **D**: [`deep_level_margin`](#e-thermodynamics) (E) · [`%block defects`](#b-candidates-and-cell-size) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#c-screening) (C) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-and-cell-size) (B) · [`dopants`](#b-candidates-and-cell-size) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
 - **E**: [`energy`](#general) (general)
 - **F**: [`fermi_temperature`](#e-thermodynamics) (E) · [`finetune`](#b-candidates-and-cell-size) (B) · [`finetune_args`](#b-candidates-and-cell-size) (B) · [`finetuned_model`](#mace) (MACE) · [`freeze_radius`](#d-production) (D)
@@ -564,9 +567,10 @@ Details: [Phase A](#phase-a-the-host).
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
-| `converge` | `true` | A1 | Converge the plane-wave cut-off and k-point spacing first. With `false`, A1 runs nothing: `production.param` is your `.param` (without `charge` or `spin`), and the k-point spacing is `kspacing`, or that of the host `.cell`'s grid. |
-| `converge_cutoffs` | `300 400 500 600 700 800 eV` (*list*) | A1 | The cut-offs tried: a single point of the host cell at each, on the finest k-grid (`kspacing`, or the smallest of `converge_kspacings`). |
-| `converge_kspacings` | `0.1 0.08 0.06 0.05 0.04 0.03 1/ang` (*list*) | A1 | The k-point spacings tried, at the highest cut-off; spacings that give the same grid run once. Not used with `kspacing`. |
+| `converge` | `true` | A1 | Converge the k-point spacing, then the plane-wave cut-off, first. With `false`, A1 runs nothing: `production.param` is your `.param` (without `charge` or `spin`), and the k-point spacing is `kspacing`, or that of the host `.cell`'s grid. |
+| `converge_cutoffs` | `300 400 500 600 700 800 eV` (*list*) | A1 | The cut-offs tried, after the k-point scan: a single point of the host cell at each, on the grid of the converged spacing (or of `kspacing`). |
+| `converge_kspacings` | `0.1 0.08 0.06 0.05 0.04 0.03 1/ang` (*list*) | A1 | The k-point spacings tried first, at `converge_kcutoff`; spacings that give the same grid run once. Not used with `kspacing`. |
+| `converge_kcutoff` | the lowest of `converge_cutoffs` | A1 | The cheap cut-off of the k-point scan. The k-point convergence barely depends on the cut-off, so a low one is enough. |
 | `converge_tol` | `0.001 eV/atom` | A1 | A1 takes the smallest cut-off, and the largest spacing, whose energy per atom (and that of every finer value) is within this of the finest one. If only the finest one is, A1 stops and asks for higher cut-offs or smaller spacings; the finished single points are reused. |
 | `kspacing` | from A1 | A1 | The production k-point spacing, in 1/Å as CASTEP's `kpoints_mp_spacing`. Every job without its own grid uses it. Setting it skips the k-point part of A1 (the cut-off is still converged). |
 | `bands_kspacing` | half the production spacing | A2.2 | The spacing of the Γ-centred grid on which A2.2 finds the VBM, CBM and gap. Make it smaller if the band edges may lie between grid points. |

@@ -135,6 +135,7 @@ PROJECT_KEYWORDS = {
     "converge": (_b, True), "converge_cutoffs": (_floats(), [300, 400, 500, 600, 700, 800]),
     "converge_kspacings": (_floats(), [0.1, 0.08, 0.06, 0.05, 0.04, 0.03]),
     "converge_tol": (sc._num("eV/atom", "eV"), 0.001), "kspacing": (sc._num("1/ang"), None),
+    "converge_kcutoff": (sc._num("eV"), None),
     "bands_kspacing": (sc._num("1/ang"), None),
     "dielectric": (sc._num(), None), "dielectric_inf": (sc._num(), None),
     "dielectric_task": (_t, "phonon+efield"), "dielectric_param": (_t, None),
@@ -1298,13 +1299,15 @@ def converged_value(values, energies, tol):
     return None
 
 
-# A1: converges the plane-wave cut-off and the k-point spacing.
-# One batch of single points of the host primitive cell as given: every cut-off in
-# converge_cutoffs on the finest k-grid, and every spacing in converge_kspacings (unless kspacing
-# is set) at the highest cut-off; spacings that give the same grid are run once. Picks the
-# smallest cut-off and the largest spacing within converge_tol (eV/atom) of the best, and writes
-# A_host/production.param (any charge or spin in the .param left out: every job sets its own).
-# With converge : false, the .param and k-points are used as given.
+# A1: converges the k-point spacing, then the plane-wave cut-off, with single points of the host
+# primitive cell as given. First every spacing in converge_kspacings (spacings that give the same
+# grid run once) at the cheap cut-off converge_kcutoff (default the lowest of converge_cutoffs),
+# in A_host/jobs/converge/kpoints; then every cut-off in converge_cutoffs on the grid of the
+# converged spacing, in A_host/jobs/converge/cutoff. Each picks the largest spacing (smallest
+# cut-off) whose energy per atom, and that of every finer value, is within converge_tol of the
+# finest. With kspacing set, the k-point scan is skipped and the cut-offs run at that spacing.
+# Writes A_host/production.param (any charge or spin in the .param left out: every job sets its
+# own). With converge : false, the .param and k-points are used as given.
 #   Called by: main() (step A1)
 #   Calls:     Project.batch(), Project.file(), Project.kspacing(), converged_value(),
 #              format_table(), production_param_text(), read_structure_file(), sc.kgrid()
@@ -1321,51 +1324,69 @@ def step_converge(p):
                 "production_param": "A_host/production.param", "_note": "converge : false - "
                 "the project's .param and k-points are used as they are"}
     prim = read_structure_file(p.file("host_cell"))
+    n, tol = len(prim), p.s.converge_tol
     cuts = sorted(p.s.converge_cutoffs)
-    spacings = sorted(p.s.converge_kspacings, reverse=True)       # coarse to fine
-    fine = p.s.kspacing or spacings[-1]
-    grids = {}
-    for s in ([] if p.s.kspacing else spacings):
-        grids.setdefault(tuple(sc.kgrid(prim.cell, s)), s)        # one job per distinct grid
-    jobs = [{"name": f"cut_{c:g}", "atoms": prim, "kind": "sp", "symmetry": True,
-             "kgrid": sc.kgrid(prim.cell, fine),
-             "overrides": dict(HOST_OVERRIDES, cut_off_energy=f"{c:g} eV")} for c in cuts]
-    jobs += [{"name": "k_" + "x".join(map(str, g)), "atoms": prim, "kind": "sp",
-              "symmetry": True, "kgrid": list(g),
-              "overrides": dict(HOST_OVERRIDES, cut_off_energy=f"{cuts[-1]:g} eV")}
-             for g in grids]
-    res = p.batch("A_host/jobs/converge", jobs, "host", text)
-    if not res["complete"]:
-        return None
-    r, n = res["jobs"], len(prim)
-    bad = [k for k, v in r.items() if v["energy"] is None or not v["scf_converged"]]
-    if bad:
-        die("the convergence single points " + ", ".join(bad) + " have no converged energy "
-            "- check their .castep files in " + str(p.dir / "A_host/jobs/converge"))
-    e_cut = [r[f"cut_{c:g}"]["energy"] / n for c in cuts]
-    cutoff = converged_value(cuts, e_cut, p.s.converge_tol)
-    rows = [[f"{c:g} eV", "x".join(map(str, sc.kgrid(prim.cell, fine))), e, e - e_cut[-1]]
-            for c, e in zip(cuts, e_cut)]
+    kcut = p.s.converge_kcutoff or cuts[0]
+    rows, energies = [], {}
+
+    # Runs single points of the primitive cell (one per (name, grid, cut-off)) in
+    # A_host/jobs/converge/<sub>; their energies per atom, or None while jobs are queued.
+    def run(sub, todo):
+        jobs = [{"name": name, "atoms": prim, "kind": "sp", "symmetry": True, "kgrid": list(g),
+                 "overrides": dict(HOST_OVERRIDES, cut_off_energy=f"{c:g} eV")}
+                for name, g, c in todo]
+        res = p.batch(f"A_host/jobs/converge/{sub}", jobs, "host", text)
+        if not res["complete"]:
+            return None
+        bad = [k for k, v in res["jobs"].items() if v["energy"] is None or not v["scf_converged"]]
+        if bad:
+            die("the convergence single points " + ", ".join(bad) + " have no converged energy "
+                "- check their .castep files in " + str(p.dir / "A_host/jobs/converge" / sub))
+        out = {name: res["jobs"][name]["energy"] / n for name, _, _ in todo}
+        energies.update(out)
+        return out
+
+    # The table so far, printed before stopping when a scan has not converged.
+    def table():
+        how = (f"cut-offs at kspacing {p.s.kspacing:g}" if p.s.kspacing else
+               f"k-points at {kcut:g} eV, then cut-offs on the converged grid")
+        return format_table(["cut-off", "k-grid (spacing)", "E/atom (eV)", "vs best"], rows,
+                            f"Energy per atom: {how} (tolerance {tol:g} eV/atom)")
+
     kspacing = p.s.kspacing
     if not kspacing:
-        gl = list(grids)
-        e_k = [r["k_" + "x".join(map(str, g))]["energy"] / n for g in gl]
-        kspacing = converged_value([grids[g] for g in gl], e_k, p.s.converge_tol)
-        rows += [[f"{cuts[-1]:g} eV", "x".join(map(str, g)) + f" ({grids[g]:g})", e, e - e_k[-1]]
-                 for g, e in zip(gl, e_k)]
-    table = format_table(["cut-off", "k-grid (spacing)", "E/atom (eV)", "vs best"], rows,
-                         f"Energy per atom, tolerance {p.s.converge_tol:g} eV/atom")
-    if cutoff is None or kspacing is None:
-        print(table)
-        die("not converged within the values given: only the "
-            + ("highest cut-off" if cutoff is None else "finest k-point spacing")
-            + f" is within {p.s.converge_tol:g} eV/atom of itself (table above). Add "
-            + ("higher cut-offs to converge_cutoffs" if cutoff is None
-               else "smaller spacings to converge_kspacings") + " and rerun")
+        grids = {}
+        for s in sorted(p.s.converge_kspacings, reverse=True):        # coarse to fine
+            grids.setdefault(tuple(sc.kgrid(prim.cell, s)), s)        # one job per distinct grid
+        names = {g: "k_" + "x".join(map(str, g)) for g in grids}
+        e = run("kpoints", [(names[g], g, kcut) for g in grids])
+        if e is None:
+            return None
+        e_k = [e[names[g]] for g in grids]
+        kspacing = converged_value(list(grids.values()), e_k, tol)
+        rows += [[f"{kcut:g} eV", "x".join(map(str, g)) + f" ({s:g})", x, x - e_k[-1]]
+                 for (g, s), x in zip(grids.items(), e_k)]
+        if kspacing is None:
+            print(table())
+            die(f"the k-points have not converged: only the finest spacing is within {tol:g} "
+                "eV/atom of itself (table above). Add smaller spacings to converge_kspacings "
+                "and rerun")
+    grid = tuple(sc.kgrid(prim.cell, kspacing))
+    e = run("cutoff", [(f"cut_{c:g}", grid, c) for c in cuts])
+    if e is None:
+        return None
+    e_cut = [e[f"cut_{c:g}"] for c in cuts]
+    cutoff = converged_value(cuts, e_cut, tol)
+    rows += [[f"{c:g} eV", "x".join(map(str, grid)) + f" ({kspacing:g})", x, x - e_cut[-1]]
+             for c, x in zip(cuts, e_cut)]
+    if cutoff is None:
+        print(table())
+        die(f"the cut-off has not converged: only the highest is within {tol:g} eV/atom of "
+            "itself (table above). Add higher cut-offs to converge_cutoffs and rerun")
     (d / "production.param").write_text(production_param_text(text, cutoff)[0])
     return {"cutoff": cutoff, "kspacing": kspacing, "production_param": "A_host/production.param",
-            "energies": {name: v["energy"] / n for name, v in r.items()},
-            "_note": f"cut-off {cutoff:g} eV, k-point spacing {kspacing:g} 1/A", "_table": table}
+            "energies": energies, "_table": table(),
+            "_note": f"k-point spacing {kspacing:g} 1/A, cut-off {cutoff:g} eV"}
 
 
 # --------------------------------------------------------------------------
@@ -3290,9 +3311,9 @@ def step_interest(p):
 # ==========================================================================================
 STEPS = [
     # A: the host
-    Step("converge", "A1", "converge the cut-off and k-point spacing", step_converge,
-         keys=("converge", "converge_cutoffs", "converge_kspacings", "converge_tol", "kspacing",
-               "energy"), files=("host_cell", "param"),
+    Step("converge", "A1", "converge the k-point spacing, then the cut-off", step_converge,
+         keys=("converge", "converge_cutoffs", "converge_kspacings", "converge_tol",
+               "converge_kcutoff", "kspacing", "energy"), files=("host_cell", "param"),
          owns=("A_host/jobs/converge", "A_host/production.param")),
     Step("relax", "A2.1", "relax the host (cell and positions)", step_relax,
          keys=("energy",), files=("host_cell",), needs=("converge",),
@@ -3413,9 +3434,10 @@ max_restarts : 0               # (the default for screening: a job that fails is
 %endblock runner_screen
 
 # ======================================================================= A: host
-converge : true                # A1: converge the cut-off and k-point spacing first
-converge_cutoffs   : 400 500 600 700 800 900 eV
-converge_kspacings : 0.08 0.06 0.05 0.04 0.03   # 1/Ang (CASTEP's 2*pi units)
+converge : true                # A1: converge the k-point spacing, then the cut-off
+converge_kspacings : 0.08 0.06 0.05 0.04 0.03   # 1/Ang (CASTEP's 2*pi units), run first ...
+converge_kcutoff   : 400 eV    # ... at this cheap cut-off (default: the lowest cut-off below)
+converge_cutoffs   : 400 500 600 700 800 900 eV   # then these, on the converged k-grid
 converge_tol       : 0.001 eV/atom
 !kspacing          : 0.04      # use this k-point spacing instead of converging it
 !bands_kspacing    : 0.02      # A2 band edges (default: half the production spacing)
