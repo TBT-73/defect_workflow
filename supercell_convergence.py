@@ -289,6 +289,9 @@ KPOINT_KEYS = {"kpoint_mp_grid", "kpoints_mp_grid", "kpoint_mp_spacing",
                "kpoints_mp_spacing", "kpoint_mp_offset", "kpoints_mp_offset"}
 SET_KEYS = KPOINT_KEYS | {"fix_all_cell"}       # written by the script instead
 # Atom-indexed / primitive-cell-specific blocks that would be wrong in a supercell
+# Keywords CASTEP accepts under two spellings: read as the one on the right, so that setting
+# either replaces the other (two spellings of one keyword in a .param is an error).
+KEY_SYNONYMS = {"spin_polarised": "spin_polarized"}
 DROP_BLOCKS = {"kpoint_list", "kpoints_list", "symmetry_ops",
                "ionic_constraints", "ionic_velocities", "cell_constraints"}
 # Also left out of the defect cells, which are run without symmetry
@@ -357,6 +360,14 @@ def strip_comment(line):
     return re.split(r"[#!]", line, maxsplit=1)[0].strip()
 
 
+# A keyword in lower case, with CASTEP's other spellings turned into one (KEY_SYNONYMS):
+# spin_polarised -> spin_polarized.
+#   Called by: parse_castep_input(), read_batch_file(), set_param(), dwf.py
+def canonical_key(key):
+    key = key.lower()
+    return KEY_SYNONYMS.get(key, key)
+
+
 # Reads any CASTEP-style text into a list of items.
 # Used for your .cell and .param(s), the .conv input file and CASTEP's -out.cell. Each item is a
 # block {'type': 'block', 'name', 'body'}, a keyword {'type': 'kw', 'key', 'value', 'raw'} or any
@@ -364,7 +375,7 @@ def strip_comment(line):
 # exactly as they were.
 #   Called by: cell_options(), final_atoms(), last_geometry(), main(), param_charge(),
 #              read_batch_file(), read_input(), read_structure(), relaxed_atoms(), run_batch()
-#   Calls:     strip_comment()
+#   Calls:     canonical_key(), strip_comment()
 def parse_castep_input(text):
     """Split a .cell/.param file into blocks, keywords and other lines."""
     items, lines, i = [], text.splitlines(), 0
@@ -383,7 +394,7 @@ def parse_castep_input(text):
         else:
             m = re.match(r"(\w+)\s*[:=]?\s*(.*)", s)
             if m:
-                items.append({"type": "kw", "key": m.group(1).lower(),
+                items.append({"type": "kw", "key": canonical_key(m.group(1)),
                               "value": m.group(2).strip(), "raw": lines[i]})
             else:
                 items.append({"type": "raw", "raw": lines[i]})
@@ -1433,16 +1444,18 @@ def run_time_for(walltime, per_scf=None, factor=1.0):
 # Sets keywords in a calculation's .param, e.g. run_time and continuation.
 # Removes any existing line for each keyword and appends the new value (a value of None just
 # removes the keyword). Everything else in the file is left as it is, so changes you make by hand
-# to a calculation's .param survive restarts. Keywords must be given in lower case.
+# to a calculation's .param survive restarts. Either spelling of a keyword with two
+# (canonical_key: spin_polarised, spin_polarized) replaces both.
 #   Called by: finalize(), restart(), write_inputs()
-#   Calls:     strip_comment()
+#   Calls:     canonical_key(), strip_comment()
 def set_param(calc, **values):
     """Set keywords in the calc's .param (None removes the keyword)."""
+    values = {canonical_key(k): v for k, v in values.items()}
     path = calc.dir / f"{calc.seed}.param"
     lines = []
     for line in path.read_text().splitlines():
         m = re.match(r"\s*(\w+)", strip_comment(line))
-        if not (m and m.group(1).lower() in values):
+        if not (m and canonical_key(m.group(1)) in values):
             lines.append(line)
     lines += [f"{key} : {val}" for key, val in values.items() if val is not None]
     path.write_text("\n".join(lines) + "\n")
@@ -2805,8 +2818,8 @@ def read_structure(path):
 # File names are relative to the batch file. Returns the settings with the jobs in
 # args.batch_jobs.
 #   Called by: get_args()
-#   Calls:     batch_args(), block_rows(), _bool(), _choice(), _ints(), parse_castep_input(),
-#              read_structure()
+#   Calls:     batch_args(), block_rows(), _bool(), _choice(), canonical_key(), _ints(),
+#              parse_castep_input(), read_structure()
 def read_batch_file(path):
     name, base = path.name, path.parent
     rows, items = None, []
@@ -2850,7 +2863,7 @@ def read_batch_file(path):
                     job["kpoint_offset"] = ("gamma" if val.lower() == "gamma"
                                             else [float(x) for x in val.split(",")])
                 else:
-                    job["overrides"][key] = val
+                    job["overrides"][canonical_key(key)] = val
             except ValueError as err:
                 die(f"{name}: job {row[0]}: bad option '{opt}': {err}")
         jobs.append(job)

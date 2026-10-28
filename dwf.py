@@ -1489,7 +1489,7 @@ def step_dielectric(p):
 # .param keyword) or from doped (phases_from : doped, with the Materials Project). Returns a list
 # of (name, Atoms, options dict).
 #   Called by: step_phases()
-#   Calls:     doped_phases(), read_structure_file()
+#   Calls:     doped_phases(), read_structure_file(), sc.canonical_key()
 def phase_list(p):
     if p.s.phases:
         out = []
@@ -1504,7 +1504,7 @@ def phase_list(p):
                 elif k.lower() == "kspacing":
                     opts["kspacing"] = float(v)
                 else:
-                    opts["overrides"][k.lower()] = v
+                    opts["overrides"][sc.canonical_key(k)] = v
             if opts.get("metal"):
                 opts["overrides"].setdefault("fix_occupancy", "false")
             out.append((row[0], read_structure_file(p.base / row[1]), opts))
@@ -2089,7 +2089,8 @@ def step_series(p):
     q = p.s.series_charge
     spin = electron_parity(build_defect(prim, p.supercell_matrix(sizes[0]),
                                         representative(p, prim)[0], name)[0], q)
-    drop = r"(charge|spin|spin_polarized)" if spin or q else r"(charge|spin)"   # set below
+    drop = (r"(charge|spin|spin_polari[sz]ed)" if spin or q       # set below (either spelling)
+            else r"(charge|spin)")
     param = "\n".join(line for line in p.production_param().splitlines()
                       if not sc.re.match(rf"\s*{drop}\b", sc.strip_comment(line),
                                          sc.re.I)).rstrip() + "\n"
