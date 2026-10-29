@@ -1,9 +1,9 @@
 #!/bin/bash
-# Jobscript template for ARCHER2: the runner fills in {JOBNAME}, {NODES}, {TASKS_PER_NODE},
-# {CPUS_PER_TASK} and {SEED}. --time is the longest any job may run, unless max_walltime in the
-# project file says otherwise (for every step, or in a runner block for some); jobs ask for less
-# once finished ones show what they need. Use your own account (--account) and CASTEP module.
-
+# Jobscript template for ARCHER2: the runner fills in the placeholders in braces (job name,
+# nodes, tasks per node, CPUs per task, seed). --time is the longest any job may run, unless
+# max_walltime in the project file says otherwise (for every step, or in a runner block for
+# some); jobs ask for less once finished ones show what they need. Use your own account
+# (--account) and CASTEP module.
 #SBATCH --job-name={JOBNAME}
 #SBATCH --time=24:00:00
 #SBATCH --nodes={NODES}
@@ -16,7 +16,7 @@
 export OMP_NUM_THREADS=1
 export SRUN_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK
 
-module purge
+module load load-epcc-module epcc-setup-env
 module load castep/26.11
 
 srun --distribution=block:block --hint=nomultithread castep.mpi {SEED}

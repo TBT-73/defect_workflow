@@ -35,6 +35,7 @@ dryrun_on        : compute
 dryrun_partition : standard
 dryrun_time      : 0:10:0
 dryrun_options   : --qos=standard
+dryrun_pack      : 32
 max_jobs  : 16                 # most jobs of one step queued at once
 max_restarts : 20              # a relaxation that runs out of time carries on this many times
 poll      : 30
@@ -52,6 +53,7 @@ max_walltime : 4:00:00
 %block runner_converge         # A1: single points of the 2-atom primitive cell
 max_nodes    : 1
 max_walltime : 0:20:00
+pack         : 4
 %block partitions              # ARCHER2's short QoS: at most 20 minutes and 32 nodes
 standard   2   --qos=short
 %endblock partitions

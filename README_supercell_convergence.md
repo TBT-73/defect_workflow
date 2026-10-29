@@ -289,7 +289,7 @@ memory.
 ### Walltimes (`walltime : auto`)
 
 - **The ceiling:** the template's `--time`, or a `--time=` on a partition line, is the most any job may ask for. `max_walltime` (e.g. `max_walltime : 12:00:00`) replaces both, so the ceiling can be set without editing the template; in `dwf.py` it can be set for each step.
-- **How the estimate works:** once jobs have finished, later ones ask for less. The script takes the measured time per SCF cycle and scales it to the new cell by k-points × electrons^a ÷ processes. The exponent a is fitted from the sizes done so far, and is 3 until there are two. That is multiplied by the SCF cycles the biggest finished relaxation needed, then by `walltime_safety` (1.5).
+- **How the estimate works:** once jobs have finished, later ones ask for less. The script takes the measured time per SCF cycle and scales it to the new cell by k-points × electrons^a ÷ processes. The exponent a is fitted from the sizes done so far, and is 3 until there are two. That is multiplied by the SCF cycles the biggest finished relaxation needed, then by `walltime_safety` (1.5). A relaxation also gets the margin its `run_time` stops it by (below), so it isn't stopped before the estimated time.
 - **Rounding:** up to 15 minutes, with at least 30 minutes.
 - **Single points** on a relaxed cell use that cell's own relaxation timing.
 - **First single points** (`sp_walltime`): until a job has finished there is nothing to estimate from, so the first pristine-cell single points would ask for the full `--time` and wait longer in the queue. Set e.g. `sp_walltime : 4:00:00` to ask for that instead. If one runs out of time, it is resubmitted with the full `--time` (this counts towards `max_restarts`).
@@ -453,8 +453,8 @@ A batch file is written like a `.conv` file and holds:
   structure or k-points);
 - `kspacing` (for jobs without their own grid), `energy`, `workdir` (default
   `batch_<file name>`);
-- `max_jobs` (the most jobs queued at once) and `tolerate_failures` (a job that fails is marked
-  failed and the others carry on);
+- `max_jobs` (the most jobs queued at once), `tolerate_failures` (a job that fails is marked
+  failed and the others carry on) and `pack` (below);
 - `%block jobs`, one job per line: `name  structure-file  [option=value ...]`.
 
 Job options: `kind=geom|sp` (a relaxation, carried on from its `.check` when it runs out of
@@ -487,6 +487,27 @@ is set up again if it never ran; if it has run, the script stops (`--force` keep
 table at the end and written to `batch_results.json` in the work directory. From Python, call
 `run_batch(workdir, jobs, args, cell_text, param_text, ...)`: its comment in the script lists
 the job options.
+
+**Several small jobs on one node (`pack : N`).** On machines that hand out whole nodes, N jobs
+can share one node in one batch job, each on `cores_per_node`/N cores. Each is planned for its
+share as usual (its k-points, the memory from its dry run); the jobs get `PACK_MEM` (three
+quarters) of the node's memory between them, in proportion to their cores, and one that doesn't
+fit in its share runs on its own. The pack's script, `packs/pack_NNN/job.sh` in the work
+directory, is the template's `#SBATCH` lines for one whole node (with `--exclusive`, without
+`--ntasks-per-node` and `--cpus-per-task`) followed by one background line per job - `cd` to its
+directory, then `srun --nodes=1 --ntasks=n --cpus-per-task=c --exact --mem=...M` and the rest of
+the template's CASTEP line - and `wait`. Each job's output, including `slurm-<job id>.out`, stays
+in its own directory, and its `job_info.json` records the pack. When fewer than N jobs are left
+they share the node evenly; a job left on its own is planned for whole nodes. A job that needs a
+restart runs on its own. The template's CASTEP line must use `srun`.
+
+**Dry runs in one job (`dryrun_pack : N`).** With `dryrun_on : compute`, each dry run is otherwise
+a job of its own. `dryrun_pack : N` runs up to N of them side by side in one job
+(`packs/dryrun_NNN/job.sh`): the dry-run template's `#SBATCH` lines for N processes on one node,
+with `dryrun_partition`, `dryrun_time` and `dryrun_options`, then one background line per dry run
+(`srun --ntasks=1 --exact --mem=<dryrun_mem_gb>`) and `wait`. On a partition whose nodes are
+shared, ask for the memory too, e.g. `dryrun_options : --mem={MEM_GB}G` (`{MEM_GB}` is then N ×
+`dryrun_mem_gb`).
 
 ---
 
@@ -556,6 +577,7 @@ Defaults in brackets.
 - `dryrun_cores` [1], `dryrun_mem_gb` [4].
 - `dryrun_cmd` [castep.mpi --dryrun {seed}].
 - `dryrun_timeout` [900 s].
+- `dryrun_pack` [1]: batch mode, see Batch mode.
 
 **Scheduler**
 
@@ -567,6 +589,8 @@ Defaults in brackets.
 
 - `max_jobs` [no limit]: the most jobs queued at once.
 - `tolerate_failures` [false]: a job that fails is marked failed and the others carry on.
+- `pack` [1]: run up to N jobs side by side on one node (needs `cores_per_node`).
+- `dryrun_pack` [1]: run up to N dry runs side by side in one job (`dryrun_on : compute`).
 - `%block jobs`, plus `param`, `geom_param`, `cell`, `kspacing`, `energy`, `workdir`: see [Batch mode](#batch-mode).
 
 **Run control**

@@ -161,6 +161,41 @@ to 20 minutes). The settings of every step are checked when `dwf.py` starts. The
 any results, so changing them never makes a step run again: when you run `dwf.py` again, the
 jobs it has not submitted yet, and the restarts of those already queued, use the new settings.
 
+**Several small jobs on one node (`pack`).** ARCHER2 charges for whole nodes, however few cores
+a job uses, and nodes are never shared between jobs. `pack : N` in a step's block runs N of that
+step's CASTEP jobs side by side in one Slurm job on one node, each on 1/N of its cores: with
+`pack : 4`, four jobs of 32 cores each. It suits steps with many small jobs, such as A1's single
+points of the primitive cell:
+
+```
+%block runner_converge
+max_nodes    : 1
+max_walltime : 0:20:00
+pack         : 4
+%endblock runner_converge
+```
+
+- Each job is planned for its own share of the node as usual (processes for its k-points, memory
+  from its dry run). Together the jobs get three-quarters of the node's memory, in proportion to
+  their cores, which leaves the rest for the system. A job too big for its share runs on its own,
+  as without `pack`.
+- When fewer than N jobs are left, the last packs share them out evenly, and each job gets more
+  of the node; a job left on its own gets whole nodes.
+- The pack asks for the longest walltime of its jobs.
+- A job that has to be restarted (a relaxation that ran out of time) runs on its own, on whole
+  nodes. A job that fails doesn't stop the others in its pack from running.
+- The pack's job script is `jobs/<step>/packs/pack_NNN/job.sh`. Each job still has its own
+  folder, where it writes its output and `slurm-<job id>.out`; its `job_info.json` names the pack.
+- It needs `cores_per_node` and a jobscript whose CASTEP line uses `srun` (each job of a pack is
+  started with its own `srun --exact`). It doesn't apply to B3, whose sizes are jobs of their own.
+
+The dry runs can be packed too, which matters with `dryrun_on : compute`, where each dry run is
+otherwise a job of its own that waits in the queue and, on ARCHER2's standard partition, takes a
+whole node. `dryrun_pack : N` (e.g. 32, for every step) runs up to N of a step's dry runs side
+by side in one job, one process each with `dryrun_mem_gb` of memory, in
+`jobs/<step>/packs/dryrun_NNN/job.sh`. With `dryrun_on : login` the dry runs don't go to the queue
+at all, so it doesn't apply.
+
 ---
 
 ## Command line
@@ -243,7 +278,8 @@ Each phase has one folder with the same layout:
   format with `ase convert` (e.g. to `.cif`).
 - **`jobs/<step>/<job>/`**: one CASTEP calculation each: `.cell`, `.param`, `.castep`,
   `-out.cell`, `.check` (unless `delete_check`), `job.sh`, `dryrun.sh` and `job_info.json`
-  (what the runner decided and how it went). Each `jobs/<step>/` has a `batch_results.json`.
+  (what the runner decided and how it went). Each `jobs/<step>/` has a `batch_results.json`,
+  and with `pack` or `dryrun_pack` a `packs/` folder with the job script of each pack.
 
 What each phase's `results.json` holds:
 
@@ -554,7 +590,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **A**: [`antisites`](#b-candidates-and-cell-size) (B)
 - **B**: [`bands_kspacing`](#a-host) (A) · [`baseline_mb`](#runner-settings) (runner)
 - **C**: [`charge_correction`](#e-thermodynamics) (E) · [`%block chemical_potentials`](#a-host) (A) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kgrid_max`](#a-host) (A) · [`converge_kgrid_min`](#a-host) (A) · [`converge_kgrid_step`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
-- **D**: [`deep_level_margin`](#e-thermodynamics) (E) · [`%block defects`](#b-candidates-and-cell-size) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#c-screening) (C) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-and-cell-size) (B) · [`dopants`](#b-candidates-and-cell-size) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
+- **D**: [`deep_level_margin`](#e-thermodynamics) (E) · [`%block defects`](#b-candidates-and-cell-size) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#c-screening) (C) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-and-cell-size) (B) · [`dopants`](#b-candidates-and-cell-size) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_pack`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
 - **E**: [`energy`](#general) (general)
 - **F**: [`fermi_temperature`](#e-thermodynamics) (E) · [`finetune`](#b-candidates-and-cell-size) (B) · [`finetune_args`](#b-candidates-and-cell-size) (B) · [`finetuned_model`](#mace) (MACE) · [`freeze_radius`](#d-production) (D)
 - **G**: [`gap`](#e-thermodynamics) (E)
@@ -566,7 +602,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **M**: [`mace`](#mace) (MACE) · [`mace_device`](#mace) (MACE) · [`mace_fmax`](#mace) (MACE) · [`mace_model`](#mace) (MACE) · [`mace_steps`](#mace) (MACE) · [`mace_threads`](#mace) (MACE) · [`max_cores`](#runner-settings) (runner) · [`max_jobs`](#runner-settings) (runner) · [`max_nodes`](#runner-settings) (runner) · [`max_restarts`](#runner-settings) (runner) · [`max_walltime`](#runner-settings) (runner) · [`mem_per_core`](#runner-settings) (runner) · [`mem_replicated`](#runner-settings) (runner) · [`mem_safety`](#runner-settings) (runner) · [`mp_api_key`](#a-host) (A)
 - **N**: [`name`](#general) (general) · [`native_pairs`](#b-candidates-and-cell-size) (B)
 - **O**: [`omp_threads`](#runner-settings) (runner) · [`%block oxidation_states`](#c-screening) (C)
-- **P**: [`pair_max_distance`](#b-candidates-and-cell-size) (B) · [`pairs`](#b-candidates-and-cell-size) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
+- **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-and-cell-size) (B) · [`pairs`](#b-candidates-and-cell-size) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
 - **Q**: [`quench_temperature`](#e-thermodynamics) (E)
 - **R**: [`rattle_dmin`](#c-screening) (C) · [`rattle_stdev`](#c-screening) (C) · [`require_bound`](#c-screening) (C) · [`require_gap_states`](#c-screening) (C) · [`require_spin`](#c-screening) (C) · [`%block runner_<group>`, `%block runner_<step>`](#runner-settings) (runner)
 - **S**: [`scan`](#b-candidates-and-cell-size) (B) · [`scan_sizes`](#b-candidates-and-cell-size) (B) · [`scan_tol`](#b-candidates-and-cell-size) (B) · [`screen_charges`](#c-screening) (C) · [`screen_cutoff`](#c-screening) (C) · [`screen_max_steps`](#c-screening) (C) · [`%block screen_overrides`](#c-screening) (C) · [`screen_spins`](#c-screening) (C) · [`series_charge`](#b-candidates-and-cell-size) (B) · [`series_choice`](#b-candidates-and-cell-size) (B) · [`series_defect`](#b-candidates-and-cell-size) (B) · [`series_sizes`](#b-candidates-and-cell-size) (B) · [`series_tol`](#b-candidates-and-cell-size) (B) · [`share_rounds`](#c-screening) (C) · [`sp_walltime`](#runner-settings) (runner) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-and-cell-size) (B)
@@ -744,11 +780,13 @@ by its group's block, then by its own ([How a run works](#how-a-run-works) lists
 | `dryrun_jobscript` | the jobscript | A separate template for dry-run jobs. |
 | `dryrun_partition`, `dryrun_time`, `dryrun_options` | — | The partition, time and other `#SBATCH` options of dry-run jobs. |
 | `dryrun_cores`, `dryrun_mem_gb` | `1`, `4` | The cores and memory (GB) of a dry-run job. |
+| `dryrun_pack` | `1` | With `dryrun_on : compute`: run up to N of a step's dry runs side by side in one job, one process each ([How a run works](#how-a-run-works)). Needs a jobscript (or `dryrun_jobscript`) whose CASTEP line uses `srun`; not for B3. |
 | `submit_cmd` | `sbatch` | The command that submits a job. |
 | `status_cmd` | `squeue` or `qstat` | The command that lists queued and running jobs. |
 | `poll` | `120 s` | Seconds between checks of the queue. |
 | `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once. |
 | `tolerate_failures` | `false` (`true` for `screen` and `production`) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
+| `pack` | `1` | Run up to N of a step's jobs side by side on one node, in one job, each on `cores_per_node`/N cores and its share of the node's memory ([How a run works](#how-a-run-works)). Needs `cores_per_node` and a jobscript whose CASTEP line uses `srun`; not for B3. |
 
 `--prepare-only`, `--no-wait`, `--resubmit-failed` and `--force` are command-line switches
 ([Command line](#command-line)), not project-file keywords.
@@ -959,6 +997,23 @@ walltime) and give the same results. `Final` was also run with a block for every
 ran out of time under a 20-minute `max_walltime` was carried on in a new job with the same 20
 minutes.
 
+Then `pack`. `Charges`, `Opts2` and `User` were run with `pack : 4` for A1 and the screening
+steps and `pack : 2` for A3.1 and D1, and gave the same results as without it at every step,
+also with `--no-wait` and the jobs finishing in the background. The packs filled up as planned
+(the last ones shared out evenly), a screening job that failed inside a pack was flagged while
+the others carried on, and relaxations of a pack that stopped at their `run_time` were carried
+on as jobs of their own. These runs also showed that a relaxation's walltime, worked out from
+earlier jobs, left too little time once its `run_time` margin (15 minutes or more) was taken
+off, so short relaxations were stopped and restarted needlessly; the margin is now added to the
+estimate. Without `pack`, the test projects again submit the same jobs and give the same
+results, except that some relaxations now ask for a little more time (e.g. 1:15:00 instead of
+1:00:00).
+
+Then `dryrun_pack`. With `dryrun_pack : 16` as well (their dry runs go to the compute nodes),
+the same three projects ran their dry runs up to 16 to a job (e.g. `Opts2`'s 138 screening dry
+runs in 9 jobs) and gave the same results, also with `--no-wait`. Without it, every dry-run
+script (`dryrun.sh`) and job script is the same as before.
+
 Not tested: `phases_from : doped` (no Materials Project access here), a real fine-tuned model
 (`finetune.sh` is written but was not run), and real CASTEP output for the DFPT permittivity and
 the `.bands` of spin-polarised runs.
@@ -984,3 +1039,8 @@ On the first real runs, check:
    alignment: fine for sorting candidates, not for production levels (those come from E2).
 5. **The band edges** come from A2.2's uniform Γ-centred grid, not a band-structure path: lower
    `bands_kspacing` if the edges may lie between grid points, or give `gap`.
+6. **Packs** (`pack`, `dryrun_pack`): the mock Slurm doesn't check what a pack's job script asks
+   for. On the first packed step, look at a `jobs/<step>/packs/pack_NNN/job.sh` (or
+   `dryrun_NNN`), and check with
+   `sacct -j <job id> --format=JobID,JobName,NTasks,AllocCPUS,Start,End,MaxRSS` that its job
+   steps ran side by side, each with its own processes.

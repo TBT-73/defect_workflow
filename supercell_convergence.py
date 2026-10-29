@@ -115,7 +115,8 @@ job asks for less once finished
 jobs show what it needs: their time per SCF cycle is scaled to the new cell as
 k-points x electrons^a / processes (a fitted from the finished sizes, 3 until there
 are two) and multiplied by the SCF cycles of the biggest finished relaxation, then by
-walltime_safety. Until a job has finished there is nothing to scale from, so the first
+walltime_safety (a relaxation also gets the margin its run_time stops it by, below).
+Until a job has finished there is nothing to scale from, so the first
 jobs get the full --time; set sp_walltime to give the first single points (e.g. the
 pristine cells) a shorter one, so they wait less in the queue (one that runs out is
 resubmitted with the full --time). Each relaxation gets CASTEP's run_time a little below
@@ -149,7 +150,10 @@ If the template's partition needs more cores (e.g. multicore needs 2+), send the
 runs elsewhere with dryrun_partition : serial, and shorten their walltime with
 dryrun_time : 0-1. For anything else give a separate template in dryrun_jobscript
 (use {SEED} and write --dryrun yourself). dryrun_on : login runs them where the
-script runs instead, using dryrun_cmd.
+script runs instead, using dryrun_cmd. In batch mode, dryrun_pack : N runs up to N dry
+runs side by side in one job (packs/dryrun_NNN/job.sh), each as one process started with
+srun --exact and dryrun_mem_gb of memory, so a step's dry runs don't wait in the queue
+one by one; the template's CASTEP line must use srun.
 
 The script waits for the jobs, so run it in tmux/screen or with nohup. It can be
 stopped and rerun with the same command at any time: finished and queued
@@ -177,9 +181,13 @@ relaxation) or  scr1  cand1.cell  kind=geom kgrid=1,1,1 charge=-1 spin=2. Each j
 its own directory, dry run, plan, walltime and restarts, as in a size series; jobs that
 would give the same dry run share one. max_jobs limits how many jobs are queued at once,
 and with tolerate_failures : true a job that fails is marked failed (in its job_info.json)
-while the others carry on; --resubmit-failed starts the failed ones again. The results
-are written to batch_results.json in the work directory (batch_<file name> by default).
-From Python: run_batch(workdir, jobs, args, cell_text, param_text, ...) (see its comment).
+while the others carry on; --resubmit-failed starts the failed ones again. With pack : N
+(and cores_per_node), up to N jobs run side by side on one node, in one job of their own
+(packs/pack_NNN/job.sh), each on cores_per_node/N cores with srun --exact and its share of
+the node's memory; a job that doesn't fit in its share, or needs a restart, runs on its own.
+The results are written to batch_results.json in the work directory (batch_<file name> by
+default). From Python: run_batch(workdir, jobs, args, cell_text, param_text, ...) (see its
+comment).
 """
 
 import argparse
@@ -278,10 +286,18 @@ UNITS = {"ang": 1.0, "bohr": BOHR, "a0": BOHR, "nm": 10.0}
 JOBSCRIPT, DRYRUN_SCRIPT, INFO = "job.sh", "dryrun.sh", "job_info.json"
 # the line of the jobscript template that runs CASTEP, and MPI process-count variables
 CASTEP_RUN = re.compile(r"((?<![\w])castep[\w.\-]*\s+)\{SEED\}")
+DRYRUN_RUN = re.compile(r"((?<![\w])castep[\w.\-]*\s+(?:--dryrun|-d)\s+)\{SEED\}")   # dry runs
 NPROC_VARS = re.compile(r"\$\{?(SLURM_NTASKS|SLURM_NPROCS|NSLOTS|PBS_NP)\}?")
 # a filled-in jobscript line that runs CASTEP (not a comment or a module command)
 CASTEP_LINE = re.compile(r"^(?!\s*#)(?!\s*module\b).*(?<![\w/])castep[\w.\-]*\s+\S", re.M)
 OMP_AUTO_MAX = 4                       # most OpenMP threads per process with omp_threads : auto
+# pack : N (batch mode): the jobs of a pack get this fraction of the node's memory between them
+# (each in proportion to its cores; the rest is left for the system), and their job scripts go in
+# <workdir>/packs/
+PACK_MEM, PACK_DIR = 0.75, "packs"
+# srun options a pack sets itself for each job, taken out of the template's CASTEP line
+SRUN_OWN = re.compile(r"\s(--(?:nodes|ntasks|ntasks-per-node|cpus-per-task|mem|mem-per-cpu)"
+                      r"(?:=|\s+)\S+|--(?:exact|exclusive)(?:=\S+)?|-[nNc]\s*\S+)(?=\s|$)")
 
 # Regenerated for every supercell; everything else in the primitive .cell
 # (species_pot, ...) is copied across unchanged.
@@ -1065,36 +1081,38 @@ def group_options(tokens):
     return options
 
 
-# Writes the text of dryrun.sh, the batch job that runs CASTEP --dryrun.
-# With dryrun_jobscript, that template is just filled in. Otherwise your main template is used,
-# with the line that runs CASTEP changed to one process with --dryrun (CASTEP_RUN, NPROC_VARS) and
-# dryrun_cores requested. dryrun_partition, dryrun_time and dryrun_options are then set with
-# add_sbatch_option. prepare_all writes the file and submits it.
-#   Called by: prepare_all()
-#   Calls:     add_sbatch_option(), fill()
-def dryrun_script(calc, ctx, args):
-    """Dry-run jobscript: dryrun_jobscript if given, otherwise the main template with
-    dryrun_cores requested (on one node) and the CASTEP line run as one process with
-    --dryrun. dryrun_partition, dryrun_time and dryrun_options then set those #SBATCH
-    options."""
-    gb, n = args.dryrun_mem_gb, args.dryrun_cores
-    subs = {"{SEED}": calc.seed, "{JOBNAME}": calc.name + "_dry", "{NKPTS}": 0, "{NCORES}": n,
-            "{NODES}": 1, "{TASKS_PER_NODE}": n, "{CPUS_PER_TASK}": 1,
+# The template of the dry-run jobs: dryrun_jobscript if given; otherwise your main template, with
+# the line that runs CASTEP changed to one process with --dryrun (CASTEP_RUN, NPROC_VARS).
+#   Called by: batch_args(), dryrun_script(), submit_dryrun_pack()
+def dryrun_template_text(job_template, dryrun_template):
+    if dryrun_template:
+        return dryrun_template
+    lines = []
+    for line in job_template.splitlines():
+        if CASTEP_RUN.search(line) and not line.lstrip().startswith("#"):
+            line = CASTEP_RUN.sub(r"\1--dryrun {SEED}", line).replace("{NCORES}", "1")
+            line = NPROC_VARS.sub("1", line)
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+# The placeholders of a dry-run job for ncores processes in all (several in a pack of dry runs).
+#   Called by: dryrun_script(), submit_dryrun_pack()
+def dryrun_subs(seed, jobname, ncores, gb, args):
+    return {"{SEED}": seed, "{JOBNAME}": jobname, "{NKPTS}": 0, "{NCORES}": ncores,
+            "{NODES}": 1, "{TASKS_PER_NODE}": ncores, "{CPUS_PER_TASK}": 1,
             "{MEM_GB}": math.ceil(gb), "{MEM_MB}": math.ceil(gb * 1024),
             "{MEM_PER_NODE_GB}": math.ceil(gb),
-            "{MEM_PER_CORE_GB}": math.ceil(gb / n), "{MEM_PER_CORE_MB}": math.ceil(gb * 1024 / n),
+            "{MEM_PER_CORE_GB}": math.ceil(gb / ncores),
+            "{MEM_PER_CORE_MB}": math.ceil(gb * 1024 / ncores),
             "{PARTITION}": args.dryrun_partition or (args.partitions[0]["name"]
                                                      if args.partitions else "")}
-    if ctx["dryrun_template"]:
-        script = fill(ctx["dryrun_template"], subs)
-    else:
-        lines = []
-        for line in ctx["job_template"].splitlines():
-            if CASTEP_RUN.search(line) and not line.lstrip().startswith("#"):
-                line = CASTEP_RUN.sub(r"\1--dryrun {SEED}", line).replace("{NCORES}", "1")
-                line = NPROC_VARS.sub("1", line)
-            lines.append(line)
-        script = fill("\n".join(lines) + "\n", subs)
+
+
+# Sets dryrun_partition, dryrun_time and dryrun_options in a dry-run job script.
+#   Called by: dryrun_script(), submit_dryrun_pack()
+#   Calls:     add_sbatch_option(), fill()
+def dryrun_sbatch(script, subs, args):
     if args.dryrun_partition:
         script = add_sbatch_option(script, f"--partition={args.dryrun_partition}")
     if args.dryrun_time:
@@ -1102,6 +1120,23 @@ def dryrun_script(calc, ctx, args):
     for option in args.dryrun_options:
         script = add_sbatch_option(script, fill(option, subs))
     return script
+
+
+# Writes the text of dryrun.sh, the batch job that runs CASTEP --dryrun.
+# The dry-run template (dryrun_template_text) filled in for dryrun_cores processes, then
+# dryrun_partition, dryrun_time and dryrun_options (dryrun_sbatch). prepare_all writes the file
+# and submits it, or runs it in a pack with other dry runs (dryrun_pack : N, submit_dryrun_pack).
+#   Called by: prepare_all()
+#   Calls:     dryrun_sbatch(), dryrun_subs(), dryrun_template_text(), fill()
+def dryrun_script(calc, ctx, args):
+    """Dry-run jobscript: dryrun_jobscript if given, otherwise the main template with
+    dryrun_cores requested (on one node) and the CASTEP line run as one process with
+    --dryrun. dryrun_partition, dryrun_time and dryrun_options then set those #SBATCH
+    options."""
+    subs = dryrun_subs(calc.seed, calc.name + "_dry", args.dryrun_cores, args.dryrun_mem_gb,
+                       args)
+    template = dryrun_template_text(ctx["job_template"], ctx["dryrun_template"])
+    return dryrun_sbatch(fill(template, subs), subs, args)
 
 
 # The text of a finished dry run, or None if it hasn't finished yet.
@@ -1397,8 +1432,9 @@ def estimate_walltime(calc, nkpts, nelec, procs, ctx):
 # Chooses a job's walltime.
 # The --time already in the jobscript (from the template, a partition line or max_walltime) is the
 # longest allowed. With walltime : auto and finished jobs to learn from, it asks for
-# estimate_walltime x walltime_safety instead, rounded up to 15 minutes (at least WALLTIME_MIN), if
-# that is shorter.
+# estimate_walltime x walltime_safety instead - plus, for a relaxation, the margin by which its
+# run_time stops it before the walltime (run_time_for), so that run_time covers the estimate -
+# rounded up to 15 minutes (at least WALLTIME_MIN), if that is shorter.
 # With no finished job to learn from, a single point asks for sp_walltime instead, if set and
 # shorter (restart gives it the full --time if it runs out). Returns the plan: walltime, longest
 # walltime, seconds, seconds per SCF and a note for the log. Notes once if the template has no
@@ -1428,7 +1464,11 @@ def plan_walltime(calc, script, dr, procs, ctx, args):
             plan.time, plan.secs = slurm_time(guess), guess
             plan.note = " (sp_walltime: no finished job to estimate it from yet)"
         return plan
-    secs = max(WALLTIME_MIN, math.ceil(est * args.walltime_safety / 900) * 900)
+    need = est * args.walltime_safety
+    if calc.kind == "geom" and not (args.max_restarts == 0
+                                    and getattr(args, "tolerate_failures", False)):
+        need += max(900.0, 1.5 * (plan.per_scf or 0.0))     # run_time stops it this much earlier
+    secs = max(WALLTIME_MIN, math.ceil(need / 900) * 900)
     if secs < smax:
         plan.time, plan.secs, plan.note = slurm_time(secs), secs, f" (estimated from {ref.name})"
     else:
@@ -1517,15 +1557,20 @@ def node_layouts(nk, cpn, max_nodes, fixed=None):
 # order and the first where the best layout fits in memory is used. If none fits with full nodes,
 # it takes the partition where fewer processes per node give the best layout (the job is
 # underpopulated); if nothing fits at all, the one that comes closest (finalize then logs a
-# warning). Returns a namespace: nodes, tpn, ncores, mpc, part, fits, underpop, cpus, skipped.
+# warning). With pack (more than 1: that many jobs share a node, pack : N), the job is first planned
+# on its share of a node, cores_per_node // pack cores, on the first partition where the best
+# layout there fits in its share of PACK_MEM of the node's memory; only if none does is it planned
+# as a job of its own. Returns a namespace: nodes, tpn, ncores, mpc, part, fits, underpop, cpus,
+# skipped, and packed and share (its cores) for a packed job.
 #   Called by: finalize()
 #   Calls:     choose_cores(), layout_key(), mem_per_core_mb(), node_layouts()
-def choose_resources(dr, args):
+def choose_resources(dr, args, pack=1):
     """Processes (and nodes), memory per process (MB) and partition for a calculation,
     from its dry run. Partitions are tried in the order given and the first where the job
     fits is used, otherwise the one that comes closest. With cores_per_node, if no
     partition fits with full nodes, the job runs with fewer processes per node, on the
-    partition where that gives the best layout."""
+    partition where that gives the best layout. With pack > 1 the job is planned on its
+    share of a node if it fits there."""
     nk, cpn = dr["nkpts"], args.cores_per_node
     skipped, under, over = [], [], []
 
@@ -1539,7 +1584,21 @@ def choose_resources(dr, args):
         return SimpleNamespace(nodes=nodes, tpn=tpn, ncores=nodes * tpn, mpc=mpc(nodes * tpn),
                                part=p, fits=fits, underpop=underpop,
                                cpus=max(1, cpn // tpn) if cpn else 1,
-                               skipped=[q for q in skipped if q is not p])
+                               skipped=[q for q in skipped if q is not p], packed=False,
+                               share=None)
+
+    if pack > 1 and cpn:                                          # a share of one node
+        share = cpn // pack
+        for p in args.partitions or [None]:
+            gb = p["mem_per_core"] if p else args.mem_per_core
+            cap = min(share, p["max_cores"]) if p and p["max_cores"] else share
+            layouts = node_layouts(nk, cap, 1, args.cores)
+            if layouts and (gb is None or layouts[0][1] * mpc(layouts[0][1])
+                            <= gb * 1024 * PACK_MEM * share):
+                n = layouts[0][1]
+                return SimpleNamespace(nodes=1, tpn=n, ncores=n, mpc=mpc(n), part=p, fits=True,
+                                       underpop=False, cpus=max(1, share // n), skipped=[],
+                                       packed=True, share=share)
 
     for p in args.partitions or [None]:
         gb = p["mem_per_core"] if p else args.mem_per_core       # None: no memory limit
@@ -1750,13 +1809,15 @@ def write_inputs(calc, ctx, args):
 # For each calculation not yet submitted: writes its inputs if needed (write_inputs; again if the
 # MACE settings changed), gets its dry run - already finished, run here (local_dryrun) or submitted
 # as a batch job (dryrun_script + submit) - and plans the job (finalize). Dry-run jobs are
-# submitted together and waited for together (wait_for with key 'dryrun_jobid'). With shared dry
-# runs (batch mode), a calculation whose dry run would be the same as another's (dryrun_key) gets a
-# copy of that one instead of its own. show=False plans without logging each plan. Returns False if
-# --no-wait and dry runs are still queued.
+# submitted together and waited for together (wait_for with key 'dryrun_jobid'); in batch mode
+# with dryrun_pack : N, up to N of them go in one job (even_groups, submit_dryrun_pack). With
+# shared dry runs (batch mode), a calculation whose dry run would be the same as another's
+# (dryrun_key) gets a copy of that one instead of its own. show=False plans without logging each
+# plan. Returns False if --no-wait and dry runs are still queued.
 #   Called by: main(), run_batch()
-#   Calls:     Calc.done(), dryrun_output(), dryrun_script(), finalize(), local_dryrun(),
-#              prerelax_settings(), submit(), wait_for(), write_inputs()
+#   Calls:     Calc.done(), dryrun_output(), dryrun_script(), even_groups(), finalize(),
+#              local_dryrun(), prerelax_settings(), submit(), submit_dryrun_pack(), wait_for(),
+#              write_inputs()
 def prepare_all(calcs, ctx, args, show=True):
     """Give every calc its inputs, a dry run and a jobscript. Dry runs are submitted to
     the queue together (or run here with dryrun_on : login). Calcs not yet submitted are
@@ -1778,7 +1839,7 @@ def prepare_all(calcs, ctx, args, show=True):
         c.dryrun_file.write_text(text)
         return text
 
-    queued, leaders = [], {}
+    queued, leaders, send = [], {}, []
     for c in calcs:
         if c.done() or c.info().get("jobid"):
             continue
@@ -1800,10 +1861,16 @@ def prepare_all(calcs, ctx, args, show=True):
                 queued.append(c)
                 continue
             (c.dir / DRYRUN_SCRIPT).write_text(dryrun_script(c, ctx, args))
-            submit(c, args, DRYRUN_SCRIPT, "dryrun_jobid")
+            send.append(c)
         if key:
             leaders.setdefault(key, c)
         queued.append(c)
+    npack = args.dryrun_pack if ctx.get("batch") else 1
+    for group in even_groups(send, npack):         # dryrun_pack : N - N to a job
+        if len(group) > 1:
+            submit_dryrun_pack(group, ctx, args)
+        else:
+            submit(group[0], args, DRYRUN_SCRIPT, "dryrun_jobid")
     jobs = [c for c in queued if c.info().get("dryrun_jobid")]
     if jobs and not wait_for(jobs, args, "dryrun_jobid"):
         return False
@@ -1826,16 +1893,21 @@ def prepare_all(calcs, ctx, args, show=True):
 # - except in a batch with max_restarts : 0 and tolerate_failures (screening), where nothing would
 # carry it on: there it may use its whole walltime. The plan is saved in job_info.json and
 # logged (show), with warnings about memory and odd electron counts unless quiet. Returns a
-# one-line summary of the layout.
+# one-line summary of the layout. In batch mode with pack : N the job is planned on its share of a
+# node (choose_resources), 1/N of it or, given pack, 1/pack (pack=1: a job of its own, as for a
+# restart); run_batch then runs it with others in one job (submit_pack), and its own job.sh is
+# only used if it is ever submitted on its own.
 #   Called by: prepare_all(), prepare_sp(), restart(), run_batch()
 #   Calls:     add_sbatch_option(), choose_resources(), fill(), parse_dryrun(), plan_walltime(),
 #              run_time_for(), set_param(), set_threads(), thread_count()
-def finalize(calc, text, ctx, args, quiet=False, show=True):
+def finalize(calc, text, ctx, args, quiet=False, show=True, pack=None):
     """Choose cores, memory and partition from the dry run and write the real jobscript.
-    quiet: no warnings; show: log the plan."""
+    quiet: no warnings; show: log the plan; pack: how many jobs share its node (default: the
+    pack setting, in batch mode)."""
     dr = parse_dryrun(text)
     grid = calc.info()["kgrid"]
-    r = choose_resources(dr, args)
+    npack = (args.pack if pack is None else pack) if ctx.get("batch") else 1
+    r = choose_resources(dr, args, npack)
     ncores, mpc, part = r.ncores, r.mpc, r.part
     if not quiet:
         if dr["mem"]["baseline"] > 2000 and args.baseline_mb is None and not ctx.get("noted"):
@@ -1890,9 +1962,14 @@ def finalize(calc, text, ctx, args, quiet=False, show=True):
                 nodes=r.nodes if args.cores_per_node else None, tasks_per_node=r.tpn,
                 omp_threads=threads, dryrun_mem=dr["mem"],
                 mem_replicated=round(args.mem_replicated, 4),
-                walltime=wall.time, walltime_max=wall.max, scf_seconds=wall.per_scf)
+                walltime=wall.time, walltime_max=wall.max, scf_seconds=wall.per_scf,
+                packed=r.packed, share=r.share)
     calc.save(info)
-    if args.cores_per_node:
+    if r.packed:
+        size = (f"{r.tpn} processes" + (f" x {threads} threads" if threads > 1 else "")
+                + f" ({npack} jobs to a node, {r.share} cores each)")
+        mem = f"~{mpc / 1024:.1f} GB/process"
+    elif args.cores_per_node:
         size = (f"{r.nodes} node{'s' if r.nodes > 1 else ''} x {r.tpn} processes"
                 + (f" x {threads} threads" if threads > 1 else ""))
         mem = f"~{mpc / 1024:.1f} GB/process (~{r.tpn * mpc / 1024:.0f} GB/node)"
@@ -1969,30 +2046,50 @@ def prepare_sp(sp, geom, ctx, args):
     finalize(sp, geom.dryrun_file.read_text(errors="replace"), ctx, args, quiet=True)
 
 
-# Submits job.sh (or dryrun.sh) with submit_cmd and records the job in job_info.json.
-# Saves the job id and submission time. For a real job it also appends a run to info['runs']: the
-# job id, where its output will start in the .castep (the file's current size), its walltime and
-# number of processes - run_segments, job_timing, last_peak and Calc.run_text depend on this
-# record. Stops if the submission fails.
-#   Called by: handle_failure(), main(), prepare_all(), restart(), run_batch()
-#   Calls:     sbatch_value()
-def submit(calc, args, script=JOBSCRIPT, key="jobid"):
-    start = calc.castep.stat().st_size if calc.castep.exists() else 0   # where its output begins
-    res = subprocess.run(shlex.split(args.submit_cmd) + [script], cwd=calc.dir,
+# Submits a jobscript with submit_cmd, from its own directory, and returns the job id. Stops if the
+# submission fails.
+#   Called by: submit(), submit_dryrun_pack(), submit_pack()
+def send_job(directory, script, args):
+    res = subprocess.run(shlex.split(args.submit_cmd) + [script], cwd=directory,
                          capture_output=True, text=True)
     m = (re.search(r"Submitted batch job (\d+)", res.stdout) or
          re.search(r"Your job (\d+)", res.stdout) or re.search(r"(\d+)", res.stdout))
     if res.returncode != 0 or not m:
-        die(f"could not submit {calc.dir / script}:\n{res.stdout}{res.stderr}")
+        die(f"could not submit {directory / script}:\n{res.stdout}{res.stderr}")
+    return m.group(1)
+
+
+# Records a job submitted for a calculation in its job_info.json: the job id and submission time.
+# For a real job also a new run in info['runs'] - the job id, where its output will start in the
+# .castep (start: the file's size before the job), its walltime and number of processes; this is
+# what run_segments, job_timing, last_peak and Calc.run_text work from - and the pack it runs in
+# (pack : N), if any.
+#   Called by: submit(), submit_dryrun_pack(), submit_pack()
+def record_job(calc, jobid, start, wall, key="jobid", pack=None):
     info = calc.info()
-    info[key] = m.group(1)
+    info[key] = jobid
     info["submitted" if key == "jobid" else "dryrun_submitted"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    wall = sbatch_value((calc.dir / script).read_text(), "--time")
     if key == "jobid":
         info["runs"] = ([r for r in info.get("runs", []) if r["start"] < start]
-                        + [{"jobid": m.group(1), "start": start, "time": wall,
+                        + [{"jobid": jobid, "start": start, "time": wall,
                             "procs": info.get("ncores")}])
+        if pack:
+            info["pack"] = pack
+        else:
+            info.pop("pack", None)
     calc.save(info)
+
+
+# Submits job.sh (or dryrun.sh) with submit_cmd and records the job in job_info.json (record_job).
+# Stops if the submission fails.
+#   Called by: handle_failure(), main(), prepare_all(), restart(), run_batch()
+#   Calls:     record_job(), sbatch_value(), send_job()
+def submit(calc, args, script=JOBSCRIPT, key="jobid"):
+    start = calc.castep.stat().st_size if calc.castep.exists() else 0   # where its output begins
+    jobid = send_job(calc.dir, script, args)
+    wall = sbatch_value((calc.dir / script).read_text(), "--time")
+    record_job(calc, jobid, start, wall, key)
+    info = calc.info()
     if key == "jobid":
         size = (f"{info['nodes']} node{'s' if info['nodes'] > 1 else ''} x "
                 f"{info['tasks_per_node']} processes" if info.get("nodes")
@@ -2002,6 +2099,175 @@ def submit(calc, args, script=JOBSCRIPT, key="jobid"):
             + (f", walltime {wall}" if wall else ""))
     else:
         log(f"submitted dry run for {calc.name} ({len(calc.atoms)} atoms): job {info[key]}")
+
+
+# The line of a jobscript template that runs CASTEP, for pack : N (rx CASTEP_RUN) or dryrun_pack : N
+# (the dry-run template, rx DRYRUN_RUN). There must be exactly one, and it must start CASTEP with
+# srun: a pack starts each of its jobs with its own srun. Returns the line; stops with what to
+# change otherwise.
+#   Called by: batch_args(), run_batch(), submit_dryrun_pack(), submit_pack()
+def pack_castep_line(template, name="the runner settings", rx=CASTEP_RUN, what="pack"):
+    runs = [line for line in template.splitlines()
+            if rx.search(line) and not line.lstrip().startswith("#")]
+    if len(runs) != 1 or not re.search(r"(?<![\w/.\-])srun\b",
+                                       runs[0][:rx.search(runs[0]).start()]):
+        die(f"{name}: {what} runs several CASTEP jobs side by side, each with its own srun, so "
+            + ("the jobscript template" if rx is CASTEP_RUN else
+               "the dry-run template (dryrun_jobscript, or else the jobscript template)")
+            + " needs exactly one line that runs CASTEP with srun, e.g.\n"
+            "    srun --distribution=block:block --hint=nomultithread castep.mpi "
+            + ("{SEED}" if rx is CASTEP_RUN else "--dryrun {SEED}"))
+    return runs[0]
+
+
+# One line of a pack's job script: the template's line that runs CASTEP (run, matched by rx), made
+# to run one calculation in its own directory, in the background - with env set and srun given
+# the calculation's own options (own) in place of the template's ones of that kind (SRUN_OWN) -
+# with its output in slurm-<job id>.out there.
+#   Called by: submit_dryrun_pack(), submit_pack()
+def pack_line(run, rx, calc, own, env):
+    m = rx.search(run)
+    head, exe, tail = run[:m.start()], m.group(1), run[m.end():]
+    s = re.search(r"(?<![\w/.\-])srun\b", head)
+    rest = SRUN_OWN.sub("", " " + head[s.end():]).split()
+    cmd = (f"{head[:s.start()]}{env}srun {own}" + (" " + " ".join(rest) if rest else "")
+           + f" {exe}{calc.seed}{tail}").replace("{SEED}", calc.seed).strip()
+    where = shlex.quote(str(calc.dir.resolve()))
+    return f"( cd {where} && {cmd} ) > {where}/slurm-${{SLURM_JOB_ID}}.out 2>&1 &"
+
+
+# A new directory for a pack's job script: <workdir>/packs/<prefix>_NNN, numbered on from those
+# already there.
+#   Called by: submit_dryrun_pack(), submit_pack()
+def new_pack_dir(workdir, prefix):
+    packs = workdir / PACK_DIR
+    packs.mkdir(exist_ok=True)
+    n = len(prefix) + 1
+    k = 1 + max([int(d.name[n:]) for d in packs.glob(f"{prefix}_*") if d.name[n:].isdigit()],
+                default=0)
+    pdir = packs / f"{prefix}_{k:03d}"
+    pdir.mkdir()
+    return pdir
+
+
+# Splits a list into as few groups of at most size as possible, as evenly as possible, in order.
+#   Called by: prepare_all()
+def even_groups(items, size):
+    n = math.ceil(len(items) / size) if items else 0
+    bounds = [round(i * len(items) / n) for i in range(n + 1)] if n else [0]
+    return [items[a:b] for a, b in zip(bounds, bounds[1:])]
+
+
+# Runs several planned calculations side by side on one node, as one job (pack : N).
+# Writes <workdir>/packs/pack_NNN/job.sh from the jobscript template: its #SBATCH lines for one
+# whole node (with --exclusive, and without --ntasks-per-node, --ntasks or --cpus-per-task, which
+# each calculation sets for itself), the partition and its options, and the longest walltime the
+# calculations were given. In place of the line that runs CASTEP comes one line per calculation
+# (pack_line), which runs it in its own directory in the background - srun with its own processes
+# and cores per process, --exact, and --mem for its share of PACK_MEM of the node's memory, with
+# the output in slurm-<job id>.out there - and then wait. A relaxation's run_time is set for the
+# pack's walltime. The job is submitted from the pack's directory (send_job) and recorded for each
+# calculation (record_job), so waiting, timings and restarts work as for a job of its own (a
+# restart runs on its own: restart plans it with finalize(..., pack=1)).
+#   Called by: run_batch()
+#   Calls:     add_sbatch_option(), fill(), new_pack_dir(), pack_castep_line(), pack_line(),
+#              record_job(), run_time_for(), send_job(), set_param(), slurm_seconds(),
+#              slurm_time()
+def submit_pack(group, ctx, args, workdir):
+    cpn, infos = args.cores_per_node, [c.info() for c in group]
+    part = next((p for p in args.partitions or [] if p["name"] == infos[0].get("partition")), None)
+    gb = part["mem_per_core"] if part else args.mem_per_core
+    mems = [math.ceil(i["share"] * gb * 1024 * PACK_MEM) if gb else
+            math.ceil(i["ncores"] * i["mem_per_core_gb"] * 1024 * 1.25) for i in infos]
+    walls = [slurm_seconds(i["walltime"]) for i in infos if i.get("walltime")]
+    wall = slurm_time(max(walls)) if walls else None
+    pdir = new_pack_dir(workdir, "pack")
+    total = sum(mems)
+    subs = {"{NCORES}": cpn, "{NODES}": 1, "{TASKS_PER_NODE}": cpn, "{CPUS_PER_TASK}": 1,
+            "{SEED}": pdir.name, "{JOBNAME}": f"{group[0].name}+{len(group) - 1}",
+            "{NKPTS}": max(i["nkpts"] for i in infos), "{MEM_MB}": total,
+            "{MEM_GB}": math.ceil(total / 1024), "{MEM_PER_NODE_GB}": math.ceil(total / 1024),
+            "{MEM_PER_CORE_MB}": math.ceil(total / cpn),
+            "{MEM_PER_CORE_GB}": math.ceil(total / cpn / 1024),
+            "{PARTITION}": part["name"] if part else ""}
+    template = ctx["job_template"]
+    run = pack_castep_line(template)
+    lines = []
+    for line in template.splitlines():
+        if re.match(r"#SBATCH\s+((--ntasks-per-node|--ntasks|--cpus-per-task)(=|\s)|-[nc](\s|\d))",
+                    line.strip()):
+            continue                            # each job of the pack sets these for itself
+        if line != run:
+            lines.append(line)
+            continue
+        for c, i, mb in zip(group, infos, mems):
+            n, threads = i["ncores"], i.get("omp_threads") or 1
+            cpus = max(1, i["share"] // n)
+            env = (f"OMP_NUM_THREADS={threads} SRUN_CPUS_PER_TASK={cpus} "
+                   + ("OMP_PLACES=cores " if threads > 1 else ""))
+            lines.append(pack_line(run, CASTEP_RUN, c, f"--nodes=1 --ntasks={n} --ntasks-per-node="
+                                   f"{n} --cpus-per-task={cpus} --exact --mem={mb}M", env))
+        lines.append("wait")
+    script = add_sbatch_option(fill("\n".join(lines) + "\n", subs), "--exclusive")
+    if part:                                    # the partition and its extra #SBATCH options
+        script = add_sbatch_option(script, f"--partition={part['name']}")
+        for option in part["options"]:
+            script = add_sbatch_option(script, fill(option, subs))
+    if wall:
+        script = add_sbatch_option(script, f"--time={wall}")
+    (pdir / JOBSCRIPT).write_text(script)
+    (pdir / JOBSCRIPT).chmod(0o755)
+    for c, i in zip(group, infos):              # each relaxation stops cleanly before the end
+        c.save(dict(c.info(), walltime=wall))
+        if c.kind == "geom" and wall and not (args.max_restarts == 0
+                                              and getattr(args, "tolerate_failures", False)):
+            set_param(c, run_time=run_time_for(slurm_seconds(wall), i.get("scf_seconds")))
+    starts = [c.castep.stat().st_size if c.castep.exists() else 0 for c in group]
+    jobid = send_job(pdir, JOBSCRIPT, args)
+    rel = str(pdir.relative_to(workdir))
+    for c, start in zip(group, starts):
+        record_job(c, jobid, start, wall, pack=rel)
+    log(f"submitted {rel}: job {jobid} on 1 node" + (f" ({part['name']})" if part else "")
+        + (f", walltime {wall}" if wall else "") + ": "
+        + ", ".join(f"{c.name} ({i['ncores']} processes)" for c, i in zip(group, infos)))
+
+
+# Runs several dry runs side by side, as one job (dryrun_pack : N).
+# Writes <workdir>/packs/dryrun_NNN/job.sh from the dry-run template (dryrun_template_text), filled
+# in for one core per dry run (on one node), with dryrun_partition, dryrun_time and dryrun_options
+# (dryrun_sbatch); in place of the line that runs CASTEP comes one line per calculation (pack_line):
+# its dry run, in its own directory, in the background, on one process (srun --ntasks=1 --exact
+# --mem=dryrun_mem_gb), then wait. Each calculation gets the job id as its dryrun_jobid
+# (record_job), so wait_for and handle_failure treat it as its own dry-run job; each also keeps
+# its own dryrun.sh, which --resubmit-failed uses.
+#   Called by: prepare_all()
+#   Calls:     dryrun_sbatch(), dryrun_subs(), dryrun_template_text(), fill(), new_pack_dir(),
+#              pack_castep_line(), pack_line(), record_job(), send_job()
+def submit_dryrun_pack(group, ctx, args):
+    workdir, n = group[0].dir.parent, len(group)
+    pdir = new_pack_dir(workdir, "dryrun")
+    subs = dryrun_subs(pdir.name, f"{group[0].name}_dry+{n - 1}", n, n * args.dryrun_mem_gb,
+                       args)
+    template = dryrun_template_text(ctx["job_template"], ctx["dryrun_template"])
+    run = pack_castep_line(template, rx=DRYRUN_RUN, what="dryrun_pack")
+    lines = []
+    for line in template.splitlines():
+        if line != run:
+            lines.append(line)
+            continue
+        own = (f"--nodes=1 --ntasks=1 --ntasks-per-node=1 --cpus-per-task=1 --exact "
+               f"--mem={math.ceil(args.dryrun_mem_gb * 1024)}M")
+        lines += [pack_line(run, DRYRUN_RUN, c, own, "OMP_NUM_THREADS=1 SRUN_CPUS_PER_TASK=1 ")
+                  for c in group]
+        lines.append("wait")
+    script = dryrun_sbatch(fill("\n".join(lines) + "\n", subs), subs, args)
+    (pdir / JOBSCRIPT).write_text(script)
+    (pdir / JOBSCRIPT).chmod(0o755)
+    jobid = send_job(pdir, JOBSCRIPT, args)
+    for c in group:
+        record_job(c, jobid, 0, None, key="dryrun_jobid")
+    log(f"submitted {n} dry runs in {pdir.relative_to(workdir)}: job {jobid} ("
+        + ", ".join(c.name for c in group) + ")")
 
 
 # Asks the scheduler whether a job is still queued or running.
@@ -2230,8 +2496,8 @@ def restart(calc, args):
 
     calibrate(*args.all, args)                     # plan it again, with what's known now
     text, desc = planning_dryrun(calc, args.ctx), None
-    if text:
-        desc = finalize(calc, text, args.ctx, args, quiet=True, show=False)
+    if text:                                       # (a job of a pack restarts on its own)
+        desc = finalize(calc, text, args.ctx, args, quiet=True, show=False, pack=1)
     info = calc.info()
     new_procs = info.get("ncores")
     if not progress and (not had or not longest or had >= longest) and not (
@@ -2646,10 +2912,13 @@ def job_spec(job, base):
 # share_dryruns (one dry run for all jobs that would give the same one: dryrun_key) and stop_file
 # (default <workdir>/STOP).
 # It works as the size series does: inputs, dry runs and plans first (prepare_all, at most max_jobs
-# dry runs queued at once), then the jobs, submitted at most max_jobs at a time, each planned again
-# just before it goes (so it uses the timings and memory measured so far), waited for (wait_for),
-# restarted as usual. With tolerate_failures, a job that fails is marked failed (mark_failed) and
-# the others carry on; --resubmit-failed starts failed jobs again from the beginning. A job whose
+# dry-run jobs queued at once; with dryrun_pack : N, N dry runs to a job), then the jobs, submitted
+# at most max_jobs at a time, each planned again just before it goes (so it uses the timings and
+# memory measured so far), waited for (wait_for), restarted as usual. With pack : N, jobs planned
+# on a share of a node go N at a time (or fewer, as evenly as the jobs left allow, each then
+# getting more of the node) in one job (submit_pack); one left on its own is planned again for
+# whole nodes. With tolerate_failures, a job that fails is marked failed (mark_failed) and the
+# others carry on; --resubmit-failed starts failed jobs again from the beginning. A job whose
 # inputs changed since it was set up (job_spec) is set up again if it never ran; one that has run
 # stops the script, unless --force (which keeps its results). Rerunning picks up where it left off.
 # Returns {'complete': True/False, 'jobs': {name: job_result}, 'calcs': {name: Calc}}, and writes
@@ -2657,8 +2926,8 @@ def job_spec(job, base):
 # --no-wait while jobs are still queued.
 #   Called by: batch_main(), dwf.py
 #   Calls:     Calc(), Calc.done(), Calc.err_files(), calibrate(), check_templates(), finalize(),
-#              job_result(), job_spec(), measure_times(), parse_castep_input(), prepare_all(),
-#              remove_check(), submit(), wait_for()
+#              job_result(), job_spec(), measure_times(), pack_castep_line(), parse_castep_input(),
+#              prepare_all(), remove_check(), submit(), submit_pack(), wait_for()
 def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, spacing=None,
               energy="auto", share_dryruns=True, stop_file=None):
     workdir = Path(workdir)
@@ -2680,7 +2949,9 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
            "job_template": job_template, "dryrun_template": dryrun_template,
            "param_items": parse_castep_input(param_text),
            "geom_param_items": parse_castep_input(geom_param_text or param_text),
-           "calcs": [], "share_dryruns": share_dryruns}
+           "calcs": [], "share_dryruns": share_dryruns, "batch": True}
+    if args.pack > 1:
+        pack_castep_line(job_template)
     base = "\n".join([cell_text, param_text, geom_param_text or "", repr(spacing)])
     calcs, keys = {}, []
     for i, job in enumerate(jobs):
@@ -2755,25 +3026,52 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
     for c in todo:                                 # delete_check : true
         remove_check(c, args)
     unplanned = [c for c in todo if not finished(c) and not c.info().get("jobid")]
-    chunk = args.max_jobs or len(unplanned) or 1
-    for k in range(0, len(unplanned), chunk):      # dry runs, at most max_jobs at a time
+    chunk = (args.max_jobs * args.dryrun_pack if args.max_jobs else len(unplanned)) or 1
+    for k in range(0, len(unplanned), chunk):      # dry runs, at most max_jobs jobs at a time
         if not prepare_all(unplanned[k:k + chunk], ctx, args, show=False):
             return results(False)
     if args.prepare_only:
         log(f"inputs for {len(unplanned)} job(s) written under {workdir}/ - check them, then "
             "rerun without --prepare-only")
         return results(False)
+    # Plans a calculation again with what is known now, on 1/pack of a node (default: the pack
+    # setting); True if it was planned to share a node.
+    def plan(c, pack=None):
+        finalize(c, c.dryrun_file.read_text(errors="replace"), ctx, args, quiet=True, show=False,
+                 pack=pack)
+        return c.info().get("packed")
+
     while True:
         calibrate(calcs, keys, args)
         measure_times(calcs, keys)
         active = [c for c in todo if c.info().get("jobid") and not finished(c)]
         queue = [c for c in todo if not c.info().get("jobid") and not finished(c)]
-        while queue and (not args.max_jobs or len(active) < args.max_jobs):
-            c = queue.pop(0)                       # plan it again with what is known now
-            finalize(c, c.dryrun_file.read_text(errors="replace"), ctx, args, quiet=True,
-                     show=False)
-            submit(c, args)
-            active.append(c)
+        running = {c.info()["jobid"] for c in active}          # jobs, not calculations
+        while queue and (not args.max_jobs or len(running) < args.max_jobs):
+            c = queue.pop(0)
+            group = [c]
+            if plan(c):                            # pack : N - others to share its node, as
+                left = 1 + len(queue)              # many in each of the packs still to come
+                size = min(args.pack, math.ceil(left / math.ceil(left / args.pack)))
+                for d in list(queue):
+                    if len(group) == size:
+                        break
+                    if plan(d) and d.info()["partition"] == c.info()["partition"]:
+                        group.append(d)
+                        queue.remove(d)
+                if 1 < len(group) < args.pack:     # fewer than pack: each gets more of the node
+                    if not all(plan(d, len(group)) for d in group) or len(
+                            {d.info()["partition"] for d in group}) > 1:
+                        for d in group:            # (unless that changes the partition)
+                            plan(d)
+            if len(group) > 1:
+                submit_pack(group, ctx, args, workdir)
+            else:
+                if c.info().get("packed"):         # nothing to share a node with: all of it
+                    plan(c, 1)
+                submit(c, args)
+            active += group
+            running.add(c.info()["jobid"])
         if not active:
             return results(True)
         if not wait_for(active, args, any_done=bool(queue)):
@@ -2783,11 +3081,13 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
 # The runner settings for batch mode, from CASTEP-style items (parse_castep_input).
 # Any of the .conv keywords that control how jobs run (jobscript, partitions, cores_per_node,
 # max_nodes, walltime, max_restarts, delete_check, dryrun_*, submit_cmd, poll, max_jobs,
-# tolerate_failures, ...), converted and checked as read_input does (convert_settings,
-# check_runner); the size-series keywords (defect, sizes, e_bulk, ...) aren't needed. File names
-# are relative to base. Returns the settings namespace run_batch takes.
+# tolerate_failures, pack, ...), converted and checked as read_input does (convert_settings,
+# check_runner; with pack, the template's CASTEP line: pack_castep_line); the size-series keywords
+# (defect, sizes, e_bulk, ...) aren't needed. File names are relative to base. Returns the
+# settings namespace run_batch takes. With dryrun_pack, the dry-run template's CASTEP line is
+# checked too.
 #   Called by: read_batch_file(), dwf.py
-#   Calls:     check_runner(), convert_settings()
+#   Calls:     check_runner(), convert_settings(), dryrun_template_text(), pack_castep_line()
 def batch_args(items, base, name="batch settings"):
     vals, raw_vals, templates = convert_settings(items, name)
     args = SimpleNamespace(**{key: default for key, (_, default) in KEYWORDS.items()})
@@ -2807,6 +3107,11 @@ def batch_args(items, base, name="batch settings"):
     args.job_template = templates.get("jobscript") or find("jobscript").read_text()
     args.dryrun_template = templates.get("dryrun_jobscript") or (
         find("dryrun_jobscript").read_text() if args.dryrun_jobscript else None)
+    if args.pack > 1:
+        pack_castep_line(args.job_template, name)
+    if args.dryrun_pack > 1 and args.dryrun_on == "compute":
+        pack_castep_line(dryrun_template_text(args.job_template, args.dryrun_template), name,
+                         DRYRUN_RUN, "dryrun_pack")
     return args
 
 
@@ -3050,6 +3355,7 @@ dryrun_mem_gb    : 4 GB
 !dryrun_jobscript : dryrun_template.sh   # own template for dry runs (or %block)
 !dryrun_cmd      : castep.mpi --dryrun {seed}   # the command for dryrun_on : login
 !dryrun_timeout  : 900            # seconds, dryrun_on : login only
+!dryrun_pack     : 32             # batch mode only: up to 32 dry runs side by side in one job
 
 # ------------------------------------------------------------------ scheduler
 submit_cmd  : sbatch
@@ -3057,6 +3363,7 @@ submit_cmd  : sbatch
 poll        : 120                 # seconds between queue checks
 !max_jobs          : 16           # batch mode only: most jobs in the queue at once
 !tolerate_failures : true         # batch mode only: a failed job is marked, the rest carry on
+!pack              : 4            # batch mode only: up to 4 jobs side by side on one node
 
 # Run-control switches are normally given on the command line (--prepare-only,
 # --no-wait, --resubmit-failed, --force) but can also be set here:
@@ -3238,6 +3545,7 @@ KEYWORDS = {
     "submit_cmd": (_text, "sbatch"), "status_cmd": (_text, None),
     "poll": (_num("s", cast=int), 120),
     "max_jobs": (_num(cast=int), None), "tolerate_failures": (_bool, False),    # batch mode
+    "pack": (_num(cast=int), 1), "dryrun_pack": (_num(cast=int), 1),           # batch mode
     "prepare_only": (_bool, False), "no_wait": (_bool, False),
     "resubmit_failed": (_bool, False), "force": (_bool, False),
     "partitions": (None, None),                               # %block only
@@ -3333,9 +3641,22 @@ def convert_settings(items, name):
 #   Called by: batch_args(), read_input()
 def check_runner(args, raw_vals, name):
     for key in ("max_cores", "cores", "dryrun_cores", "poll", "dryrun_timeout",
-                "cores_per_node", "max_nodes", "prerelax_steps", "prerelax_threads", "max_jobs"):
+                "cores_per_node", "max_nodes", "prerelax_steps", "prerelax_threads", "max_jobs",
+                "pack", "dryrun_pack"):
         if getattr(args, key) is not None and getattr(args, key) < 1:
             die(f"{name}: {key} must be at least 1")
+    if args.pack > 1:                        # several jobs side by side on one node
+        if not args.cores_per_node:
+            die(f"{name}: pack shares out whole nodes, so it needs cores_per_node")
+        if args.pack > args.cores_per_node:
+            die(f"{name}: pack : {args.pack} is more jobs than a node has cores "
+                f"({args.cores_per_node})")
+        if args.cores and args.cores > args.cores_per_node // args.pack:
+            die(f"{name}: with pack : {args.pack} each job has {args.cores_per_node // args.pack} "
+                f"cores, so cores : {args.cores} is too many")
+    if args.cores_per_node and args.dryrun_pack > args.cores_per_node:
+        die(f"{name}: dryrun_pack : {args.dryrun_pack} is more dry runs than a node has cores "
+            f"({args.cores_per_node})")
     if args.cores_per_node:
         if "max_cores" in raw_vals:
             die(f"{name}: with cores_per_node the job size is set by max_nodes - remove max_cores")
@@ -3702,10 +4023,10 @@ def main():
     print(f"\nSettings from {args.input_path} (everything else at its default):")
     for key, raw in args.raw.items():
         print(f"  {key:<17}: {raw}")
-    for key in ("max_jobs", "tolerate_failures"):
+    for key in ("max_jobs", "tolerate_failures", "pack", "dryrun_pack"):
         if key in args.raw:
             log(f"note: {key} is for batch mode only, so it is ignored here")
-    args.max_jobs, args.tolerate_failures = None, False
+    args.max_jobs, args.tolerate_failures, args.pack, args.dryrun_pack = None, False, 1, 1
     cell_text, param_text = args.cell.read_text(), args.param.read_text()
     geom_param_text = args.geom_param.read_text() if args.geom_param else param_text
     job_template, dryrun_template = check_templates(args)
