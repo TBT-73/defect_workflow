@@ -40,8 +40,8 @@ All CASTEP jobs go through supercell_convergence.py, which must be in the same d
 B3 size series in its usual mode, which builds its own cells, every other step in its batch
 mode, which runs the structures this script builds. Its runner settings (jobscript,
 partitions, cores_per_node, max_nodes, max_walltime, pack, ...) go in the project file, for
-every step; %block runner_<group> changes them for a group of steps (host, series, screen,
-production) and %block runner_<step> for one step (e.g. runner_converge, runner_relax).
+every step; %block runner_host and runner_screen change them for all of phase A's or phase C's
+CASTEP steps, and %block runner_<step> for one step (e.g. runner_converge, runner_production).
 """
 
 import argparse
@@ -261,9 +261,9 @@ def read_project(path):
             continue
         key = item_key(it)
         if key.startswith("runner_") and key not in known:
-            die(f"{name}: there is no {key}: the runner blocks are runner_<group> for a group of "
-                f"steps ({', '.join(RUNNER_GROUPS)}) and runner_<step> for one step ("
-                + ", ".join(b for b in RUNNER_BLOCKS if b not in RUNNER_GROUPS) + ")")
+            die(f"{name}: there is no {key}: the runner blocks are runner_host (all of phase A's "
+                "CASTEP steps), runner_screen (all of phase C's) and, for one step, "
+                + ", ".join(f"runner_{s}" for s in RUNNER_STEPS if s != "screen"))
         if key not in known:
             close = difflib.get_close_matches(key, sorted(known), n=1)
             die(f"{name}: unknown keyword '{key}'" + (f" - did you mean '{close[0]}'?" if close
@@ -3530,14 +3530,15 @@ max_jobs  : 16                 # most jobs of one step queued at once
 max_restarts : 20              # a relaxation that runs out of time carries on this many times
 poll      : 300
 delete_check : true            # delete each .check once its calculation has finished
-# ... and for some steps only: %block runner_host (A1 to A3.1), runner_converge (A1),
-# runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3), runner_phases (A3.1),
-# runner_series (B3), runner_screen (C2, C5, C6), runner_drelax (C5), runner_rank (C6),
-# runner_production (D1). A step uses the settings above, changed by its group's block
-# (runner_host or runner_screen), then by its own: each replaces only the keywords it gives
-# (a %block partitions in one replaces the whole list). pack : N runs N of a step's jobs side
-# by side on one node, each on 1/N of it: for small jobs, as a node is charged whole however
-# few cores a job uses. Starting points for CaO:Sb on ARCHER2 - set your own:
+# ... and for some steps only, in a runner block: runner_host for all of phase A's CASTEP
+# steps (A1 to A3.1) and runner_screen for all of phase C's (C2, C5, C6); for one step:
+# runner_converge (A1), runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3),
+# runner_phases (A3.1), runner_series (B3), runner_drelax (C5), runner_rank (C6),
+# runner_production (D1). A step's own block wins over runner_host or runner_screen, and
+# they win over the settings above, for the keywords they give (a %block partitions in one
+# replaces the whole list). pack : N runs N of a step's jobs side by side on one node, each
+# on 1/N of it: for small jobs, as a node is charged whole however few cores a job uses.
+# Starting points for CaO:Sb on ARCHER2 - set your own:
 %block runner_host             # A1 to A3.1: the primitive cell and the competing phases
 max_walltime : 4:00:00
 %endblock runner_host

@@ -121,11 +121,10 @@ same cells as the rest of the workflow, see [B3](#phase-b-candidate-defects-and-
 Only the size it chooses, and its relaxation as B4's training data, are used later.
 
 **Nodes and walltimes for each step.** The runner settings in the project file
-([Runner settings](#runner-settings): nodes, walltime, partitions, ...) apply to every step. A
-`%block runner_<group>` changes them for a group of steps, and a `%block runner_<step>` for one
-step; each changes only the keywords it gives. So the primitive-cell single points of A1 can run
-on one node for at most 20 minutes, while the supercell relaxations of D1 get 8 nodes and up to
-24 hours:
+([Runner settings](#runner-settings): nodes, walltime, partitions, ...) apply to every step.
+A runner block changes them for some steps only (the table below), and changes only the keywords
+it gives. So the primitive-cell single points of A1 can run on one node for at most 20 minutes,
+while the supercell relaxations of D1 get 8 nodes and up to 24 hours:
 
 ```
 max_nodes : 2                  # every step, unless a block says otherwise
@@ -139,21 +138,31 @@ max_walltime : 24:00:00
 %endblock runner_production
 ```
 
-The steps that run CASTEP jobs, and the blocks each one uses (applied in this order, after the
-project-wide settings and the group's defaults):
+Two blocks cover a whole phase, and the others one step each:
 
-| Step | Its runner blocks | Defaults that differ |
-|---|---|---|
-| A1 converge | `runner_host`, `runner_converge` | — |
-| A2.1 relax | `runner_host`, `runner_relax` | — |
-| A2.2 bands | `runner_host`, `runner_bands` | — |
-| A2.3 dielectric | `runner_host`, `runner_dielectric` | — |
-| A3.1 phases | `runner_host`, `runner_phases` | — |
-| B3 series | `runner_series` | (`max_jobs` and `tolerate_failures` don't apply) |
-| C2 screen | `runner_screen` | `max_restarts : 0`, `tolerate_failures : true` (a run that fails is flagged, not rescued) |
-| C5 drelax | `runner_screen`, `runner_drelax` | as C2 |
-| C6 rank | `runner_screen`, `runner_rank` | as C2 |
-| D1 production | `runner_production` | `tolerate_failures : true` |
+| Block | Applies to |
+|---|---|
+| `runner_host` | every CASTEP step of phase A: A1, A2.1, A2.2, A2.3 and A3.1 |
+| `runner_converge` | A1 |
+| `runner_relax` | A2.1 |
+| `runner_bands` | A2.2 |
+| `runner_dielectric` | A2.3 |
+| `runner_phases` | A3.1 |
+| `runner_series` | B3 |
+| `runner_screen` | every CASTEP step of phase C: C2, C5 and C6 |
+| `runner_drelax` | C5 |
+| `runner_rank` | C6 |
+| `runner_production` | D1 |
+
+You only need the blocks for the steps you want to change. A step uses the project-wide
+settings, then `runner_host` or `runner_screen` if it is in phase A or C, then its own block; the
+later one wins for any keyword both give. C2 has no block of its own: set it with
+`runner_screen`, and give C5 or C6 their own blocks where they should differ.
+
+The screening steps (C2, C5, C6) use `max_restarts : 0` and `tolerate_failures : true` (a run
+that fails is flagged, not rescued), and D1 `tolerate_failures : true`, whatever the project-wide
+settings say; a runner block can change them. `max_jobs` and `tolerate_failures` don't apply to
+B3.
 
 A block can also hold its own `%block partitions`, which replaces the whole list for those steps,
 e.g. to send A1's jobs to a short-job QoS (`standard  2  --qos=short` on ARCHER2, for jobs of up
@@ -446,9 +455,9 @@ the properties you ask for get a search for their ground-state structure.
 | C5 | `drelax` | cheap relaxations of the distortions | — |
 | C6 | `rank` | ranks the structures, shares winning distortions between charge states | a distortion counts if it beats the screened structure by `distortion_min_gain` |
 
-The CASTEP jobs of C2, C5 and C6 run with the `screen` group's runner settings
-(`%block runner_screen`, then `runner_drelax` or `runner_rank` for C5 or C6 alone): no restarts,
-and a job that fails is flagged while the others carry on (`--resubmit-failed` tries it again).
+The CASTEP jobs of C2, C5 and C6 run with the runner settings of `%block runner_screen` (and of
+`runner_drelax` or `runner_rank` for C5 or C6 alone): no restarts, and a job that fails is
+flagged while the others carry on (`--resubmit-failed` tries it again).
 
 **C1 prerelax.** Each candidate is built in the chosen supercell; a pair whose components are
 more than half the shortest image distance apart is left out. With `mace : true` it is relaxed
@@ -604,7 +613,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **O**: [`omp_threads`](#runner-settings) (runner) · [`%block oxidation_states`](#c-screening) (C)
 - **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-and-cell-size) (B) · [`pairs`](#b-candidates-and-cell-size) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
 - **Q**: [`quench_temperature`](#e-thermodynamics) (E)
-- **R**: [`rattle_dmin`](#c-screening) (C) · [`rattle_stdev`](#c-screening) (C) · [`require_bound`](#c-screening) (C) · [`require_gap_states`](#c-screening) (C) · [`require_spin`](#c-screening) (C) · [`%block runner_<group>`, `%block runner_<step>`](#runner-settings) (runner)
+- **R**: [`rattle_dmin`](#c-screening) (C) · [`rattle_stdev`](#c-screening) (C) · [`require_bound`](#c-screening) (C) · [`require_gap_states`](#c-screening) (C) · [`require_spin`](#c-screening) (C) · [`%block runner_host`, `runner_screen`, `runner_<step>`](#runner-settings) (runner)
 - **S**: [`scan`](#b-candidates-and-cell-size) (B) · [`scan_sizes`](#b-candidates-and-cell-size) (B) · [`scan_tol`](#b-candidates-and-cell-size) (B) · [`screen_charges`](#c-screening) (C) · [`screen_cutoff`](#c-screening) (C) · [`screen_max_steps`](#c-screening) (C) · [`%block screen_overrides`](#c-screening) (C) · [`screen_spins`](#c-screening) (C) · [`series_charge`](#b-candidates-and-cell-size) (B) · [`series_choice`](#b-candidates-and-cell-size) (B) · [`series_defect`](#b-candidates-and-cell-size) (B) · [`series_sizes`](#b-candidates-and-cell-size) (B) · [`series_tol`](#b-candidates-and-cell-size) (B) · [`share_rounds`](#c-screening) (C) · [`sp_walltime`](#runner-settings) (runner) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-and-cell-size) (B)
 - **T**: [`tolerate_failures`](#runner-settings) (runner) · [`transform`](#general) (general) · [`triage`](#c-screening) (C) · [`triage_window`](#c-screening) (C)
 - **V**: [`vacancies`](#b-candidates-and-cell-size) (B)
@@ -749,11 +758,12 @@ Details: [Phase E](#phase-e-thermodynamics).
 
 These are `supercell_convergence.py`'s keywords for how jobs run (see
 `README_supercell_convergence.md` for the details). In the project file they apply to every
-step. `%block runner_<group>` (`host`, `series`, `screen` or `production`) changes them for a
-group of steps, and `%block runner_<step>` (`converge`, `relax`, `bands`, `dielectric`, `phases`,
-`drelax` or `rank`) for one step; these blocks hold runner keywords only, and may hold a
-`%block partitions`. A step uses the project-wide settings, changed by its group's defaults, then
-by its group's block, then by its own ([How a run works](#how-a-run-works) lists them).
+step. A runner block changes them for some steps: `%block runner_host` for every CASTEP step of
+phase A, `%block runner_screen` for every one of phase C, and `%block runner_converge`,
+`runner_relax`, `runner_bands`, `runner_dielectric`, `runner_phases`, `runner_series`,
+`runner_drelax`, `runner_rank` or `runner_production` for one step
+([How a run works](#how-a-run-works) has the table). They hold runner keywords only, and may hold
+a `%block partitions`.
 
 | Keyword | Default | What it does |
 |---|---|---|
@@ -772,7 +782,7 @@ by its group's block, then by its own ([How a run works](#how-a-run-works) lists
 | `walltime` | `auto` | `auto`: once jobs have finished, later ones ask for what they need (scaled from the measured time per SCF cycle) instead of the longest walltime; `fixed`: always the longest. |
 | `walltime_safety` | `1.5` | Factor on the walltime estimate. |
 | `sp_walltime` | — | The walltime (`H:MM:SS`) of the first single points, before there is anything to estimate from, if shorter than the longest. One that runs out is resubmitted with the longest. |
-| `max_restarts` | `10` (`0` for `screen`) | How many times a job that runs out of time, or stops in a way the runner can recover from, is resubmitted; a relaxation carries on from its `.check`. |
+| `max_restarts` | `10` (`0` for C2, C5, C6) | How many times a job that runs out of time, or stops in a way the runner can recover from, is resubmitted; a relaxation carries on from its `.check`. |
 | `delete_check` | `false` | Delete each calculation's `.check` file once it has finished; they can be large. |
 | `dryrun_on` | `compute` | Where the dry runs go (one per distinct input, for the k-points and memory): `compute`, as small batch jobs from your template; `login`, where `dwf.py` runs, with `dryrun_cmd`. On ARCHER2, don't send them to the shared `serial` partition with a whole-node template, which it rejects: use `login`, or `dryrun_partition : standard`. |
 | `dryrun_cmd` | `castep.mpi --dryrun {seed}` | The command for `dryrun_on : login`, e.g. `castep.serial --dryrun {seed}`. |
@@ -785,7 +795,7 @@ by its group's block, then by its own ([How a run works](#how-a-run-works) lists
 | `status_cmd` | `squeue` or `qstat` | The command that lists queued and running jobs. |
 | `poll` | `120 s` | Seconds between checks of the queue. |
 | `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once. |
-| `tolerate_failures` | `false` (`true` for `screen` and `production`) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
+| `tolerate_failures` | `false` (`true` for C2, C5, C6 and D1) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
 | `pack` | `1` | Run up to N of a step's jobs side by side on one node, in one job, each on `cores_per_node`/N cores and its share of the node's memory ([How a run works](#how-a-run-works)). Needs `cores_per_node` and a jobscript whose CASTEP line uses `srun`; not for B3. |
 
 `--prepare-only`, `--no-wait`, `--resubmit-failed` and `--force` are command-line switches
