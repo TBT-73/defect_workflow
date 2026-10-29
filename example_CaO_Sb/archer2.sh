@@ -9,7 +9,7 @@
 #SBATCH --nodes={NODES}
 #SBATCH --ntasks-per-node={TASKS_PER_NODE}
 #SBATCH --cpus-per-task={CPUS_PER_TASK}
-#SBATCH --account=e89
+#SBATCH --account=e89-man-m
 #SBATCH --partition=standard
 #SBATCH --qos=standard
 
