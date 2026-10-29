@@ -288,12 +288,12 @@ memory.
 
 ### Walltimes (`walltime : auto`)
 
-- **The ceiling:** the template's `--time`, or a `--time=` on a partition line, is the most any job may ask for.
+- **The ceiling:** the template's `--time`, or a `--time=` on a partition line, is the most any job may ask for. `max_walltime` (e.g. `max_walltime : 12:00:00`) replaces both, so the ceiling can be set without editing the template; in `dwf.py` it can be set for each step.
 - **How the estimate works:** once jobs have finished, later ones ask for less. The script takes the measured time per SCF cycle and scales it to the new cell by k-points × electrons^a ÷ processes. The exponent a is fitted from the sizes done so far, and is 3 until there are two. That is multiplied by the SCF cycles the biggest finished relaxation needed, then by `walltime_safety` (1.5).
 - **Rounding:** up to 15 minutes, with at least 30 minutes.
 - **Single points** on a relaxed cell use that cell's own relaxation timing.
 - **First single points** (`sp_walltime`): until a job has finished there is nothing to estimate from, so the first pristine-cell single points would ask for the full `--time` and wait longer in the queue. Set e.g. `sp_walltime : 4:00:00` to ask for that instead. If one runs out of time, it is resubmitted with the full `--time` (this counts towards `max_restarts`).
-- `walltime : fixed` always uses the template's time.
+- `walltime : fixed` always uses the ceiling.
 
 ### Clean stops
 
@@ -535,6 +535,7 @@ Defaults in brackets.
 - `walltime` [auto | fixed].
 - `walltime_safety` [1.5].
 - `sp_walltime` [none]: walltime for a first single point with no estimate yet.
+- `max_walltime` [the template's `--time`]: the longest a job may run, replacing the template's and a partition line's `--time`.
 - `max_restarts` [10].
 - `delete_check` [false].
 

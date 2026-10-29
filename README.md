@@ -58,9 +58,11 @@ The example folder holds the project file and every file it names:
 | `CaO_ncp.cell`, `CaO_ncp.param` | the DFPT dielectric run (A2.3): norm-conserving potentials, fixed occupancies |
 | `Ca.cell`, `O2.cell`, `Sb.cell`, `Sb2O3.cell` | competing phases (A3): fcc Ca, O₂ in a box, A7 Sb, senarmontite Sb₂O₃, near their experimental structures |
 
-Before running it, check: the account and CASTEP module in `archer2.sh`; the pseudopotentials
-(`CaO_prim.cell` has no `species_pot`, so CASTEP uses its default on-the-fly ones); the cut-off
-in `CaO_ncp.param`; and the competing phases (add any other that could limit Sb).
+Before running it, check: the account and CASTEP module in `archer2.sh`; the nodes and
+walltimes of each step (the runner blocks in `CaO_Sb.dwf` are starting points); the
+pseudopotentials (`CaO_prim.cell` has no `species_pot`, so CASTEP uses its default on-the-fly
+ones); the cut-off in `CaO_ncp.param`; and the competing phases (add any other that could limit
+Sb).
 
 For a project of your own, `python3 dwf.py --example > <name>.dwf` prints the annotated project
 file to start from.
@@ -118,16 +120,46 @@ series: that is a normal `supercell_convergence.py` size series, which builds it
 same cells as the rest of the workflow, see [B3](#phase-b-candidate-defects-and-cell-size)).
 Only the size it chooses, and its relaxation as B4's training data, are used later.
 
-**Runner groups.** The jobs of each group of steps run with the project's runner settings
-([Runner settings](#runner-settings)), changed by these defaults and then by
-`%block runner_<group>` in the project file:
+**Nodes and walltimes for each step.** The runner settings in the project file
+([Runner settings](#runner-settings): nodes, walltime, partitions, ...) apply to every step. A
+`%block runner_<group>` changes them for a group of steps, and a `%block runner_<step>` for one
+step; each changes only the keywords it gives. So the primitive-cell single points of A1 can run
+on one node for at most 20 minutes, while the supercell relaxations of D1 get 8 nodes and up to
+24 hours:
 
-| Group | Steps | Defaults that differ |
+```
+max_nodes : 2                  # every step, unless a block says otherwise
+%block runner_converge         # A1
+max_nodes    : 1
+max_walltime : 0:20:00
+%endblock runner_converge
+%block runner_production       # D1
+max_nodes    : 8
+max_walltime : 24:00:00
+%endblock runner_production
+```
+
+The steps that run CASTEP jobs, and the blocks each one uses (applied in this order, after the
+project-wide settings and the group's defaults):
+
+| Step | Its runner blocks | Defaults that differ |
 |---|---|---|
-| `host` | A1–A3 | — |
-| `series` | B3 | (`max_jobs` and `tolerate_failures` don't apply) |
-| `screen` | C2, C5, C6 | `max_restarts : 0`, `tolerate_failures : true` (a run that fails is flagged, not rescued) |
-| `production` | D1 | `tolerate_failures : true` |
+| A1 converge | `runner_host`, `runner_converge` | — |
+| A2.1 relax | `runner_host`, `runner_relax` | — |
+| A2.2 bands | `runner_host`, `runner_bands` | — |
+| A2.3 dielectric | `runner_host`, `runner_dielectric` | — |
+| A3.1 phases | `runner_host`, `runner_phases` | — |
+| B3 series | `runner_series` | (`max_jobs` and `tolerate_failures` don't apply) |
+| C2 screen | `runner_screen` | `max_restarts : 0`, `tolerate_failures : true` (a run that fails is flagged, not rescued) |
+| C5 drelax | `runner_screen`, `runner_drelax` | as C2 |
+| C6 rank | `runner_screen`, `runner_rank` | as C2 |
+| D1 production | `runner_production` | `tolerate_failures : true` |
+
+A block can also hold its own `%block partitions`, which replaces the whole list for those steps,
+e.g. to send A1's jobs to a short-job QoS (`standard  2  --qos=short` on ARCHER2, for jobs of up
+to 20 minutes). The settings of every step are checked when `dwf.py` starts. They don't change
+any results, so changing them never makes a step run again: when you run `dwf.py` again, the
+jobs it has not submitted yet, and the restarts of those already queued, use the new settings.
 
 ---
 
@@ -378,8 +410,9 @@ the properties you ask for get a search for their ground-state structure.
 | C5 | `drelax` | cheap relaxations of the distortions | — |
 | C6 | `rank` | ranks the structures, shares winning distortions between charge states | a distortion counts if it beats the screened structure by `distortion_min_gain` |
 
-The CASTEP jobs of C2, C5 and C6 run as runner group `screen`: no restarts, and a job that fails
-is flagged while the others carry on (`--resubmit-failed` tries it again).
+The CASTEP jobs of C2, C5 and C6 run with the `screen` group's runner settings
+(`%block runner_screen`, then `runner_drelax` or `runner_rank` for C5 or C6 alone): no restarts,
+and a job that fails is flagged while the others carry on (`--resubmit-failed` tries it again).
 
 **C1 prerelax.** Each candidate is built in the chosen supercell; a pair whose components are
 more than half the shortest image distance apart is left out. With `mace : true` it is relaxed
@@ -442,8 +475,8 @@ cut-off and k-point spacing, `%block production_overrides`, its charge, and its 
 from phase C (`spin_polarized : true` with that spin; a spin-0 state runs without spin
 polarisation unless `production_overrides` sets `spin_polarized`). Positions only (the cell stays
 at the host's relaxed lattice), no symmetry. Plus a single point of the pristine supercell at
-the same settings: E_host for the formation energies. The jobs run as runner group `production`:
-a relaxation that runs out of walltime is carried on from its `.check`, and a job that fails is
+the same settings: E_host for the formation energies. The jobs run with the runner settings of
+`%block runner_production`: a relaxation that runs out of walltime is carried on from its `.check`, and a job that fails is
 flagged and left out of phase E (fix the cause and use `--resubmit-failed`). The run stops if the
 pristine single point fails.
 
@@ -530,12 +563,12 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **J**: [`jobscript`](#runner-settings) (runner)
 - **K**: [`keep_structures`](#c-screening) (C) · [`kspacing`](#a-host) (A)
 - **L**: [`level_margin`](#c-screening) (C)
-- **M**: [`mace`](#mace) (MACE) · [`mace_device`](#mace) (MACE) · [`mace_fmax`](#mace) (MACE) · [`mace_model`](#mace) (MACE) · [`mace_steps`](#mace) (MACE) · [`mace_threads`](#mace) (MACE) · [`max_cores`](#runner-settings) (runner) · [`max_jobs`](#runner-settings) (runner) · [`max_nodes`](#runner-settings) (runner) · [`max_restarts`](#runner-settings) (runner) · [`mem_per_core`](#runner-settings) (runner) · [`mem_replicated`](#runner-settings) (runner) · [`mem_safety`](#runner-settings) (runner) · [`mp_api_key`](#a-host) (A)
+- **M**: [`mace`](#mace) (MACE) · [`mace_device`](#mace) (MACE) · [`mace_fmax`](#mace) (MACE) · [`mace_model`](#mace) (MACE) · [`mace_steps`](#mace) (MACE) · [`mace_threads`](#mace) (MACE) · [`max_cores`](#runner-settings) (runner) · [`max_jobs`](#runner-settings) (runner) · [`max_nodes`](#runner-settings) (runner) · [`max_restarts`](#runner-settings) (runner) · [`max_walltime`](#runner-settings) (runner) · [`mem_per_core`](#runner-settings) (runner) · [`mem_replicated`](#runner-settings) (runner) · [`mem_safety`](#runner-settings) (runner) · [`mp_api_key`](#a-host) (A)
 - **N**: [`name`](#general) (general) · [`native_pairs`](#b-candidates-and-cell-size) (B)
 - **O**: [`omp_threads`](#runner-settings) (runner) · [`%block oxidation_states`](#c-screening) (C)
 - **P**: [`pair_max_distance`](#b-candidates-and-cell-size) (B) · [`pairs`](#b-candidates-and-cell-size) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
 - **Q**: [`quench_temperature`](#e-thermodynamics) (E)
-- **R**: [`rattle_dmin`](#c-screening) (C) · [`rattle_stdev`](#c-screening) (C) · [`require_bound`](#c-screening) (C) · [`require_gap_states`](#c-screening) (C) · [`require_spin`](#c-screening) (C) · [`%block runner_<group>`](#runner-settings) (runner)
+- **R**: [`rattle_dmin`](#c-screening) (C) · [`rattle_stdev`](#c-screening) (C) · [`require_bound`](#c-screening) (C) · [`require_gap_states`](#c-screening) (C) · [`require_spin`](#c-screening) (C) · [`%block runner_<group>`, `%block runner_<step>`](#runner-settings) (runner)
 - **S**: [`scan`](#b-candidates-and-cell-size) (B) · [`scan_sizes`](#b-candidates-and-cell-size) (B) · [`scan_tol`](#b-candidates-and-cell-size) (B) · [`screen_charges`](#c-screening) (C) · [`screen_cutoff`](#c-screening) (C) · [`screen_max_steps`](#c-screening) (C) · [`%block screen_overrides`](#c-screening) (C) · [`screen_spins`](#c-screening) (C) · [`series_charge`](#b-candidates-and-cell-size) (B) · [`series_choice`](#b-candidates-and-cell-size) (B) · [`series_defect`](#b-candidates-and-cell-size) (B) · [`series_sizes`](#b-candidates-and-cell-size) (B) · [`series_tol`](#b-candidates-and-cell-size) (B) · [`share_rounds`](#c-screening) (C) · [`sp_walltime`](#runner-settings) (runner) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-and-cell-size) (B)
 - **T**: [`tolerate_failures`](#runner-settings) (runner) · [`transform`](#general) (general) · [`triage`](#c-screening) (C) · [`triage_window`](#c-screening) (C)
 - **V**: [`vacancies`](#b-candidates-and-cell-size) (B)
@@ -680,27 +713,29 @@ Details: [Phase E](#phase-e-thermodynamics).
 
 These are `supercell_convergence.py`'s keywords for how jobs run (see
 `README_supercell_convergence.md` for the details). In the project file they apply to every
-group of steps; `%block runner_<group>`, holding runner keywords only, changes them for one group
-(`host`, `series`, `screen` or `production`). The groups' own defaults
-([How a run works](#how-a-run-works)) take precedence over the project-wide settings, and a
-`%block runner_<group>` setting over both.
+step. `%block runner_<group>` (`host`, `series`, `screen` or `production`) changes them for a
+group of steps, and `%block runner_<step>` (`converge`, `relax`, `bands`, `dielectric`, `phases`,
+`drelax` or `rank`) for one step; these blocks hold runner keywords only, and may hold a
+`%block partitions`. A step uses the project-wide settings, changed by its group's defaults, then
+by its group's block, then by its own ([How a run works](#how-a-run-works) lists them).
 
 | Keyword | Default | What it does |
 |---|---|---|
-| `jobscript` | required | Your jobscript template, as a file or as `%block jobscript`. It needs `{SEED}` where the seedname goes, and `{NCORES}`, or on whole-node machines `{NODES}`, `{TASKS_PER_NODE}` and `{CPUS_PER_TASK}`. Other placeholders: `{JOBNAME}`, `{PARTITION}`, `{NKPTS}`, `{MEM_GB}`, `{MEM_MB}`, `{MEM_PER_NODE_GB}`, `{MEM_PER_CORE_GB}`, `{MEM_PER_CORE_MB}`. The runner sets the partition and `--time` itself; the template's `--time` is the longest any job may run. |
+| `jobscript` | required | Your jobscript template, as a file or as `%block jobscript`. It needs `{SEED}` where the seedname goes, and `{NCORES}`, or on whole-node machines `{NODES}`, `{TASKS_PER_NODE}` and `{CPUS_PER_TASK}`. Other placeholders: `{JOBNAME}`, `{PARTITION}`, `{NKPTS}`, `{MEM_GB}`, `{MEM_MB}`, `{MEM_PER_NODE_GB}`, `{MEM_PER_CORE_GB}`, `{MEM_PER_CORE_MB}`. The runner sets the partition and `--time` itself; the template's `--time` is the longest any job may run, unless `max_walltime` is set. |
 | `cores_per_node` | — | Cores per node on a machine that hands out whole nodes (128 on ARCHER2). Jobs are then laid out as nodes × processes per node, chosen for k-point parallelism. |
 | `max_nodes` | `1` | The most nodes a job may use (with `cores_per_node`). |
 | `max_cores` | `32` | The most cores a job may use on a machine that hands out cores (without `cores_per_node`). |
 | `cores` | — | An exact core count for every job. |
-| `%block partitions` | — | One partition per line: `name  GB_per_core  [max_cores]  [#SBATCH options]`, e.g. `highmem  4  --qos=highmem`. A job goes on the first partition where it fits in memory with full nodes; if none fits, on the best layout with fewer processes per node. |
+| `%block partitions` | — | One partition per line: `name  GB_per_core  [max_cores]  [#SBATCH options]`, e.g. `highmem  4  --qos=highmem`. A job goes on the first partition where it fits in memory with full nodes; if none fits, on the best layout with fewer processes per node. One inside a runner block replaces the whole list for those steps. |
 | `mem_per_core` | — | Without `%block partitions`: the memory per core (GB) jobs must fit in; a job that can't is warned about. |
 | `mem_safety` | `1.05` | Factor on the memory estimated from the dry run. |
 | `mem_replicated` | `auto` | The fraction of the dry run's memory that every process keeps its own copy of. `auto` starts at 0.25 and is measured from each finished job. |
 | `baseline_mb` | — | Replaces CASTEP's baseline memory estimate (MB). |
 | `omp_threads` | `1` | `auto` or a number: OpenMP threads per process on cores left idle when nodes are underpopulated for memory. |
-| `walltime` | `auto` | `auto`: once jobs have finished, later ones ask for what they need (scaled from the measured time per SCF cycle) instead of the template's `--time`; `fixed`: always the template's. |
+| `max_walltime` | the template's `--time` | The longest a job may run (`H:MM:SS`, or `D-HH:MM:SS`), instead of the template's `--time` (or a partition line's `--time=`). The first jobs of a step ask for this; with `walltime : auto` later ones ask for less once finished jobs show what they need. A relaxation stops a little before it and carries on in a new job; a single point can't, so give single points enough. |
+| `walltime` | `auto` | `auto`: once jobs have finished, later ones ask for what they need (scaled from the measured time per SCF cycle) instead of the longest walltime; `fixed`: always the longest. |
 | `walltime_safety` | `1.5` | Factor on the walltime estimate. |
-| `sp_walltime` | — | The walltime (`H:MM:SS`) of the first single points, before there is anything to estimate from. One that runs out is resubmitted with the full time. |
+| `sp_walltime` | — | The walltime (`H:MM:SS`) of the first single points, before there is anything to estimate from, if shorter than the longest. One that runs out is resubmitted with the longest. |
 | `max_restarts` | `10` (`0` for `screen`) | How many times a job that runs out of time, or stops in a way the runner can recover from, is resubmitted; a relaxation carries on from its `.check`. |
 | `delete_check` | `false` | Delete each calculation's `.check` file once it has finished; they can be large. |
 | `dryrun_on` | `compute` | Where the dry runs go (one per distinct input, for the k-points and memory): `compute`, as small batch jobs from your template; `login`, where `dwf.py` runs, with `dryrun_cmd`. On ARCHER2, don't send them to the shared `serial` partition with a whole-node template, which it rejects: use `login`, or `dryrun_partition : standard`. |
@@ -804,10 +839,10 @@ Your usual CASTEP jobscript with placeholders. The runner fills them in for each
 
 The runner also sets `#SBATCH --partition` (with the partition line's extra options) and
 `--time`, replacing the template's in either spelling; the template's `--time` is the longest
-any job may run. It sets `OMP_NUM_THREADS`, and with threads adds `OMP_PLACES`,
-`SRUN_CPUS_PER_TASK` and `--cpus-per-task` if they are missing. A dry-run job (`dryrun_on :
-compute`) is made from the same template (or `dryrun_jobscript`), with the CASTEP line run as
-one process with `--dryrun`.
+any job may run, unless `max_walltime` is set. It sets `OMP_NUM_THREADS`, and with threads adds
+`OMP_PLACES`, `SRUN_CPUS_PER_TASK` and `--cpus-per-task` if they are missing. A dry-run job
+(`dryrun_on : compute`) is made from the same template (or `dryrun_jobscript`), with the CASTEP
+line run as one process with `--dryrun`.
 
 ### 7. `series.conv` (written by B3)
 
@@ -914,6 +949,15 @@ q=-1`, `Vac_O  q=+2,+1`, `Sb_Ca` without) screened, relaxed and analysed each de
 own charge states, and ran the size series in q = −1. A non-cubic grid list (`6 6 4` to
 `16 16 14` in steps of `2 2 2`) was tested through A1 and A2.1, and the checks on the three
 keywords on their own.
+
+Runner blocks for single steps (`%block runner_<step>`) and `max_walltime` came last. Without
+them, the test projects submit exactly the same jobs as before (every `job.sh`, layout and
+walltime) and give the same results. `Final` was also run with a block for every step
+(different `max_nodes`, `cores` and `max_walltime`, and for A1 its own partition line with
+`--qos=short`): every job got its own step's nodes and longest walltime, the B3 size series too
+(through `series.conv`), and the results were the same as without the blocks. A relaxation that
+ran out of time under a 20-minute `max_walltime` was carried on in a new job with the same 20
+minutes.
 
 Not tested: `phases_from : doped` (no Materials Project access here), a real fine-tuned model
 (`finetune.sh` is written but was not run), and real CASTEP output for the DFPT permittivity and

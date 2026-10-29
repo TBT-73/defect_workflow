@@ -39,11 +39,73 @@ max_jobs  : 16                 # most jobs of one step queued at once
 max_restarts : 20              # a relaxation that runs out of time carries on this many times
 poll      : 30
 delete_check : true            # delete each .check once its calculation has finished
-# ... and for one group of steps (host, series, screen, production) only:
-%block runner_screen
-max_nodes    : 1               # Gamma-only screening jobs are small
+# Defect workflow project file    run:  nohup python3 dwf.py <this file> > run.log 2>&1 &
+# Written like a CASTEP .param/.cell file: "keyword : value", %block ... %endblock, keywords
+# in any case, # or ! starts a comment. Lines starting with ! are optional settings with an
+# example value: delete the ! to use one. File names are relative to this file: the example
+# inputs (CaO:Sb on ARCHER2) are in example_CaO_Sb/, this file and every file it names.
+
+# ======================================================================= general
+host_cell : CaO_prim.cell      # host primitive cell: species_pot, symmetry_generate, k-points
+param     : CaO.param          # production settings (functional, cut-off, ...); dwf.py
+                               #   sets task, charge and spin, and A1 sets cut_off_energy
+!workdir  : dwf_CaO_Sb         # where everything goes (default dwf_<file name>)
+# Supercell shape: size n uses n x transform x (primitive cell). This one gives cubic cells
+# (8 n^3 atoms) from an FCC primitive cell; leave it out for n x n x n primitive cells.
+%block transform
+  -1  1  1
+   1 -1  1
+   1  1 -1
+%endblock transform
+mace        : true             # MACE for the size scan (B2) and pre-relaxations (B3, C1)
+!mace_model : medium-mpa-0     # a mace_mp foundation model, or a .model file
+!finetuned_model : dwf_CaO_Sb/B_candidates/finetune/dwf_finetuned.model   # C1 only: the
+                               #   model fine-tuned from B4's data (finetune.sh)
+!mace_threads : 8
+
+# ======================================================================= runner settings
+# How the CASTEP jobs run: any supercell_convergence.py runner keyword (see its --example).
+jobscript      : archer2.sh    # template with {SEED} and {NODES}/{TASKS_PER_NODE} or {NCORES}
+cores_per_node : 128
+max_nodes      : 2             # most nodes per job (more or fewer for some steps: below)
+!max_walltime  : 12:00:00      # the longest a job may run (default: the template's --time)
+%block partitions              # each job goes on the first with enough memory per core
+standard   2   --qos=standard
+highmem    4   --qos=highmem
+%endblock partitions
+dryrun_on  : login             # dry runs where dwf.py runs (not ARCHER2's shared serial
+dryrun_cmd : castep.serial --dryrun {seed}   #  partition, which rejects whole-node jobs)
+max_jobs  : 16                 # most jobs of one step queued at once
+max_restarts : 20              # a relaxation that runs out of time carries on this many times
+poll      : 300
+delete_check : true            # delete each .check once its calculation has finished
+# ... and for some steps only: %block runner_host (A1 to A3.1), runner_converge (A1),
+# runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3), runner_phases (A3.1),
+# runner_series (B3), runner_screen (C2, C5, C6), runner_drelax (C5), runner_rank (C6),
+# runner_production (D1). A step uses the settings above, changed by its group's block
+# (runner_host or runner_screen), then by its own: each replaces only the keywords it gives
+# (a %block partitions in one replaces the whole list). Starting points for CaO:Sb on
+# ARCHER2 - set your own:
+%block runner_host             # A1 to A3.1: the primitive cell and the competing phases
+max_walltime : 4:00:00
+%endblock runner_host
+%block runner_converge         # A1: single points of the 2-atom primitive cell
+max_nodes    : 1
+max_walltime : 0:30:00
+%block partitions              # ARCHER2's short QoS: at most 20 minutes and 32 nodes
+standard   2   --qos=short
+%endblock partitions
+%endblock runner_converge
+%block runner_series           # B3: up to the 512-atom cell of size 4
+max_nodes    : 12
+%endblock runner_series
+%block runner_screen           # C2, C5, C6: Gamma-only screening jobs are small
+max_nodes    : 1
 max_restarts : 0               # (the default for screening: a job that fails is flagged)
 %endblock runner_screen
+%block runner_production       # D1: the production relaxations
+max_nodes    : 8
+%endblock runner_production
 
 # ======================================================================= A: host
 converge : true                # A1: converge the cut-off and k-point spacing first

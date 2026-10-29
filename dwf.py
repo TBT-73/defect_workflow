@@ -39,8 +39,9 @@ again from scratch).
 All CASTEP jobs go through supercell_convergence.py, which must be in the same directory: the
 B3 size series in its usual mode, which builds its own cells, every other step in its batch
 mode, which runs the structures this script builds. Its runner settings (jobscript,
-partitions, cores_per_node, walltime, ...) go in the project file, and %block runner_<group>
-changes them for one group of steps (host, series, screen, production).
+partitions, cores_per_node, max_nodes, max_walltime, ...) go in the project file, for every
+step; %block runner_<group> changes them for a group of steps (host, series, screen,
+production) and %block runner_<step> for one step (e.g. runner_converge, runner_relax).
 """
 
 import argparse
@@ -184,17 +185,26 @@ PROJECT_KEYWORDS = {
 }
 LIST_KEYS = {"transform", "converge_cutoffs", "dopants", "scan_sizes",
              "series_sizes", "screen_charges", "distortions", "zpl_window"}   # block or keyword
-# supercell_convergence keywords that control how jobs run (allowed in the project file and in
-# %block runner_<group>)
+# supercell_convergence keywords that control how jobs run (allowed in the project file, for every
+# step, and in %block runner_<group> or runner_<step>)
 RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "cores",
                "cores_per_node", "max_nodes", "mem_per_core", "mem_safety", "mem_replicated",
                "baseline_mb", "omp_threads", "walltime", "walltime_safety", "sp_walltime",
-               "max_restarts", "delete_check", "dryrun_on", "dryrun_partition", "dryrun_time",
-               "dryrun_cores", "dryrun_mem_gb", "dryrun_options", "dryrun_cmd",
+               "max_walltime", "max_restarts", "delete_check", "dryrun_on", "dryrun_partition",
+               "dryrun_time", "dryrun_cores", "dryrun_mem_gb", "dryrun_options", "dryrun_cmd",
                "dryrun_timeout", "submit_cmd", "status_cmd", "poll", "max_jobs",
                "tolerate_failures"}
+# The steps that run CASTEP jobs, and the group of steps each belongs to. The runner settings of a
+# step: the project's, changed by its group's defaults (GROUP_DEFAULTS), then by %block
+# runner_<group>, then by %block runner_<step> (Project.runner_items). series, screen and
+# production are both a step and a group: runner_screen is for all three screening steps (C2, C5,
+# C6), and runner_drelax and runner_rank change it for C5 or C6 only.
+RUNNER_STEPS = {"converge": "host", "relax": "host", "bands": "host", "dielectric": "host",
+                "phases": "host", "series": "series", "screen": "screen", "drelax": "screen",
+                "rank": "screen", "production": "production"}
 RUNNER_GROUPS = ("host", "series", "screen", "production")
-# what each group of steps uses unless the project file's %block runner_<group> says otherwise
+RUNNER_BLOCKS = RUNNER_GROUPS + tuple(s for s in RUNNER_STEPS if s not in RUNNER_GROUPS)
+# what each group of steps uses unless the project file's runner blocks say otherwise
 GROUP_DEFAULTS = {"host": "", "series": "",
                   "screen": "max_restarts : 0\ntolerate_failures : true",
                   "production": "tolerate_failures : true"}
@@ -228,21 +238,32 @@ def kgrid_list(name, lo, hi, step):
     return [[a + j * d for a, d in zip(lo, step)] for j in range(k + 1)]
 
 
+# The keyword, or the block's name, of an item of a CASTEP-style file (sc.parse_castep_input).
+#   Called by: Project.runner(), Project.runner_items(), read_project(), runner_conv_lines()
+def item_key(x):
+    return x["name"] if x["type"] == "block" else x["key"]
+
+
 # Reads the project file into a namespace of settings.
 # Every keyword must be a project keyword (PROJECT_KEYWORDS) or a runner keyword (RUNNER_KEYS,
-# passed to supercell_convergence.batch_args); %block runner_<group> holds runner keywords for one
-# group of steps. A typo gets the closest keyword suggested. Returns (settings, the text each
-# setting was given as, the runner items, {group: runner items}).
+# passed to supercell_convergence.batch_args); %block runner_<group> or runner_<step>
+# (RUNNER_BLOCKS) holds runner keywords, and may hold a %block partitions, for a group of steps or
+# one step. A typo gets the closest keyword suggested. Returns (settings, the text each setting was
+# given as, the runner items, {group or step: runner items}).
 #   Called by: Project.__init__()
-#   Calls:     kgrid_list(), sc.block_rows(), sc.parse_castep_input()
+#   Calls:     item_key(), kgrid_list(), sc.block_rows(), sc.parse_castep_input()
 def read_project(path):
     name = path.name
-    vals, raw, runner, groups = {}, {}, [], {}
-    known = set(PROJECT_KEYWORDS) | RUNNER_KEYS | {f"runner_{g}" for g in RUNNER_GROUPS}
+    vals, raw, runner, blocks = {}, {}, [], {}
+    known = set(PROJECT_KEYWORDS) | RUNNER_KEYS | {f"runner_{b}" for b in RUNNER_BLOCKS}
     for it in sc.parse_castep_input(path.read_text()):
         if it["type"] == "raw":
             continue
-        key = it["name"] if it["type"] == "block" else it["key"]
+        key = item_key(it)
+        if key.startswith("runner_") and key not in known:
+            die(f"{name}: there is no {key}: the runner blocks are runner_<group> for a group of "
+                f"steps ({', '.join(RUNNER_GROUPS)}) and runner_<step> for one step ("
+                + ", ".join(b for b in RUNNER_BLOCKS if b not in RUNNER_GROUPS) + ")")
         if key not in known:
             close = difflib.get_close_matches(key, sorted(known), n=1)
             die(f"{name}: unknown keyword '{key}'" + (f" - did you mean '{close[0]}'?" if close
@@ -259,11 +280,14 @@ def read_project(path):
                 die(f"{name}: {key} is a block of runner settings (%block {key} ... "
                     f"%endblock {key})")
             items = [x for x in sc.parse_castep_input("\n".join(it["body"])) if x["type"] != "raw"]
-            for x in items:
-                k = x["name"] if x["type"] == "block" else x["key"]
+            seen = set()
+            for k in map(item_key, items):
                 if k not in RUNNER_KEYS:
                     die(f"{name}: %block {key} can only hold runner settings, not '{k}'")
-            groups[key[len("runner_"):]] = items
+                if k in seen:
+                    die(f"{name}: '{k}' is given more than once in %block {key}")
+                seen.add(k)
+            blocks[key[len("runner_"):]] = items
             raw[key] = "(%block)"
             continue
         conv, _ = PROJECT_KEYWORDS[key]
@@ -299,7 +323,7 @@ def read_project(path):
     for key in ("host_cell", "param"):
         if getattr(s, key) is None:
             die(f"{name}: '{key}' is required")
-    if not any((x["name"] if x["type"] == "block" else x["key"]) == "jobscript" for x in runner):
+    if not any(item_key(x) == "jobscript" for x in runner):
         die(f"{name}: give the jobscript template, as 'jobscript : file' or %block jobscript")
     if s.transform is not None and round(np.linalg.det(np.reshape(s.transform, (3, 3)))) <= 0:
         die(f"{name}: transform must have a positive determinant")
@@ -311,26 +335,29 @@ def read_project(path):
                                    s.converge_kgrid_step)
     if s.zpl_window and s.zpl_window[0] >= s.zpl_window[1]:
         die(f"{name}: zpl_window is  lowest highest  (eV)")
-    return s, raw, runner, groups
+    return s, raw, runner, blocks
 
 
 # A project: its settings, files, directories, checkpoints (state.json), results (results.json
 # of each phase) and job runner. main() makes one from the project file and the command-line
 # switches, and passes it to the steps.
 class Project:
-    # Reads the project file and the state of earlier runs.
+    # Reads the project file and the state of earlier runs, and checks the runner settings of
+    # every step now (rather than when the step starts, perhaps days later).
     #   Called by: main()
-    #   Calls:     read_project()
+    #   Calls:     Project.runner(), read_project()
     def __init__(self, path, cl):
         self.path, self.base, self.cl = path, path.parent, cl
-        self.s, self.raw, self.runner_items, self.runner_groups = read_project(path)
+        self.s, self.raw, self.runner_project, self.runner_blocks = read_project(path)
+        self._runners, self._mace, self._model_ids, self._results = {}, {}, {}, {}
+        for step in RUNNER_STEPS:
+            self.runner(step)
         self.name = self.s.name or path.stem
         self.dir = self.base / (self.s.workdir or f"dwf_{self.name}")
         self.dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.dir / STATE
         self.state = (json.loads(self.state_file.read_text()) if self.state_file.exists()
                       else {"steps": {}})
-        self._runners, self._mace, self._model_ids, self._results = {}, {}, {}, {}
 
     # A file named by a project keyword (relative to the project file); stops if it is missing.
     #   Called by: Project.cell_text(), Project.production_param(), inputs_hash(), step_converge(),
@@ -398,36 +425,49 @@ class Project:
     def finished(self, step):
         return self.state["steps"].get(step, {}).get("status") == "done"
 
-    # The runner settings for a group of steps (supercell_convergence.batch_args): the project's
-    # runner keywords, then the group's defaults (GROUP_DEFAULTS), then %block runner_<group>,
-    # each replacing the one before; then the command-line switches.
-    #   Called by: Project.batch(), runner_conv_lines()
-    #   Calls:     sc.batch_args(), sc.parse_castep_input()
-    def runner(self, group):
-        if group not in self._runners:
-            def key(x):
-                return x["name"] if x["type"] == "block" else x["key"]
-            own = self.runner_groups.get(group, [])
-            dflt = [x for x in sc.parse_castep_input(GROUP_DEFAULTS.get(group, ""))
-                    if x["type"] != "raw" and key(x) not in {key(y) for y in own}]
-            later = {key(y) for y in own + dflt}
-            items = [x for x in self.runner_items if key(x) not in later] + dflt + own
-            args = sc.batch_args(items, self.base, f"{self.path.name} (runner settings, "
-                                                    f"{group} steps)")
+    # The runner items of a step that runs CASTEP jobs (one of RUNNER_STEPS): the project's runner
+    # keywords, changed by its group's defaults (GROUP_DEFAULTS), then by %block runner_<group>,
+    # then by %block runner_<step>; each replaces the keywords (and %block partitions) it gives.
+    #   Called by: Project.runner(), runner_conv_lines()
+    #   Calls:     item_key(), sc.parse_castep_input()
+    def runner_items(self, step):
+        group = RUNNER_STEPS[step]
+        layers = [[x for x in sc.parse_castep_input(GROUP_DEFAULTS[group]) if x["type"] != "raw"],
+                  self.runner_blocks.get(group, [])]
+        if step != group:
+            layers.append(self.runner_blocks.get(step, []))
+        items = list(self.runner_project)
+        for layer in layers:
+            given = {item_key(x) for x in layer}
+            items = [x for x in items if item_key(x) not in given] + layer
+        return items
+
+    # The runner settings of a step (supercell_convergence.batch_args of its runner_items), with
+    # the command-line switches. Steps with the same settings share them, as the steps of a group
+    # did before there were step blocks (so e.g. the memory model measured in C2 is used for C5's
+    # first jobs when they run in one go).
+    #   Called by: Project.__init__(), Project.batch()
+    #   Calls:     Project.runner_items(), item_key(), sc.batch_args()
+    def runner(self, step):
+        items = self.runner_items(step)
+        sig = json.dumps([[item_key(x), x.get("value"), x.get("body")] for x in items])
+        if sig not in self._runners:
+            args = sc.batch_args(items, self.base, f"{self.path.name} (runner settings of step "
+                                                    f"{STEP_INDEX[step].label} {step})")
             for flag in ("no_wait", "prepare_only", "force", "resubmit_failed"):
                 if getattr(self.cl, flag, False):
                     setattr(args, flag, True)
-            self._runners[group] = args
-        return self._runners[group]
+            self._runners[sig] = args
+        return self._runners[sig]
 
     # Runs a list of CASTEP jobs with supercell_convergence.run_batch in <workdir>/<subdir>, with
-    # the runner settings of a group of steps and the project's STOP file. Returns run_batch's
-    # result ({'complete', 'jobs', 'calcs'}).
+    # the runner settings of the step (its name, e.g. 'relax') and the project's STOP file. Returns
+    # run_batch's result ({'complete', 'jobs', 'calcs'}).
     #   Called by: run_screen_jobs(), step_bands(), step_converge(), step_dielectric(),
     #              step_phases(), step_production(), step_relax(), step_screen()
     #   Calls:     Project.cell_text(), Project.runner(), sc.run_batch()
-    def batch(self, subdir, jobs, group, param_text, cell_text=None, spacing=None):
-        return sc.run_batch(self.dir / subdir, jobs, self.runner(group),
+    def batch(self, subdir, jobs, step, param_text, cell_text=None, spacing=None):
+        return sc.run_batch(self.dir / subdir, jobs, self.runner(step),
                             cell_text or self.cell_text(), param_text, spacing=spacing,
                             energy=self.s.energy, stop_file=self.dir / "STOP")
 
@@ -1377,7 +1417,7 @@ def step_converge(p):
         jobs = [{"name": name, "atoms": prim, "kind": "sp", "symmetry": True, "kgrid": list(g),
                  "overrides": dict(HOST_OVERRIDES, cut_off_energy=f"{c:g} eV")}
                 for name, g, c in todo]
-        res = p.batch(f"A_host/jobs/converge/{sub}", jobs, "host", text)
+        res = p.batch(f"A_host/jobs/converge/{sub}", jobs, "converge", text)
         if not res["complete"]:
             return None
         bad = [k for k, v in res["jobs"].items() if v["energy"] is None or not v["scf_converged"]]
@@ -1447,7 +1487,7 @@ def step_relax(p):
     res = p.batch("A_host/jobs/relax", [{"name": "host", "atoms": prim, "kind": "geom",
                                          "fix_cell": False, "symmetry": True,
                                          "overrides": HOST_OVERRIDES}],
-                  "host", p.production_param(), spacing=p.kspacing())
+                  "relax", p.production_param(), spacing=p.kspacing())
     if not res["complete"]:
         return None
     r = res["jobs"]["host"]
@@ -1479,7 +1519,7 @@ def step_bands(p):
     res = p.batch("A_host/jobs/bands", [{"name": "bands", "atoms": host, "kind": "sp",
                                          "symmetry": True, "kgrid": sc.kgrid(host.cell, spacing),
                                          "kpoint_offset": "gamma", "overrides": HOST_OVERRIDES}],
-                  "host", p.production_param())
+                  "bands", p.production_param())
     if not res["complete"]:
         return None
     calc = res["calcs"]["bands"]
@@ -1524,7 +1564,7 @@ def step_dielectric(p):
     res = p.batch("A_host/jobs/dielectric", [{"name": "dielectric", "atoms": host, "kind": "sp",
                                               "task": task, "symmetry": True, "cell_extra": extra,
                                               "overrides": over}],
-                  "host", param, cell_text=cell, spacing=p.kspacing())
+                  "dielectric", param, cell_text=cell, spacing=p.kspacing())
     if not res["complete"]:
         return None
     eps_inf, eps0 = read_permittivity(res["calcs"]["dielectric"].output())
@@ -1642,7 +1682,8 @@ def step_phases(p):
         elif o.get("kspacing"):
             job["kgrid"] = sc.kgrid(atoms.cell, o["kspacing"])
         jobs.append(job)
-    res = p.batch("A_host/jobs/phases", jobs, "host", p.production_param(), spacing=p.kspacing())
+    res = p.batch("A_host/jobs/phases", jobs, "phases", p.production_param(),
+                  spacing=p.kspacing())
     if not res["complete"]:
         return None
     out, rows = {}, []
@@ -2115,23 +2156,15 @@ def step_scan(p):
             "_note": f"levels off at size {cap}" if cap else "did not level off"}
 
 
-# The runner settings of a group, as lines of a .conv file: the project's (and the group's) runner
-# keywords, with file names made absolute (the .conv is elsewhere). Batch-only keywords are left
-# out.
+# The runner settings of a step, as lines of a .conv file: its runner items (the project's runner
+# keywords, changed by its runner blocks), with file names made absolute (the .conv is elsewhere).
+# Batch-only keywords are left out.
 #   Called by: step_series()
-#   Calls:     Project.runner()
-def runner_conv_lines(p, group):
-    p.runner(group)                                   # checks them
-    own = p.runner_groups.get(group, [])
-
-    # The keyword or block name of an item.
-    def key(x):
-        return x["name"] if x["type"] == "block" else x["key"]
-
-    later = {key(y) for y in own}
+#   Calls:     Project.runner_items(), item_key()
+def runner_conv_lines(p, step):
     lines = []
-    for it in [x for x in p.runner_items if key(x) not in later] + own:
-        k = key(it)
+    for it in p.runner_items(step):
+        k = item_key(it)
         if k in ("max_jobs", "tolerate_failures"):
             continue
         if it["type"] == "block":
@@ -2783,18 +2816,19 @@ def step_distort(p):
 
 
 # Runs a list of distortion-type jobs (name, cand, starting structure, q, spin) with the
-# screening settings in C_screen/jobs/<subdir>, and returns {name: job_summary}, the final
-# structures saved in C_screen/structures/<structdir>.
+# screening settings in C_screen/jobs/<subdir>, with the runner settings of the step that runs them
+# (drelax or rank), and returns {name: job_summary}, the final structures saved in
+# C_screen/structures/<structdir>.
 #   Called by: step_drelax(), step_rank()
 #   Calls:     Project.batch(), Project.production_param(), job_summary(), load_cell(),
 #              screen_job()
-def run_screen_jobs(p, subdir, todo, structdir):
+def run_screen_jobs(p, step, subdir, todo, structdir):
     defects = p.out("prerelax")["defects"]
     jobs = []
     for t in todo:
         jobs.append(screen_job(p, t["name"], load_cell(p, t["structure"]), defects[t["cand"]],
                                t["q"], t["spin"]))
-    res = p.batch(f"C_screen/jobs/{subdir}", jobs, "screen", p.production_param())
+    res = p.batch(f"C_screen/jobs/{subdir}", jobs, step, p.production_param())
     if not res["complete"]:
         return None
     edges = p.out("screen")["host"]
@@ -2810,7 +2844,7 @@ def run_screen_jobs(p, subdir, todo, structdir):
 #   Called by: main() (step C5)
 #   Calls:     problem_table(), run_screen_jobs()
 def step_drelax(p):
-    out = run_screen_jobs(p, "drelax", p.out("distort")["jobs"], "drelax")
+    out = run_screen_jobs(p, "drelax", "drelax", p.out("distort")["jobs"], "drelax")
     if out is None:
         return None
     bad = sum(r["energy"] is None for r in out.values())
@@ -2924,7 +2958,7 @@ def step_rank(p):
             break
         log(f"C6 round {rnd}: trying {len(todo)} structures found in one charge state in the "
             "others")
-        out = run_screen_jobs(p, f"share_{rnd}", todo, "share")
+        out = run_screen_jobs(p, "rank", f"share_{rnd}", todo, "share")
         if out is None:
             return None
         results.update(out)
@@ -3480,8 +3514,9 @@ mace        : true             # MACE for the size scan (B2) and pre-relaxations
 # How the CASTEP jobs run: any supercell_convergence.py runner keyword (see its --example).
 jobscript      : archer2.sh    # template with {SEED} and {NODES}/{TASKS_PER_NODE} or {NCORES}
 cores_per_node : 128
-max_nodes      : 12            # most nodes per job (fewer for screening: runner_screen)
-%block partitions
+max_nodes      : 2             # most nodes per job (more or fewer for some steps: below)
+!max_walltime  : 12:00:00      # the longest a job may run (default: the template's --time)
+%block partitions              # each job goes on the first with enough memory per core
 standard   2   --qos=standard
 highmem    4   --qos=highmem
 %endblock partitions
@@ -3491,11 +3526,33 @@ max_jobs  : 16                 # most jobs of one step queued at once
 max_restarts : 20              # a relaxation that runs out of time carries on this many times
 poll      : 300
 delete_check : true            # delete each .check once its calculation has finished
-# ... and for one group of steps (host, series, screen, production) only:
-%block runner_screen
-max_nodes    : 1               # Gamma-only screening jobs are small
+# ... and for some steps only: %block runner_host (A1 to A3.1), runner_converge (A1),
+# runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3), runner_phases (A3.1),
+# runner_series (B3), runner_screen (C2, C5, C6), runner_drelax (C5), runner_rank (C6),
+# runner_production (D1). A step uses the settings above, changed by its group's block
+# (runner_host or runner_screen), then by its own: each replaces only the keywords it gives
+# (a %block partitions in one replaces the whole list). Starting points for CaO:Sb on
+# ARCHER2 - set your own:
+%block runner_host             # A1 to A3.1: the primitive cell and the competing phases
+max_walltime : 4:00:00
+%endblock runner_host
+%block runner_converge         # A1: single points of the 2-atom primitive cell
+max_nodes    : 1
+max_walltime : 0:20:00
+%block partitions              # ARCHER2's short QoS: at most 20 minutes and 32 nodes
+standard   2   --qos=short
+%endblock partitions
+%endblock runner_converge
+%block runner_series           # B3: up to the 512-atom cell of size 4
+max_nodes    : 12
+%endblock runner_series
+%block runner_screen           # C2, C5, C6: Gamma-only screening jobs are small
+max_nodes    : 1
 max_restarts : 0               # (the default for screening: a job that fails is flagged)
 %endblock runner_screen
+%block runner_production       # D1: the production relaxations
+max_nodes    : 8
+%endblock runner_production
 
 # ======================================================================= A: host
 converge : true                # A1: converge the k-point grid, then the cut-off

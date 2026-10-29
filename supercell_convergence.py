@@ -109,8 +109,9 @@ calculation planned after that, including jobs that are resubmitted.
 
 Walltimes
 ---------
-The #SBATCH --time in the template (or a --time= on a partition line) is the longest
-any job may run. With walltime : auto (the default) a job asks for less once finished
+The #SBATCH --time in the template (or a --time= on a partition line, or max_walltime,
+which replaces both) is the longest any job may run. With walltime : auto (the default) a
+job asks for less once finished
 jobs show what it needs: their time per SCF cycle is scaled to the new cell as
 k-points x electrons^a / processes (a fitted from the finished sizes, 3 until there
 are two) and multiplied by the SCF cycles of the biggest finished relaxation, then by
@@ -372,7 +373,8 @@ def canonical_key(key):
 # Used for your .cell and .param(s), the .conv input file and CASTEP's -out.cell. Each item is a
 # block {'type': 'block', 'name', 'body'}, a keyword {'type': 'kw', 'key', 'value', 'raw'} or any
 # other line {'type': 'raw'}. The original lines are kept, so render() can write the items back
-# exactly as they were.
+# exactly as they were. A block may hold other blocks (dwf.py's %block runner_<step> can hold a
+# %block partitions): they stay in its body, to be read by parsing the body again.
 #   Called by: cell_options(), final_atoms(), last_geometry(), main(), param_charge(),
 #              read_batch_file(), read_input(), read_structure(), relaxed_atoms(), run_batch()
 #   Calls:     canonical_key(), strip_comment()
@@ -383,9 +385,16 @@ def parse_castep_input(text):
         s = strip_comment(lines[i])
         m = re.match(r"%block\s+(\w+)", s, re.I)
         if m:
-            name, body = m.group(1).lower(), []
+            name, body, inner = m.group(1).lower(), [], 0      # inner: blocks open inside it
             i += 1
-            while i < len(lines) and not re.match(r"%endblock", strip_comment(lines[i]), re.I):
+            while i < len(lines):
+                t = strip_comment(lines[i])
+                if re.match(r"%endblock", t, re.I):
+                    if not inner:
+                        break
+                    inner -= 1
+                elif re.match(r"%block\s+\w", t, re.I):
+                    inner += 1
                 body.append(lines[i])
                 i += 1
             if i == len(lines):
@@ -1386,9 +1395,10 @@ def estimate_walltime(calc, nkpts, nelec, procs, ctx):
 
 
 # Chooses a job's walltime.
-# The --time already in the jobscript (from the template or a partition line) is the longest
-# allowed. With walltime : auto and finished jobs to learn from, it asks for estimate_walltime x
-# walltime_safety instead, rounded up to 15 minutes (at least WALLTIME_MIN), if that is shorter.
+# The --time already in the jobscript (from the template, a partition line or max_walltime) is the
+# longest allowed. With walltime : auto and finished jobs to learn from, it asks for
+# estimate_walltime x walltime_safety instead, rounded up to 15 minutes (at least WALLTIME_MIN), if
+# that is shorter.
 # With no finished job to learn from, a single point asks for sp_walltime instead, if set and
 # shorter (restart gives it the full --time if it runs out). Returns the plan: walltime, longest
 # walltime, seconds, seconds per SCF and a note for the log. Notes once if the template has no
@@ -1406,8 +1416,8 @@ def plan_walltime(calc, script, dr, procs, ctx, args):
         if not ctx.get("time_noted"):
             ctx["time_noted"] = True
             log("note: no #SBATCH --time in the jobscript, so walltimes are not estimated and "
-                "relaxations can't stop cleanly before the time limit - add one (the longest "
-                "a job may run)")
+                "relaxations can't stop cleanly before the time limit - add one, or set "
+                "max_walltime (the longest a job may run)")
         return plan
     if args.walltime != "auto":
         return plan
@@ -1809,8 +1819,9 @@ def prepare_all(calcs, ctx, args, show=True):
 # Turns a dry run into a job plan and writes job.sh.
 # parse_dryrun gives the k-points, electrons and memory; choose_resources picks the layout, memory
 # per process and partition; the template is filled in (fill), OpenMP threads are set for cores
-# the layout leaves idle (thread_count, set_threads), and the partition, its #SBATCH options and
-# the walltime (plan_walltime) are set with add_sbatch_option. For a relaxation,
+# the layout leaves idle (thread_count, set_threads), and the partition, its #SBATCH options,
+# max_walltime (the longest a job may run, replacing the template's and the partition's --time)
+# and the walltime (plan_walltime) are set with add_sbatch_option. For a relaxation,
 # run_time is set in the .param (run_time_for, set_param), so it can stop cleanly and be carried on
 # - except in a batch with max_restarts : 0 and tolerate_failures (screening), where nothing would
 # carry it on: there it may use its whole walltime. The plan is saved in job_info.json and
@@ -1861,6 +1872,8 @@ def finalize(calc, text, ctx, args, quiet=False, show=True):
         script = add_sbatch_option(script, f"--partition={part['name']}")
         for option in part["options"]:
             script = add_sbatch_option(script, fill(option, subs))
+    if args.max_walltime:                       # the longest these jobs may run
+        script = add_sbatch_option(script, f"--time={args.max_walltime}")
     wall = plan_walltime(calc, script, dr, ncores, ctx, args)
     if wall.time != wall.max:
         script = add_sbatch_option(script, f"--time={wall.time}")
@@ -2189,7 +2202,8 @@ def restart(calc, args):
             " before the time limit" if killed else "")
     else:
         why = "stopped itself before the time limit" if stopped else "was stopped at the time limit"
-    more = "Give it more nodes (max_nodes) or a longer walltime (#SBATCH --time), then rerun."
+    more = ("Give it more nodes (max_nodes) or a longer walltime (max_walltime, or #SBATCH "
+            "--time in the jobscript), then rerun.")
     if n >= args.max_restarts:
         die(f"{what} {why}, after {n} restarts already (max_restarts). "
             + ("Check its output files and the disk quota." if unreadable or cut else more))
@@ -2998,9 +3012,11 @@ himem       62   32    --mem={MEM_GB}G
 !mem_per_core  : 8 GB             # without %block partitions: warn if a job won't fit
 
 # Walltime: the template's #SBATCH --time is the longest a job may run (a partition line
-# can give its own, e.g. --time=48:00:00). auto: ask for less once finished jobs show
-# how long the next ones need; fixed: always the template's. A relaxation that runs out
-# of time stops cleanly and is resubmitted to carry on from its .check file.
+# can give its own, e.g. --time=48:00:00, and max_walltime replaces both). auto: ask for
+# less once finished jobs show how long the next ones need; fixed: always the longest. A
+# relaxation that runs out of time stops cleanly and is resubmitted to carry on from its
+# .check file.
+!max_walltime   : 12:00:00        # the longest a job may run, instead of the template's --time
 walltime        : auto
 walltime_safety : 1.5             # factor on the estimated time
 !sp_walltime    : 4:00:00         # walltime for a single point (e.g. a pristine cell) that
@@ -3142,7 +3158,7 @@ def _omp_threads(v):
     return n
 
 
-# KEYWORDS converter for a Slurm time such as 4:00:00 (sp_walltime).
+# KEYWORDS converter for a Slurm time such as 4:00:00 (sp_walltime, max_walltime).
 # Checks it with slurm_seconds and keeps the text.
 #   Called by: convert_settings (through the KEYWORDS table)
 #   Calls:     slurm_seconds()
@@ -3207,7 +3223,7 @@ KEYWORDS = {
     "mem_replicated": (_replicated, "auto"), "baseline_mb": (_num("MB"), None),
     "omp_threads": (_omp_threads, 1),
     "walltime": (_choice("auto", "fixed"), "auto"), "walltime_safety": (_num(), 1.5),
-    "sp_walltime": (_slurm_time, None),
+    "sp_walltime": (_slurm_time, None), "max_walltime": (_slurm_time, None),
     "max_restarts": (_num(cast=int), 10), "delete_check": (_bool, False),
     "prerelax": (_choice("none", "mace"), "none"), "prerelax_model": (_text, "medium-mpa-0"),
     "prerelax_fmax": (_num("eV/ang", "eV/A"), 0.05), "prerelax_steps": (_num(cast=int), 500),
