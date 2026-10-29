@@ -51,7 +51,7 @@ max_walltime : 4:00:00
 %endblock runner_host
 %block runner_converge         # A1: single points of the 2-atom primitive cell
 max_nodes    : 1
-max_walltime : 0:30:00
+max_walltime : 0:20:00
 %block partitions              # ARCHER2's short QoS: at most 20 minutes and 32 nodes
 standard   2   --qos=short
 %endblock partitions
