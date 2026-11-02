@@ -149,17 +149,18 @@ Two blocks cover a whole phase, and the others one step each:
 | `runner_dielectric` | A2.3 |
 | `runner_phases` | A3.1 |
 | `runner_series` | B3 |
-| `runner_screen` | every CASTEP step of phase C: C2, C5 and C6 |
+| `runner_screen` | every CASTEP step of phase C: C2, C5, C6 and C7 |
 | `runner_drelax` | C5 |
 | `runner_rank` | C6 |
+| `runner_excite` | C7 (both of its batches) |
 | `runner_production` | D1 |
 
 You only need the blocks for the steps you want to change. A step uses the project-wide
 settings, then `runner_host` or `runner_screen` if it is in phase A or C, then its own block; the
 later one wins for any keyword both give. C2 has no block of its own: set it with
-`runner_screen`, and give C5 or C6 their own blocks where they should differ.
+`runner_screen`, and give C5, C6 or C7 their own blocks where they should differ.
 
-The screening steps (C2, C5, C6) use `max_restarts : 0` and `tolerate_failures : true` (a run
+The screening steps (C2, C5, C6, C7) use `max_restarts : 0` and `tolerate_failures : true` (a run
 that fails is flagged, not rescued), and D1 `tolerate_failures : true`, whatever the project-wide
 settings say; a runner block can change them. `max_jobs` and `tolerate_failures` don't apply to
 B3.
@@ -296,14 +297,15 @@ What each phase's `results.json` holds:
 |---|---|---|
 | A | `converge`: cut-off, k-point spacing, `production.param`; `relax`: `host_relaxed.cell`, `e_bulk`; `bands`: VBM, CBM, gap, the `.bands` file; `dielectric`: ε₀, ε∞; `phases`: their energies; `limits`: μ at each limit | every later phase |
 | B | `generate`: the candidates (id, components, composition group, orientations, sites); `scan`: the size cap; `series`: E_f* per size and the choice; `finetune`: `train.xyz`, `finetune.sh`; `choose`: the supercell (size, matrix, shortest image distance) | C, D, E |
-| C | `prerelax`: each candidate's starting structure and where its defect is; `screen`: every run (energy, final spin, gap levels, first ZPL estimate, structure) and the host's band edges at Γ; `filter`, `zpl`: the survivors; `distort`: the distorted structures; `drelax`: their runs; `rank`: the structures for D | D, E |
+| C | `prerelax`: each candidate's starting structure and where its defect is; `screen`: every run (energy, final spin, gap levels, structure) and the host's band edges at Γ; `filter`: the survivors; `distort`: the distorted structures; `drelax`: their runs; `rank`: the ranked structures; `excite`: each ground state's excitation, ZPL (or vertical energy), ΔQ and verdict, and the structures for D | D, E |
 | D | `production`: E_host, and every run's energy, final spin, status and relaxed structure | E |
 | E | `corrections`: E_corr per charge; `formation`: formation energies at each limit, transition levels, Fermi level; `interest`: the defects for phase F (`for_F`) | phase F |
 
 Job names say what they are: `d001_qm1_s0` is candidate d001 in charge state −1 starting with
 spin 0 (C2), `d001_qm1_bm0.40` the same with the bonds around the defect 40 % shorter (C4, C5),
-`..._to_q0` a structure found in another charge state tried in q = 0 (C6), and `d001_qm1_k0`
-the lowest structure of d001 in q = −1 at the production settings (D1).
+`..._to_q0` a structure found in another charge state tried in q = 0 (C6), `d001_qm1_gs` and
+`d001_qm1_ex` its ground and excited states (C7), and `d001_qm1_k0` the lowest structure of d001
+in q = −1 at the production settings (D1).
 
 ---
 
@@ -443,21 +445,23 @@ directly.
 ### Phase C: screening and ground states
 
 Every candidate goes through cheap CASTEP relaxations; the ones that are competitive and have
-the properties you ask for get a search for their ground-state structure.
+the properties you ask for get a search for their ground-state structure. With `excite : true`,
+C7 then calculates each one's excited state, and only the defects that pass, plus every native
+defect, go on to the production runs.
 
 | Label | Step | What it does | Decision |
 |---|---|---|---|
 | C1 | `prerelax` | builds every candidate in the B5 supercell and relaxes it with MACE | pairs too far apart for the cell are left out; `configuration_margin` drops arrangements far above the lowest |
 | C2 | `screen` | one cheap CASTEP relaxation per candidate, charge state and starting spin | — |
 | C3 | `filter` | defect hull, duplicates, property filters | within `hull_margin` of the hull; the `require_*` filters |
-| C3b | `zpl` | optional ZPL window | first ZPL estimate inside `zpl_window` |
 | C4 | `distort` | ShakeNBreak distortions of the survivors | which charge states (`distort_charges`) |
 | C5 | `drelax` | cheap relaxations of the distortions | — |
 | C6 | `rank` | ranks the structures, shares winning distortions between charge states | a distortion counts if it beats the screened structure by `distortion_min_gain` |
+| C7 | `excite` | optional (`excite : true`): the excited state of each ground state, by ΔSCF | the ZPL inside `excite_window`; native defects go on anyway |
 
-The CASTEP jobs of C2, C5 and C6 run with the runner settings of `%block runner_screen` (and of
-`runner_drelax` or `runner_rank` for C5 or C6 alone): no restarts, and a job that fails is
-flagged while the others carry on (`--resubmit-failed` tries it again).
+The CASTEP jobs of C2, C5, C6 and C7 run with the runner settings of `%block runner_screen` (and
+of `runner_drelax`, `runner_rank` or `runner_excite` for one of them alone): no restarts, and a
+job that fails is flagged while the others carry on (`--resubmit-failed` tries it again).
 
 **C1 prerelax.** Each candidate is built in the chosen supercell; a pair whose components are
 more than half the shortest image distance apart is left out. With `mace : true` it is relaxed
@@ -474,9 +478,8 @@ most `screen_max_steps` geometry steps and any `%block screen_overrides`. The st
 as `spin` and as `SPIN=` on the anchor atom. They are starting values: CASTEP may end elsewhere,
 and the results keep the final spin. The pristine supercell gets a single point at the same
 settings: its band edges at Γ are the reference for the gap levels. Each run records its energy
-(only if the last SCF cycle converged), final spin, the defect levels in the gap (more than
-`level_margin` inside the band edges) and the first ZPL estimate (the smallest step from an
-occupied to an empty gap level in one spin channel).
+(only if the last SCF cycle converged), final spin, and the defect levels in the gap (more than
+`level_margin` inside the band edges).
 
 **C3 filter.**
 
@@ -490,14 +493,11 @@ occupied to an empty gap level in one spin channel).
    is dropped.
 4. *Property filters,* each met by a stable charge state: `require_gap_states` (occupied, empty
    or both kinds of gap level), `require_spin` (the final spin), `require_bound` (pairs bound
-   against their isolated components somewhere in the gap).
+   against their isolated components somewhere in the gap). With `excite : true`, native
+   defects skip these filters (but not the hull or the duplicates), so that they reach D.
 
 The charge states carried on are the stable ones (`distort_charges : stable`) or every one with a
 usable energy (`screened`). `summary.txt` gives every candidate's verdict and why.
-
-**C3b zpl** (`zpl_window`): a survivor is kept if one of its first ZPL estimates is inside the
-window. Kohn–Sham eigenvalue differences at the screening settings are a rough guide: keep the
-window wide.
 
 **C4 distort, C5 drelax.** For each survivor and charge state, from its screened structure,
 ShakeNBreak moves the nearest neighbours of the defect (ShakeNBreak's count, from the oxidation
@@ -511,11 +511,50 @@ relaxation are pooled, identical structures merged (pymatgen's StructureMatcher 
 tolerances) and ranked by energy. A distortion that wins in one charge state (by
 `distortion_min_gain`) is also relaxed in the other charge states of that defect, for up to
 `share_rounds` rounds. The lowest `keep_structures` distinct structures of each charge state go
-on to phase D.
+on to C7 (and so to phase D).
+
+**C7 excite** (`excite : true`; off by default, when everything C6 kept goes on to D). It
+calculates the excited state of each defect's ground state, in each charge state C6 kept (its
+lowest structure), the way ADAQ's screening does, and filters on the result:
+
+1. *Ground state:* a single point of the structure at the screening settings (Γ, `screen_cutoff`,
+   `%block screen_overrides`), with `metals_method : dm` and `%block excite_overrides`
+   (`C_screen/jobs/excite_gs/`). Its `.check` is kept, even with `delete_check : true`, since
+   the excited state starts from it: once you are happy with C7's results you can delete
+   `C_screen/jobs/excite_gs/*/*.check` to save space (a 216-atom cell's can be a few GB).
+2. *Which excitation:* from its eigenvalues, the smallest step of at least `excite_min` (0.4 eV)
+   from an occupied to an empty level in one spin channel, both more than `level_margin` inside
+   the host's band edges. One excitation per charge state. None: the charge state has no internal
+   transition in the gap.
+3. *Excited state:* CASTEP's simple ΔSCF (`calculate_deltascf : true`, `deltascf_method :
+   simple`, the two bands' occupations in `%block deltascf_constraints`), starting from the ground
+   state's `.check` (`reuse` and `deltascf_checkpoint`) (`C_screen/jobs/excite/`). With
+   `excite_relax : true` (the default) it is relaxed: its energy above the ground state is the ZPL,
+   and ΔQ (the mass-weighted displacement, amu^½ Å) comes from the two structures
+   (`C_screen/structures/excite/`). With `false`, a single point gives the vertical energy.
+4. *Verdict per charge state:* `pass` (energy inside `excite_window`; any converged energy without
+   a window), `outside`, `none` (no excitation in the gap), or `unknown` (a run failed or did not
+   converge: kept, with a warning, rather than dropped on a failed calculation).
+5. *On to D:* a defect with a charge state that passes (or is unknown) goes on with every
+   structure C6 kept for it, in every charge state. Every native defect (one that only adds or
+   removes host elements: vacancies, antisites, self-interstitials and their complexes) goes on
+   whatever its result, because E's formation energies and Fermi level need it.
+
+The ΔSCF occupations are only set in the excited-state runs; every ground-state run still lets
+the spin relax as before. Test C7 on one defect before a full run: CASTEP's ΔSCF must work on
+your build, and its documentation does not say whether excited-state geometry optimisation
+honours the constraints (if it doesn't, use `excite_relax : false`). Sb_Ca–V_O in q = −1 is a
+good test: ADAQ found its ZPL at about 0.53 eV (PBE 0.54, HSE 0.53). The ΔSCF energies are at
+the PBE level, which in SiC and diamond comes out about 0.2 eV low; keep the window generous. A
+constrained-occupation run can fail to converge (ADAQ had this for the P and As versions of
+X_Ca–V_O); those charge states come out `unknown`. Like ADAQ, it only looks at excitations
+between levels in the gap, so a defect whose level lies inside a band at the PBE level has none.
 
 ### Phase D: production relaxations
 
-**D1 production.** One relaxation per structure C6 kept, at the production settings: A1's
+**D1 production.** One relaxation per structure phase C passed on (C6's, or with `excite :
+true` those of the defects that passed C7 and of every native defect), at the production
+settings: A1's
 cut-off and k-point spacing, `%block production_overrides`, its charge, and its starting spin
 from phase C (`spin_polarized : true` with that spin; a spin-0 state runs without spin
 polarisation unless `production_overrides` sets `spin_polarized`). Positions only (the cell stays
@@ -550,10 +589,13 @@ from the formation energies, the sites, orientations and the final spin's degene
 from A2.2's band energies). With `quench_temperature`, the concentrations are frozen at
 `fermi_temperature` and shared out again between charge states at the lower temperature. Only
 the defects that reached phase D take part, so native defects dropped earlier can move the real
-Fermi level.
+Fermi level; with `excite : true`, every native defect on the hull reaches D.
 
 **E3 interest.** A defect goes on to phase F if one of its transition levels lies at least
-`deep_level_margin` from both band edges, or if phase C found an internal transition for it.
+`deep_level_margin` from both band edges, or if phase C found an internal transition for it: with
+`excite : true`, a charge state that passed C7 (its ΔSCF ZPL or vertical energy is given), or one
+whose C7 runs failed (flagged to check by hand). Without `excite`, only deep levels count. E3 does not use the Fermi level: check that the charge state you take to phase F is
+the one present at E2's Fermi level.
 
 ---
 
@@ -587,7 +629,8 @@ The file you give `dwf.py`. Its keywords are grouped below by the phase that use
   any number of values per line (`%block distortions` … `%endblock distortions`).
 - **Switches** take `true` or `false` (also `yes`/`no`, `on`/`off`); the keyword alone means
   `true`.
-- **Blocks** that hold `.param` keywords (`screen_overrides`, `production_overrides`) take
+- **Blocks** that hold `.param` keywords (`screen_overrides`, `excite_overrides`,
+  `production_overrides`) take
   `keyword : value` lines; the others take the rows described below.
 
 **Changing them.** The Steps column lists the steps that use a keyword. Change it and those steps
@@ -600,7 +643,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **B**: [`bands_kspacing`](#a-host) (A) · [`baseline_mb`](#runner-settings) (runner)
 - **C**: [`charge_correction`](#e-thermodynamics) (E) · [`%block chemical_potentials`](#a-host) (A) · [`configuration_margin`](#c-screening) (C) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kgrid_max`](#a-host) (A) · [`converge_kgrid_min`](#a-host) (A) · [`converge_kgrid_step`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
 - **D**: [`deep_level_margin`](#e-thermodynamics) (E) · [`%block defects`](#b-candidates-and-cell-size) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#c-screening) (C) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-and-cell-size) (B) · [`dopants`](#b-candidates-and-cell-size) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_pack`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
-- **E**: [`energy`](#general) (general)
+- **E**: [`energy`](#general) (general) · [`excite`](#c-screening) (C) · [`excite_min`](#c-screening) (C) · [`%block excite_overrides`](#c-screening) (C) · [`excite_relax`](#c-screening) (C) · [`excite_window`](#c-screening) (C)
 - **F**: [`fermi_temperature`](#e-thermodynamics) (E) · [`finetune`](#b-candidates-and-cell-size) (B) · [`finetune_args`](#b-candidates-and-cell-size) (B) · [`finetuned_model`](#mace) (MACE) · [`freeze_radius`](#d-production) (D)
 - **G**: [`gap`](#e-thermodynamics) (E)
 - **H**: [`host_cell`](#general) (general) · [`hull_margin`](#c-screening) (C)
@@ -618,7 +661,6 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **T**: [`tolerate_failures`](#runner-settings) (runner) · [`transform`](#general) (general)
 - **V**: [`vacancies`](#b-candidates-and-cell-size) (B)
 - **W**: [`walltime`](#runner-settings) (runner) · [`walltime_safety`](#runner-settings) (runner) · [`workdir`](#general) (general)
-- **Z**: [`zpl_window`](#c-screening) (C)
 
 Groups: [General](#general) · [MACE](#mace) · [A: host](#a-host) ·
 [B: candidates and cell size](#b-candidates-and-cell-size) · [C: screening](#c-screening) ·
@@ -632,7 +674,7 @@ Groups: [General](#general) · [MACE](#mace) · [A: host](#a-host) ·
 | `host_cell` | required | A1, A2.1 | The host cell, normally the primitive cell (a conventional cell also works); A2.1 relaxes it. Everything in it apart from the structure and k-points (`species_pot`, `symmetry_generate`, any other `.cell` keyword) is copied into every job's `.cell`; defect cells lose the symmetry keywords. List the dopants in `species_pot` too, or leave the block out to use CASTEP's default on-the-fly potentials for every species. |
 | `param` | required | A1 | The production settings: functional, SCF and geometry settings, smearing, and so on. A1 writes `production.param` from it, with the converged `cut_off_energy` and without any `charge` or `spin`, and every later job starts from that file. `dwf.py` sets `task`, and per job `charge`, `spin`, `spin_polarized` and the k-points. |
 | `transform` | identity | B2, B3, B5 | The supercell shape: 9 integers, row by row, each row a supercell vector in terms of the primitive vectors (determinant > 0). Size n is n × `transform`. The example's matrix turns an FCC primitive cell into cubic cells of 8n³ atoms. Without it, size n is n × n × n primitive cells. Everything after B5 uses the chosen cell. |
-| `energy` | `auto` | A1, A2.1, A3.1, B3, C2, C5, C6, D1 | Which CASTEP energy every step reads: `final` (Final energy), `free` (E − TS), `0K` (the 0 K estimate) or `auto` (the 0 K estimate when CASTEP prints one, else the final energy). They differ only with smearing. |
+| `energy` | `auto` | A1, A2.1, A3.1, B3, C2, C5, C6, C7, D1 | Which CASTEP energy every step reads: `final` (Final energy), `free` (E − TS), `0K` (the 0 K estimate) or `auto` (the 0 K estimate when CASTEP prints one, else the final energy). They differ only with smearing. |
 | `name` | the file name | — | The project's name: the default work directory is `dwf_<name>`, and it titles the E2 plot. |
 | `workdir` | `dwf_<name>` | — | The work directory, relative to the project file. |
 
@@ -713,16 +755,15 @@ phase D redoes the survivors properly.
 | `configuration_margin` | — | C1 | Before any CASTEP run, drop arrangements whose configurational energy (MACE energy above the lowest arrangement of the same composition) is more than this, e.g. `1.0 eV`. Off unless given; needs `mace : true`. MACE has no charge or spin, so keep it generous. Replaces `triage` and `triage_window`. |
 | `screen_charges` | `-1 0 1` (*list*) | C2 | The charge states every candidate is screened in, except one with its own `q=` in `%block defects`. |
 | `screen_spins` | `both` | C2 | The starting spins: `low` is the lowest the electron count allows (0 or 1); `both` adds that + 2. They are starting values: the results keep the final spin. |
-| `screen_cutoff` | the production cut-off | C2, C5, C6 | The cut-off of the screening runs. |
-| `screen_max_steps` | `50` | C2, C5, C6 | `geom_max_iter` of the screening relaxations. A run that reaches it is logged as failed but keeps its last energy, marked as not converged. |
-| `%block screen_overrides` | — | C2, C5, C6 | Any other `.param` keywords for the screening runs, e.g. a looser `elec_energy_tol`. |
-| `level_margin` | `0.1 eV` | C2, C5, C6 | How far inside the host's band edges (from the pristine cell at Γ) an eigenvalue must lie to count as a defect level in the gap. |
+| `screen_cutoff` | the production cut-off | C2, C5, C6, C7 | The cut-off of the screening runs. |
+| `screen_max_steps` | `50` | C2, C5, C6, C7 | `geom_max_iter` of the screening relaxations. A run that reaches it is logged as failed but keeps its last energy, marked as not converged. |
+| `%block screen_overrides` | — | C2, C5, C6, C7 | Any other `.param` keywords for the screening runs, e.g. a looser `elec_energy_tol`. |
+| `level_margin` | `0.1 eV` | C2, C5, C6, C7 | How far inside the host's band edges (from the pristine cell at Γ) an eigenvalue must lie to count as a defect level in the gap. |
 | `hull_margin` | `0.2 eV` | C3 | Keep an arrangement if its lowest formation energy comes within this of its composition group's defect hull somewhere in the gap. Allow for the error of the screening settings. |
 | `require_gap_states` | `none` | C3 | Keep only defects with `occupied` gap levels, `empty` ones, or `both` (an occupied and an empty level in the same spin channel: an internal transition), in a stable charge state. |
 | `require_spin` | — | C3 | Keep only defects with this final spin (unpaired electrons, within 0.25) in a stable charge state, e.g. `2` for a triplet. |
 | `require_bound` | `false` | C3 | Keep only pairs that are bound against their components somewhere in the gap: E_b = Σ E_f(parts) − E_f(pair) > 0. The components must be candidates too. |
 | `distort_charges` | `stable` | C3 | The charge states that go on to the distortions: `stable` (lowest in energy for that defect somewhere in the gap) or `screened` (every one with a usable energy). |
-| `zpl_window` | — | C3b | `lowest highest` in eV: keep only defects whose first ZPL estimate (the smallest step from an occupied to an empty gap level in one spin channel) lies inside. Without it, C3b keeps every survivor. |
 | `distortions` | `-0.6 -0.5 … 0.5 0.6` (*list*) | C4 | ShakeNBreak bond distortions of the defect's nearest neighbours: `-0.4` brings them 40 % closer, `0.4` takes them 40 % further. One relaxation per factor, charge state and survivor. |
 | `distort_around` | `anchor` | C4 | The centre of the distortion: `anchor` (the first component's atom) or `vacancy` (the vacant site, for defects that have one). |
 | `%block oxidation_states` | guessed | C4 | One `El  value` per line, for ShakeNBreak's count of neighbours to distort: n = q − Σ (oxidation state put there − that of the site), and that many neighbours (the absolute value), or 8 minus it above 4. Without the block, pymatgen guesses the host's, and each dopant takes its common oxidation state closest to that of the element it replaces. |
@@ -730,7 +771,12 @@ phase D redoes the survivors properly.
 | `rattle_dmin` | 80 % of the host bond | C4 | The shortest distance (Å) between atoms that rattling may produce. |
 | `distortion_min_gain` | `0.05 eV` | C6 | A distortion counts as found when it beats the screened structure by this. |
 | `share_rounds` | `2` | C6 | How many rounds of trying a winning distortion in the other charge states of its defect. |
-| `keep_structures` | `1` | C6 | How many distinct structures, lowest first, of each defect and charge state go on to phase D. |
+| `keep_structures` | `1` | C6 | How many distinct structures, lowest first, of each defect and charge state go on to phase D (C7 excites the lowest). |
+| `excite` | `false` | C3, C7, E3 | Run C7: the excited state of each defect's ground state (ΔSCF at the screening settings). Only the defects that pass, and every native defect, go on to D; native defects also skip C3's property filters. E3 takes its internal transitions from C7. With `false`, everything C6 kept goes on, and E3 counts deep levels only. |
+| `excite_window` | — | C7 | `lowest highest` in eV: a charge state passes if its ZPL (or vertical energy, with `excite_relax : false`) lies inside. Without it, any converged excited state passes. |
+| `excite_min` | `0.4 eV` | C7 | The smallest step from an occupied to an empty gap level (one spin channel, Kohn–Sham) taken as the excitation: C7 calculates the smallest one at least this big. |
+| `excite_relax` | `true` | C7 | Relax the excited state (its energy is then the ZPL, and ΔQ is given). `false`: a single point at the ground-state structure (the vertical energy, above the ZPL), for a CASTEP build whose ΔSCF has no excited-state forces. |
+| `%block excite_overrides` | — | C7 | Any other `.param` keywords for C7's runs (ground and excited states), after `screen_overrides` and `metals_method : dm`, e.g. `deltascf_smearing : 0.01` for degenerate levels or more `nextra_bands`. |
 
 #### D: production
 
@@ -760,7 +806,7 @@ These are `supercell_convergence.py`'s keywords for how jobs run (see
 step. A runner block changes them for some steps: `%block runner_host` for every CASTEP step of
 phase A, `%block runner_screen` for every one of phase C, and `%block runner_converge`,
 `runner_relax`, `runner_bands`, `runner_dielectric`, `runner_phases`, `runner_series`,
-`runner_drelax`, `runner_rank` or `runner_production` for one step
+`runner_drelax`, `runner_rank`, `runner_excite` or `runner_production` for one step
 ([How a run works](#how-a-run-works) has the table). They hold runner keywords only, and may hold
 a `%block partitions`.
 
@@ -781,7 +827,7 @@ a `%block partitions`.
 | `walltime` | `auto` | `auto`: once jobs have finished, later ones ask for what they need (scaled from the measured time per SCF cycle) instead of the longest walltime; `fixed`: always the longest. |
 | `walltime_safety` | `1.5` | Factor on the walltime estimate. |
 | `sp_walltime` | — | The walltime (`H:MM:SS`) of the first single points, before there is anything to estimate from, if shorter than the longest. One that runs out is resubmitted with the longest. |
-| `max_restarts` | `10` (`0` for C2, C5, C6) | How many times a job that runs out of time, or stops in a way the runner can recover from, is resubmitted; a relaxation carries on from its `.check`. |
+| `max_restarts` | `10` (`0` for C2, C5, C6, C7) | How many times a job that runs out of time, or stops in a way the runner can recover from, is resubmitted; a relaxation carries on from its `.check`. |
 | `delete_check` | `false` | Delete each calculation's `.check` file once it has finished; they can be large. |
 | `dryrun_on` | `compute` | Where the dry runs go (one per distinct input, for the k-points and memory): `compute`, as small batch jobs from your template; `login`, where `dwf.py` runs, with `dryrun_cmd`. On ARCHER2, don't send them to the shared `serial` partition with a whole-node template, which it rejects: use `login`, or `dryrun_partition : standard`. |
 | `dryrun_cmd` | `castep.mpi --dryrun {seed}` | The command for `dryrun_on : login`, e.g. `castep.serial --dryrun {seed}`. |
@@ -794,7 +840,7 @@ a `%block partitions`.
 | `status_cmd` | `squeue` or `qstat` | The command that lists queued and running jobs. |
 | `poll` | `120 s` | Seconds between checks of the queue. |
 | `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once. |
-| `tolerate_failures` | `false` (`true` for C2, C5, C6 and D1) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
+| `tolerate_failures` | `false` (`true` for C2, C5, C6, C7 and D1) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
 | `pack` | `1` | Run up to N of a step's jobs side by side on one node, in one job, each on `cores_per_node`/N cores and its share of the node's memory ([How a run works](#how-a-run-works)). Needs `cores_per_node` and a jobscript whose CASTEP line uses `srun`; not for B3. |
 
 `--prepare-only`, `--no-wait`, `--resubmit-failed` and `--force` are command-line switches
@@ -809,17 +855,19 @@ starts from that file. Any keyword not in this table (`xc_functional`, `elec_ene
 | Keyword | What the workflow does with it |
 |---|---|
 | `task` | Set for every job: `geometryoptimization` for relaxations, `singlepoint` for single points, `dielectric_task` for the A2.3 run. Yours is ignored. |
-| `cut_off_energy` | A1 sets it on each convergence run and writes the converged value into `production.param`, replacing yours. With `converge : false`, yours is kept. The screening runs (C2, C5, C6) use `screen_cutoff` if it is set. |
+| `cut_off_energy` | A1 sets it on each convergence run and writes the converged value into `production.param`, replacing yours. With `converge : false`, yours is kept. The screening runs (C2, C5, C6, C7) use `screen_cutoff` if it is set. |
 | `basis_precision` | Removed by A1 when it sets `cut_off_energy`. |
 | `charge` | Set per job, to the charge state; removed from `production.param` and from the host, competing-phase and pristine-supercell jobs. Leave it out. |
-| `spin` | The starting total spin (unpaired electrons), set per defect job: from `screen_spins` in C2, from the final spin of the screening run in C5, C6 and D1, and from the electron count in B3. Removed from `production.param` and from the host and phase jobs (unless a phase line sets it). A starting value only: with `fix_occupancy : false`, CASTEP holds it for `spin_fix` SCF cycles and then lets it relax. |
-| `spin_polarized` (or `spin_polarised`) | Either spelling works: a job that sets it replaces yours, whichever spelling you used. `true` on every screening run (C2, C5, C6), on D1 runs with a non-zero spin, and on charged or odd-electron size series (B3); `false` for D1's spin-0 states unless `%block production_overrides` sets it, and for the A2.3 run without `dielectric_param`. The host and phase jobs use yours. |
+| `spin` | The starting total spin (unpaired electrons), set per defect job: from `screen_spins` in C2, from the final spin of the screening run in C5, C6, C7 and D1 (for C7's excited state, of its ground-state run), and from the electron count in B3. Removed from `production.param` and from the host and phase jobs (unless a phase line sets it). A starting value only: with `fix_occupancy : false`, CASTEP holds it for `spin_fix` SCF cycles and then lets it relax. |
+| `spin_polarized` (or `spin_polarised`) | Either spelling works: a job that sets it replaces yours, whichever spelling you used. `true` on every screening run (C2, C5, C6, C7), on D1 runs with a non-zero spin, and on charged or odd-electron size series (B3); `false` for D1's spin-0 states unless `%block production_overrides` sets it, and for the A2.3 run without `dielectric_param`. The host and phase jobs use yours. |
 | `fix_occupancy` | `true` for the A2.3 run without `dielectric_param`, `false` for `metal` phases; otherwise yours. |
 | `geom_max_iter` | `screen_max_steps` on the screening relaxations; yours, or `%block production_overrides`, elsewhere. A production relaxation that reaches it is flagged and left out of E. |
 | `write_cell_structure` | Set to `true` on relaxations: their final structure is read from `<seed>-out.cell`. |
 | `run_time` | Set on relaxations, a little below the job's walltime, so CASTEP stops cleanly and writes its `.check` before the time limit (not on screening runs, which are not restarted). |
-| `continuation` | Yours is removed. Set to `default` when a relaxation is resubmitted to carry on from its `.check`. |
-| `reuse` | Removed. |
+| `continuation` | Yours is removed. Set to `default` when a relaxation is resubmitted to carry on from its `.check` (which removes any `reuse`: CASTEP takes one or the other). |
+| `reuse` | Yours is removed. C7's excited-state runs set it to their ground state's `.check`. |
+| `metals_method` | `dm` on C7's runs (CASTEP's ΔSCF constraints need density mixing), unless `%block excite_overrides` sets it; yours elsewhere. |
+| `calculate_deltascf`, `deltascf_method`, `deltascf_checkpoint`, `%block deltascf_constraints` | Set on C7's excited-state runs only: `true`, `simple`, the ground state's `.check`, and the occupations of the two bands (the occupied one emptied, the empty one filled, in one spin channel). |
 
 `%block screen_overrides` and `%block production_overrides` (project file) set further keywords
 for the screening and production runs, and options on a `%block phases` line set them for that
@@ -971,11 +1019,14 @@ energies, spins and band structures, so these runs check the workflow's logic, n
 
 | Test project | What it covered |
 |---|---|
-| `Final` | A to E with MACE: convergence, DFPT, competing phases and limits, generated candidates, MACE scan, size series, fine-tuning data (B4), `configuration_margin`, a MACE model file for C1 (`finetuned_model`), `require_gap_states`, `zpl_window`, `hull_margin`, distortions and sharing, Fermi level with a quench |
+| `Final` | A to E with MACE: convergence, DFPT, competing phases and limits, generated candidates, MACE scan, size series, fine-tuning data (B4), `configuration_margin`, a MACE model file for C1 (`finetuned_model`), `require_gap_states`, `hull_margin`, distortions and sharing, Fermi level with a quench |
 | `Opts2` | A to E with `mace : false`, antisites, native and dopant pairs, a charged size series, `series_choice : larger`, `screen_cutoff`, `%block screen_overrides`, `require_spin`, `require_bound`, `distort_charges : screened`, `distort_around : vacancy`, `%block oxidation_states`, `keep_structures : 2`, `%block production_overrides`, `freeze_radius`, `charge_correction : mp`, `gap`, `fermi_temperature` |
-| `User` | A to E with Voronoi interstitials (`interstitials : dopants`), `supercell`, `zpl_window`, a quench |
+| `User` | A to E with Voronoi interstitials (`interstitials : dopants`), `supercell`, a quench |
 | `Opts` | phase A with `converge : false`, `kspacing`, `dielectric`, `%block chemical_potentials` |
 | `Async` | `--no-wait`, run again until the steps finish |
+| `ExciteA` | `Charges` with C7: relaxed excited states, `excite_window`, `delete_check : true`, a restart of an excited state, `%block runner_excite` |
+| `ExciteB` | `Charges` with C7: vertical energies (`excite_relax : false`), no window, a failed excited-state run |
+| `ExciteC` | `Opts2` with C7: native defects past `require_spin` and `require_bound`, `keep_structures : 2` |
 
 `dwf.py` replaces five scripts (one per phase) that passed results on through more files. The
 `Final`, `Opts2` and `User` projects were run from scratch with both, and give the same results at
@@ -1030,9 +1081,33 @@ the relaxed structure. They now match CASTEP's atoms to their own by element, wh
 whatever order CASTEP uses. The mock CASTEP now lists the atoms the same way: with it the old
 scripts fail as they did on ARCHER2, and the new ones give the same results as before.
 
+Then C7 (`excite`). The mock CASTEP now does a simple ΔSCF: it needs `metals_method : dm` and
+the `.check` it reuses, stops if `reuse` and `continuation` are both set, raises the energy by
+the gap between the two constrained bands (less 0.1 eV, or 0.25 eV and one atom moved for a
+relaxation), and can stop a chosen relaxation at its `run_time`. `ExciteA` (window 1.0–1.5 eV):
+the Sb_Ca–V_O complex (ZPL 1.95 eV) was dropped and did not reach D, Sb_Ca passed through its
+q = +1 state (1.25 eV), and V_O went on as a native defect; the ground states' `.check` files
+survived `delete_check : true`, and the excited state stopped at `run_time` carried on from its
+own `.check`, with `reuse` removed. `ExciteB` gave the vertical energies, and its failed
+excited-state run kept its defect as `unknown`, flagged again in E3. `ExciteC` took all 14
+native defects past `require_spin : 2` and `require_bound` to D (22 defects instead of 8).
+Without `excite`, `Charges`, `Opts2`, `User` and `Final` submit the same jobs as before and give
+the same results at every step (`User` differs only in the mock's job ids in its failure
+messages).
+
+Then the first ZPL estimate went: C2's Kohn–Sham estimate, its column in C3's table, step C3b
+and `zpl_window` (a project file that still has it stops with a note to use C7).
+`require_gap_states : both` still checks for an occupied and an empty gap level in one spin
+channel. The four test projects (`User` and `Final` without their `zpl_window`, which had kept
+every survivor anyway) submit the same jobs and give the same results as before, apart from the
+estimate itself and E3: without `excite`, E3 now counts deep levels only, so `Charges`'s
+Sb_Ca–V_O complex, picked before only for its estimate, no longer goes to F (the other projects'
+picks are the same, for their deep levels). `ExciteA` and `ExciteB` give the same results as
+before.
+
 Not tested: `phases_from : doped` (no Materials Project access here), a real fine-tuned model
-(`finetune.sh` is written but was not run), and real CASTEP output for the DFPT permittivity and
-the `.bands` of spin-polarised runs.
+(`finetune.sh` is written but was not run), real CASTEP ΔSCF (C7), and real CASTEP output for
+the DFPT permittivity and the `.bands` of spin-polarised runs.
 
 On the first real runs, check:
 
@@ -1060,3 +1135,10 @@ On the first real runs, check:
    `dryrun_NNN`), and check with
    `sacct -j <job id> --format=JobID,JobName,NTasks,AllocCPUS,Start,End,MaxRSS` that its job
    steps ran side by side, each with its own processes.
+7. **C7 (`excite`)**, before relying on it: run one defect (e.g. `%block defects` with
+   `Sb_Ca + Vac_O  all  q=-1`, and `--until C7`). In `C_screen/jobs/excite/`, check that the
+   `.castep` shows CASTEP applying the constraints to the two bands named in the `.param`, that
+   the excited state relaxed (or set `excite_relax : false` if CASTEP won't relax it), and that
+   the ZPL in `C_screen/summary.txt` is near ADAQ's 0.53 eV for Sb_Ca–V_O⁻ (ADAQ used VASP with
+   PAW potentials, so expect some difference). If the SCF won't converge with the constraints,
+   try `deltascf_smearing : 0.01` (or more `nextra_bands`) in `%block excite_overrides`.

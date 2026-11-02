@@ -15,8 +15,8 @@ or --until STEP to stop after a step or phase.
                      A3.2 limits
   B  candidates      B1 generate, B2 scan (MACE), B3 series (CASTEP size series),
                      B4 finetune, B5 choose (the supercell)
-  C  screening       C1 prerelax (MACE), C2 screen, C3 filter, C3b zpl, C4 distort
-                     (ShakeNBreak), C5 drelax, C6 rank
+  C  screening       C1 prerelax (MACE), C2 screen, C3 filter, C4 distort (ShakeNBreak),
+                     C5 drelax, C6 rank, C7 excite (ΔSCF)
   D  production      D1 production (D2: freeze_radius)
   E  thermodynamics  E1 corrections, E2 formation, E3 interest
 
@@ -41,10 +41,11 @@ B3 size series in its usual mode, which builds its own cells, every other step i
 mode, which runs the structures this script builds. Its runner settings (jobscript,
 partitions, cores_per_node, max_nodes, max_walltime, pack, ...) go in the project file, for
 every step; %block runner_host and runner_screen change them for all of phase A's or phase C's
-CASTEP steps, and %block runner_<step> for one step (e.g. runner_converge, runner_production).
+CASTEP steps, and %block runner_<step> for one step (e.g. runner_converge, runner_excite).
 """
 
 import argparse
+import copy
 import difflib
 import hashlib
 import itertools
@@ -88,7 +89,7 @@ log, die = sc.log, sc.die
 #
 # Helpers the steps share: structures (save_cell, load_cell, build_defect, host_supercell,
 # symmetry_ops, equivalent_sites, electron_parity, spin_states), CASTEP output (read_bands,
-# occupied_bands, band_edges, gap_levels, zpl_estimate, read_permittivity, read_trajectory), the
+# occupied_bands, band_edges, gap_levels, internal_pair, read_permittivity, read_trajectory), the
 # charge correction (correction), MACE (Project.mace, mace_relax) and tables (format_table).
 # Project.out() and Project.phase_dir() are used by almost every step, so they are left out of
 # the "Calls" lists, as are log() and die().
@@ -167,7 +168,6 @@ PROJECT_KEYWORDS = {
     "hull_margin": (sc._num("eV"), 0.2), "level_margin": (sc._num("eV"), 0.1),
     "require_bound": (_b, False), "require_spin": (sc._num(), None),
     "require_gap_states": (sc._choice("none", "occupied", "empty", "both"), "none"),
-    "zpl_window": (_floats(2), None),
     "distortions": (_floats(), [-0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0.1, 0.2, 0.3, 0.4, 0.5,
                                 0.6]),
     "distort_charges": (sc._choice("stable", "screened"), "stable"),
@@ -176,6 +176,9 @@ PROJECT_KEYWORDS = {
     "oxidation_states": ("lines", None),
     "distortion_min_gain": (sc._num("eV"), 0.05), "share_rounds": (sc._num(cast=int), 2),
     "keep_structures": (sc._num(cast=int), 1),
+    "excite": (_b, False), "excite_window": (_floats(2), None),
+    "excite_min": (sc._num("eV"), 0.4), "excite_relax": (_b, True),
+    "excite_overrides": ("kv", {}),
     # D: production
     "production_overrides": ("kv", {}), "freeze_radius": (sc._num("ang", "A"), 0.0),
     # E: thermodynamics
@@ -184,7 +187,7 @@ PROJECT_KEYWORDS = {
     "deep_level_margin": (sc._num("eV"), 0.5),
 }
 LIST_KEYS = {"transform", "converge_cutoffs", "dopants", "scan_sizes",
-             "series_sizes", "screen_charges", "distortions", "zpl_window"}   # block or keyword
+             "series_sizes", "screen_charges", "distortions", "excite_window"}   # block or keyword
 # supercell_convergence keywords that control how jobs run (allowed in the project file, for every
 # step, and in %block runner_<group> or runner_<step>)
 RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "cores",
@@ -197,11 +200,11 @@ RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "core
 # The steps that run CASTEP jobs, and the group of steps each belongs to. The runner settings of a
 # step: the project's, changed by its group's defaults (GROUP_DEFAULTS), then by %block
 # runner_<group>, then by %block runner_<step> (Project.runner_items). series, screen and
-# production are both a step and a group: runner_screen is for all three screening steps (C2, C5,
-# C6), and runner_drelax and runner_rank change it for C5 or C6 only.
+# production are both a step and a group: runner_screen is for all four screening steps (C2, C5,
+# C6, C7), and runner_drelax, runner_rank and runner_excite change it for C5, C6 or C7 only.
 RUNNER_STEPS = {"converge": "host", "relax": "host", "bands": "host", "dielectric": "host",
                 "phases": "host", "series": "series", "screen": "screen", "drelax": "screen",
-                "rank": "screen", "production": "production"}
+                "rank": "screen", "excite": "screen", "production": "production"}
 RUNNER_GROUPS = ("host", "series", "screen", "production")
 RUNNER_BLOCKS = RUNNER_GROUPS + tuple(s for s in RUNNER_STEPS if s not in RUNNER_GROUPS)
 # what each group of steps uses unless the project file's runner blocks say otherwise
@@ -244,20 +247,25 @@ def item_key(x):
     return x["name"] if x["type"] == "block" else x["key"]
 
 
+# Keywords that have been renamed or removed, with what to do instead.
+#   Used by: read_project()
+RETIRED = {"triage": "has been renamed: use configuration_margin (in eV; giving it switches the "
+                     "filter on)",
+           "triage_window": "has been renamed: use configuration_margin (in eV; giving it switches "
+                            "the filter on)",
+           "zpl_window": "has been removed, with step C3b and its Kohn-Sham ZPL estimate: C7 "
+                         "filters on the ΔSCF ZPL instead (excite : true, excite_window)"}
+
+
 # Reads the project file into a namespace of settings.
 # Every keyword must be a project keyword (PROJECT_KEYWORDS) or a runner keyword (RUNNER_KEYS,
 # passed to supercell_convergence.batch_args); %block runner_<group> or runner_<step>
 # (RUNNER_BLOCKS) holds runner keywords, and may hold a %block partitions, for a group of steps or
-# one step. A typo gets the closest keyword suggested. Returns (settings, the text each setting was
-# given as, the runner items, {group or step: runner items}).
+# one step. A typo gets the closest keyword suggested, and a retired one (RETIRED) what to do.
+# Returns (settings, the text each setting was given as, the runner items, {group or step: runner
+# items}).
 #   Called by: Project.__init__()
 #   Calls:     item_key(), kgrid_list(), sc.block_rows(), sc.parse_castep_input()
-# Keywords that have been renamed, with what to write instead.
-#   Used by: read_project()
-RENAMED = {"triage": "use configuration_margin (in eV; giving it switches the filter on)",
-           "triage_window": "use configuration_margin (in eV; giving it switches the filter on)"}
-
-
 def read_project(path):
     name = path.name
     vals, raw, runner, blocks = {}, {}, [], {}
@@ -270,8 +278,8 @@ def read_project(path):
             die(f"{name}: there is no {key}: the runner blocks are runner_host (all of phase A's "
                 "CASTEP steps), runner_screen (all of phase C's) and, for one step, "
                 + ", ".join(f"runner_{s}" for s in RUNNER_STEPS if s != "screen"))
-        if key in RENAMED:
-            die(f"{name}: '{key}' has been renamed: {RENAMED[key]}")
+        if key in RETIRED:
+            die(f"{name}: '{key}' {RETIRED[key]}")
         if key not in known:
             close = difflib.get_close_matches(key, sorted(known), n=1)
             die(f"{name}: unknown keyword '{key}'" + (f" - did you mean '{close[0]}'?" if close
@@ -339,13 +347,13 @@ def read_project(path):
     if s.transform is not None and round(np.linalg.det(np.reshape(s.transform, (3, 3)))) <= 0:
         die(f"{name}: transform must have a positive determinant")
     for key in ("pair_max_distance", "scan_tol", "series_tol", "configuration_margin",
-                "converge_tol", "mace_fmax"):
+                "converge_tol", "mace_fmax", "excite_min"):
         if getattr(s, key) is not None and getattr(s, key) <= 0:
             die(f"{name}: {key} must be greater than 0")
     s.converge_kgrids = kgrid_list(name, s.converge_kgrid_min, s.converge_kgrid_max,
                                    s.converge_kgrid_step)
-    if s.zpl_window and s.zpl_window[0] >= s.zpl_window[1]:
-        die(f"{name}: zpl_window is  lowest highest  (eV)")
+    if s.excite_window and s.excite_window[0] >= s.excite_window[1]:
+        die(f"{name}: excite_window is  lowest highest  (eV)")
     return s, raw, runner, blocks
 
 
@@ -472,13 +480,19 @@ class Project:
         return self._runners[sig]
 
     # Runs a list of CASTEP jobs with supercell_convergence.run_batch in <workdir>/<subdir>, with
-    # the runner settings of the step (its name, e.g. 'relax') and the project's STOP file. Returns
-    # run_batch's result ({'complete', 'jobs', 'calcs'}).
+    # the runner settings of the step (its name, e.g. 'relax') and the project's STOP file;
+    # keep_check : True keeps the jobs' .check files even with delete_check : true (for jobs that
+    # later jobs start from). Returns run_batch's result ({'complete', 'jobs', 'calcs'}).
     #   Called by: run_screen_jobs(), step_bands(), step_converge(), step_dielectric(),
-    #              step_phases(), step_production(), step_relax(), step_screen()
+    #              step_excite(), step_phases(), step_production(), step_relax(), step_screen()
     #   Calls:     Project.cell_text(), Project.runner(), sc.run_batch()
-    def batch(self, subdir, jobs, step, param_text, cell_text=None, spacing=None):
-        return sc.run_batch(self.dir / subdir, jobs, self.runner(step),
+    def batch(self, subdir, jobs, step, param_text, cell_text=None, spacing=None,
+              keep_check=False):
+        args = self.runner(step)
+        if keep_check and args.delete_check:
+            args = copy.copy(args)
+            args.delete_check = False
+        return sc.run_batch(self.dir / subdir, jobs, args,
                             cell_text or self.cell_text(), param_text, spacing=spacing,
                             energy=self.s.energy, stop_file=self.dir / "STOP")
 
@@ -490,7 +504,7 @@ class Project:
 
     # The .param of the production settings: A1's (with the converged cut-off) once it has run,
     # else the project's .param as it is.
-    #   Called by: run_screen_jobs(), step_bands(), step_dielectric(), step_phases(),
+    #   Called by: run_screen_jobs(), step_bands(), step_dielectric(), step_excite(), step_phases(),
     #              step_production(), step_relax(), step_screen(), step_series()
     #   Calls:     Project.file(), Project.finished()
     def production_param(self):
@@ -515,8 +529,8 @@ class Project:
 
     # The relaxed host primitive cell from A2.1 (ASE Atoms, from A_host/host_relaxed.cell).
     #   Called by: doped_phases(), screen_setup(), step_bands(), step_choose(), step_corrections(),
-    #              step_dielectric(), step_formation(), step_generate(), step_limits(),
-    #              step_production(), step_scan(), step_series()
+    #              step_dielectric(), step_excite(), step_formation(), step_generate(),
+    #              step_limits(), step_production(), step_scan(), step_series()
     #   Calls:     load_cell()
     def host(self):
         return load_cell(self, self.out("relax")["cell"])
@@ -827,7 +841,7 @@ def atoms_from_dict(d):
 # (load_cell) gives the same atom numbers. Only the structure: each job adds its k-points,
 # species_pot and the rest. Returns the path relative to the work directory, as the results give
 # it.
-#   Called by: job_summary(), step_distort(), step_prerelax(), step_production()
+#   Called by: job_summary(), step_distort(), step_excite(), step_prerelax(), step_production()
 def save_cell(p, path, atoms, title):
     path.parent.mkdir(parents=True, exist_ok=True)
     frac = atoms.get_scaled_positions(wrap=True)
@@ -845,7 +859,7 @@ def save_cell(p, path, atoms, title):
 # Reads a structure saved by save_cell (rel: relative to the work directory), as ASE Atoms with
 # the starting spins as initial magnetic moments.
 #   Called by: Project.host(), distinct_states(), duplicates(), run_screen_jobs(),
-#              step_distort(), step_production(), step_rank(), step_screen()
+#              step_distort(), step_excite(), step_production(), step_rank(), step_screen()
 #   Calls:     sc.read_structure()
 def load_cell(p, rel):
     return sc.read_structure(p.dir / rel)
@@ -1076,7 +1090,7 @@ def host_supercell(prim, P):
 # Reads a CASTEP .bands file: k-points, weights, eigenvalues (eV, [spin][k-point][band]), the
 # electrons in each spin channel (one number, the total, when the calculation is not spin-
 # polarised) and the Fermi energies (eV).
-#   Called by: job_summary(), step_bands(), step_formation(), step_screen()
+#   Called by: job_summary(), step_bands(), step_excite(), step_formation(), step_screen()
 def read_bands(path):
     lines = Path(path).read_text().splitlines()
 
@@ -1109,7 +1123,7 @@ def read_bands(path):
 # The number of occupied bands in each spin channel of a .bands (read_bands). From the electron
 # counts when CASTEP gives one per spin (or the total, not spin-polarised); otherwise the bands
 # below the Fermi energy at the first k-point.
-#   Called by: band_edges(), carriers(), gap_levels()
+#   Called by: band_edges(), carriers(), excitation(), gap_levels()
 def occupied_bands(b):
     if b["nspin"] == 1:
         return [int(round(b["nelec"][0] / 2))]
@@ -1147,19 +1161,16 @@ def gap_levels(b, vbm, cbm, margin):
     return out
 
 
-# A first estimate of the lowest internal transition (the zero-phonon line, eV) from the gap levels
-# (gap_levels): the smallest step from an occupied to an empty level in the same spin channel.
-# None if no spin channel has both.
-#   Called by: job_summary(), step_filter()
-def zpl_estimate(levels):
-    best = None
+# Whether gap levels (gap_levels) include an occupied and an empty level in the same spin
+# channel, the empty one above (the levels of an internal transition): require_gap_states : both.
+#   Called by: step_filter()
+def internal_pair(levels):
     for s in (0, 1):
         occ = [x["e"] for x in levels if x["spin"] == s and x["occupied"]]
         emp = [x["e"] for x in levels if x["spin"] == s and not x["occupied"]]
         if occ and emp and min(emp) > max(occ):
-            d = min(emp) - max(occ)
-            best = d if best is None else min(best, d)
-    return best
+            return True
+    return False
 
 
 # A row of CASTEP's Forces table: species, number, and the three components (eV/A).
@@ -1284,10 +1295,10 @@ def write_json(path, data):
 # A text table for summary.txt and the log: a title, a header row, a rule and the rows, in columns
 # as wide as needed (numbers to the right, text to the left). Floats are shown with 4 decimals,
 # None as blank.
-#   Called by: problem_table(), step_converge(), step_corrections(), step_filter(),
-#              step_formation(), step_generate(), step_interest(), step_limits(), step_phases(),
-#              step_prerelax(), step_production(), step_rank(), step_scan(), step_series(),
-#              step_zpl()
+#   Called by: problem_table(), step_converge(), step_corrections(), step_excite(),
+#              step_filter(), step_formation(), step_generate(), step_interest(), step_limits(),
+#              step_phases(), step_prerelax(), step_production(), step_rank(), step_scan(),
+#              step_series()
 def format_table(header, rows, title=""):
     cells = [[("" if v is None else (f"{v:.4f}" if isinstance(v, float) else str(v)))
               for v in r] for r in rows]
@@ -1316,7 +1327,7 @@ def counts(atoms):
 
 
 # The tag of a charge state in job names (which can't hold + or -): q0, qp1, qm1, ...
-#   Called by: step_distort(), step_production(), step_rank(), step_screen()
+#   Called by: step_distort(), step_excite(), step_production(), step_rank(), step_screen()
 def qtag(q):
     return "q0" if q == 0 else f"q{'p' if q > 0 else 'm'}{abs(q)}"
 
@@ -2371,7 +2382,7 @@ def screen_setup(p):
 
 # The .param keywords of the screening runs: screen_cutoff, screen_max_steps and
 # %block screen_overrides.
-#   Called by: screen_job(), step_screen()
+#   Called by: excite_job(), screen_job(), step_screen()
 def screen_overrides(p):
     o = {"geom_max_iter": p.s.screen_max_steps}
     if p.s.screen_cutoff:
@@ -2383,7 +2394,7 @@ def screen_overrides(p):
 # A screening or distortion job for one structure in charge state q, starting with spin S
 # (spin_polarized, spin : S, and SPIN=S on the anchor atom when there is one): a Gamma-point
 # relaxation without symmetry, with the screening keywords.
-#   Called by: run_screen_jobs(), step_screen()
+#   Called by: excite_job(), run_screen_jobs(), step_screen()
 #   Calls:     screen_overrides()
 def screen_job(p, name, atoms, info, q, S):
     a = atoms.copy()
@@ -2397,20 +2408,18 @@ def screen_job(p, name, atoms, info, q, S):
 
 
 # What a finished screening-type job gave: energy (None unless the last SCF converged), whether
-# its geometry converged, final spin, defect levels in the gap and the first ZPL estimate (from its
-# .bands against the host's band edges at the same settings), and its final structure, saved as
-# <structdir>/<name>.cell.
+# its geometry converged, final spin, defect levels in the gap (from its .bands against the host's
+# band edges at the same settings), and its final structure, saved as <structdir>/<name>.cell.
 #   Called by: run_screen_jobs(), step_screen()
-#   Calls:     gap_levels(), read_bands(), save_cell(), zpl_estimate(), sc.final_atoms()
+#   Calls:     gap_levels(), read_bands(), save_cell(), sc.final_atoms()
 def job_summary(p, res, name, edges, structdir):
     r, calc = res["jobs"][name], res["calcs"][name]
     out = {"status": r["status"], "reason": r["reason"], "geom_converged": r["geom_converged"],
            "energy": r["energy"] if r["scf_converged"] else None, "spin": r["spin"],
-           "steps": r["geom_steps"], "levels": None, "zpl": None, "structure": None}
+           "steps": r["geom_steps"], "levels": None, "structure": None}
     bands = calc.dir / f"{calc.seed}.bands"
     if bands.exists() and edges:
-        lv = gap_levels(read_bands(bands), edges[0], edges[1], p.s.level_margin)
-        out["levels"], out["zpl"] = lv, zpl_estimate(lv)
+        out["levels"] = gap_levels(read_bands(bands), edges[0], edges[1], p.s.level_margin)
     if r["energy"] is not None:
         atoms = sc.final_atoms(calc)
         if atoms is None:
@@ -2533,7 +2542,7 @@ def step_screen(p):
 
 
 # --------------------------------------------------------------------------
-# C3, C3b
+# C3
 # --------------------------------------------------------------------------
 # The best screening result of each candidate in each charge state: the lowest energy over its
 # starting spins, among runs with a converged last SCF (an unconverged geometry is kept, but
@@ -2592,11 +2601,13 @@ def duplicates(p, best, groups):
 # (require_spin) and binding against its isolated components (require_bound: the components must
 # have been screened too) - each met by at least one stable charge state. Arrangements that relaxed
 # into the same structure as a lower one of their group in every charge state both have
-# (duplicates) are dropped too. The results list the survivors, with the charge states to carry
-# on (distort_charges); the table gives every candidate's verdict.
+# (duplicates) are dropped too. With excite : true, native defects (is_native) skip the property
+# filters (C7 passes them on to D whatever their excited states, for E), but not the hull or the
+# duplicates. The results list the survivors, with the charge states to carry on
+# (distort_charges); the table gives every candidate's verdict.
 #   Called by: main() (step C3)
-#   Calls:     best_states(), duplicates(), format_table(), host_supercell(),
-#              relative_formation(), screen_setup(), zpl_estimate()
+#   Calls:     best_states(), duplicates(), format_table(), host_supercell(), internal_pair(),
+#              is_native(), relative_formation(), screen_setup()
 def step_filter(p):
     cands, prim, P = screen_setup(p)
     scr = p.out("screen")
@@ -2617,13 +2628,14 @@ def step_filter(p):
                for cid, c in cands.items() if len(c["comps"]) == 1}
     dup = duplicates(p, best, groups)
     left_out = p.out("prerelax")["skipped"]
+    host_el = set(prim.get_chemical_symbols())
     survivors, rows = [], []
     for cid in sorted(cands):
         c = cands[cid]
         if cid not in best:
             why = (f"left out in C1: {left_out[cid]}" if cid in left_out
                    else "dropped: no usable screening run")
-            rows.append([cid, c["name"], c["group"], "", "", "", "", "", why])
+            rows.append([cid, c["name"], c["group"], "", "", "", "", why])
             continue
         dist = float(np.min(env[cid] - hull[c["group"]]))
         lowest = np.argmin(np.array([form[cid][q] for q in sorted(form[cid])]), axis=0)
@@ -2639,7 +2651,7 @@ def step_filter(p):
             want = p.s.require_gap_states
             return (want == "none" or (want == "occupied" and any(x["occupied"] for x in lv))
                     or (want == "empty" and any(not x["occupied"] for x in lv))
-                    or (want == "both" and zpl_estimate(lv) is not None))
+                    or (want == "both" and internal_pair(lv)))
 
         # Whether a charge state has the spin asked for.
         def spin_ok(s):
@@ -2647,11 +2659,12 @@ def step_filter(p):
                     (s["spin"] is not None and abs(abs(s["spin"]) - p.s.require_spin) < 0.25))
 
         good = [q for q, s in props.items() if levels_ok(s) and spin_ok(s)]
+        failed = []                                  # the property filters it fails
         if not good:
             asked = [x for x, on in (("gap levels", p.s.require_gap_states != "none"),
                                      ("spin", p.s.require_spin is not None)) if on]
-            why.append("no stable charge state with the " + " and ".join(asked)
-                       + " asked for")
+            failed.append("no stable charge state with the " + " and ".join(asked)
+                          + " asked for")
         bind = None
         if len(c["comps"]) > 1:
             parts = [singles.get((x["new"], x["host"], x.get("prim_site"),
@@ -2661,54 +2674,31 @@ def step_filter(p):
                 bind = (float(eb.min()), float(eb.max()))
         if p.s.require_bound and len(c["comps"]) > 1:
             if bind is None:
-                why.append("binding energy unknown (its components were not screened)")
+                failed.append("binding energy unknown (its components were not screened)")
             elif bind[1] <= 0:
-                why.append(f"not bound (E_b {bind[0]:.2f} to {bind[1]:.2f} eV)")
+                failed.append(f"not bound (E_b {bind[0]:.2f} to {bind[1]:.2f} eV)")
+        waived = bool(failed) and p.s.excite and is_native(c, host_el)
+        if not waived:
+            why += failed
         charges = stable if p.s.distort_charges == "stable" else sorted(best[cid])
         spins = ", ".join(f"{q:+d}:{best[cid][q]['spin']:.1f}" if best[cid][q]["spin"] is not None
                           else f"{q:+d}:-" for q in stable)
-        zpls = [best[cid][q]["zpl"] for q in stable if best[cid][q]["zpl"] is not None]
         rows.append([cid, c["name"], c["group"], dist, " ".join(f"{q:+d}" for q in stable), spins,
-                     f"{min(zpls):.2f}" if zpls else "",
                      f"{bind[0]:.2f}..{bind[1]:.2f}" if bind else "",
-                     "kept" if not why else "dropped: " + "; ".join(why)])
+                     ("kept" + (" (native, so the property filters are waived for E: "
+                                + "; ".join(failed) + ")" if waived else ""))
+                     if not why else "dropped: " + "; ".join(why)])
         if not why:
             survivors.append({"cand": cid, "name": c["name"], "group": c["group"],
                               "hull_distance": dist, "stable": stable, "charges": charges,
                               "good": good, "binding": bind,
                               "best": {str(q): best[cid][q] for q in best[cid]}})
     table = format_table(["id", "defect", "composition", "above hull/eV", "stable q",
-                          "spin (q:S)", "ZPL est./eV", "E_b/eV", "verdict"], rows,
+                          "spin (q:S)", "E_b/eV", "verdict"], rows,
                          f"Defect hull (margin {p.s.hull_margin:g} eV) and property filters")
     return {"survivors": survivors, "_table": table,
             "_note": f"{len(survivors)} of {len(cands)} candidates kept"}
 
-
-# C3b (optional, zpl_window): keeps the survivors with a first ZPL estimate (zpl_estimate, from
-# the screening run of a stable charge state that met the property filters) inside zpl_window; one
-# with no occupied -> empty step in any spin channel has no internal transition and is dropped.
-# Without zpl_window every survivor carries on.
-#   Called by: main() (step C3b)
-#   Calls:     format_table()
-def step_zpl(p):
-    survivors = p.out("filter")["survivors"]
-    if not p.s.zpl_window:
-        return {"survivors": survivors, "_note": "no zpl_window, so no ZPL filter"}
-    lo, hi = p.s.zpl_window
-    kept, rows = [], []
-    for s in survivors:
-        est = [s["best"][str(q)]["zpl"] for q in s["good"] if s["best"][str(q)]["zpl"] is not None]
-        inside = [e for e in est if lo <= e <= hi]
-        shown = ", ".join(f"{e:.2f}" for e in est)
-        verdict = ("kept" if inside else "dropped: " + (f"estimates {shown} eV outside" if est
-                                                        else "no internal transition"))
-        rows.append([s["cand"], s["name"], ", ".join(f"{e:.2f}" for e in est), verdict])
-        if inside:
-            kept.append(dict(s, zpl=inside))
-    table = format_table(["id", "defect", "ZPL estimates/eV", "verdict"], rows,
-                         f"First ZPL estimates, window {lo:g}-{hi:g} eV")
-    return {"survivors": kept, "_table": table,
-            "_note": f"{len(kept)} of {len(survivors)} inside the window"}
 
 
 # --------------------------------------------------------------------------
@@ -2755,7 +2745,7 @@ def neighbours_to_distort(comps, q, ox):
 
 # The final spin of a charge state's best screening run, as a starting spin with the right parity
 # for its electron count.
-#   Called by: step_distort(), step_rank()
+#   Called by: step_distort(), step_excite(), step_rank()
 #   Calls:     electron_parity()
 def start_spin(atoms, q, spin):
     par = electron_parity(atoms, q)
@@ -2785,7 +2775,7 @@ def step_distort(p):
     warnings.filterwarnings("ignore")
     cands, prim, P = screen_setup(p)
     d = p.phase_dir("C") / "structures" / "distortions"
-    survivors = p.out("zpl")["survivors"]
+    survivors = p.out("filter")["survivors"]
     defects = p.out("prerelax")["defects"]
     ox = oxidation_states(p, prim, cands)
     host = host_supercell(prim, P)
@@ -2945,7 +2935,7 @@ def distinct_states(p, survivors, results):
 #   Calls:     distinct_states(), format_table(), load_cell(), qtag(), run_screen_jobs(),
 #              same_structures(), start_spin()
 def step_rank(p):
-    survivors = p.out("zpl")["survivors"]
+    survivors = p.out("filter")["survivors"]
     results = dict(p.out("drelax")["runs"])
     tried = set()
     for rnd in range(1, p.s.share_rounds + 1):
@@ -3003,6 +2993,197 @@ def step_rank(p):
                      f"{len(rows)} charge states"}
 
 
+# --------------------------------------------------------------------------
+# C7: excited states
+# --------------------------------------------------------------------------
+# Whether a candidate is a native defect: every element it adds or removes is one of the host's
+# (vacancies, antisites, self-interstitials and complexes of them). C7 always passes these on to
+# D, because E's formation energies and Fermi level need them, bright or not.
+#   Called by: step_excite(), step_filter()
+def is_native(cand, host_elements):
+    return all(el in host_elements for el in cand["delta"])
+
+
+# The excitation C7 calculates for a ground state, chosen as ADAQ does: from its .bands
+# (read_bands) at the screening settings, the smallest step of at least emin from an occupied to an
+# empty level in the same spin channel, both more than margin inside the host's band edges (vbm,
+# cbm: the levels gap_levels counts). Returns {spin (0 or 1), from_band, to_band (counted from 1
+# in that spin channel, as CASTEP does), e_from, e_to (eV above the VBM), step (eV)}, or None.
+#   Called by: step_excite()
+#   Calls:     occupied_bands()
+def excitation(b, vbm, cbm, margin, emin):
+    occ, best, step = occupied_bands(b), None, None
+    for s in range(b["nspin"]):
+        levels = [(n, float(x)) for n, x in enumerate(b["eig"][s, 0])
+                  if np.isfinite(x) and vbm + margin < x < cbm - margin]
+        for i, ei in (lv for lv in levels if lv[0] < occ[s]):
+            for j, ej in (lv for lv in levels if lv[0] >= occ[s]):
+                if ej - ei >= emin and (step is None or ej - ei < step - 1e-6):
+                    step = ej - ei
+                    best = {"spin": s, "from_band": i + 1, "to_band": j + 1,
+                            "e_from": round(ei - vbm, 4), "e_to": round(ej - vbm, 4),
+                            "step": round(step, 4)}
+    return best
+
+
+# The %block deltascf_constraints of an excitation (excitation): its occupied band emptied and its
+# empty band filled, in its spin channel (CASTEP's 1 = majority, 2 = minority), each looked for at
+# its own band index only. In a calculation without spin polarisation an occupation of 1 is two
+# electrons, so moving one electron is 0.5 in each band.
+#   Called by: step_excite()
+def deltascf_block(ex, nspin):
+    lo, hi = (0.5, 0.5) if nspin == 1 else (0.0, 1.0)
+    sp = ex["spin"] + 1 if nspin == 2 else 1
+    rows = [f"  {band:5d} {occ:8.4f} {sp:4d} {band:4d} {band:4d}"
+            for band, occ in ((ex["from_band"], lo), (ex["to_band"], hi))]
+    return ("%block deltascf_constraints\n" + "\n".join(rows)
+            + "\n%endblock deltascf_constraints\n")
+
+
+# A C7 job for one structure in charge state q, starting with spin S: a screening job (screen_job:
+# Gamma point, no symmetry, the screening keywords) with metals_method : dm (CASTEP's excitation
+# constraints need density mixing), %block excite_overrides, then extra (the ΔSCF keywords of an
+# excited state). kind: 'sp' (the ground state; the vertical excited state) or 'geom' (the relaxed
+# excited state).
+#   Called by: step_excite()
+#   Calls:     screen_job(), screen_overrides()
+def excite_job(p, name, atoms, info, q, S, kind, extra=None):
+    job = screen_job(p, name, atoms, info, q, S)
+    o = dict(screen_overrides(p), metals_method="dm")
+    o.update(p.s.excite_overrides)
+    o.update(charge=q, spin=S, spin_polarized="true")
+    o.update(extra or {})
+    job.update(kind=kind, overrides=o)
+    return job
+
+
+# The mass-weighted distance between two structures of the same cell, in amu^1/2 Ang:
+# ΔQ = sqrt(sum_i m_i |Δr_i|^2), each Δr_i the shortest through the periodic images.
+#   Called by: step_excite()
+def delta_q(a, b):
+    from ase.geometry import find_mic
+    d, _ = find_mic(b.positions - a.positions, a.cell, pbc=True)
+    return float(np.sqrt(np.sum(a.get_masses()[:, None] * d * d)))
+
+
+# C7 (excite : true): the excited state of each defect's ground state in each charge state (the
+# lowest structure C6 kept), at the screening settings, in two batches:
+#  1. a single point of the ground state (C_screen/jobs/excite_gs; its .check is kept even with
+#     delete_check : true), whose .bands gives the excitation (excitation);
+#  2. the excited state (C_screen/jobs/excite): CASTEP's simple ΔSCF (calculate_deltascf, the two
+#     bands' occupations in %block deltascf_constraints), starting from the ground state's .check
+#     (reuse, deltascf_checkpoint), relaxed with excite_relax : true (energy = the ZPL, E of the
+#     relaxed excited state - E of the ground state; and ΔQ, delta_q), else a single point (the
+#     vertical energy).
+# A charge state passes if its energy is in excite_window (any converged energy, without a window);
+# one without an excitation in the gap does not. One whose runs failed or did not converge is
+# 'unknown' and counts as a pass, with a warning. A defect goes on to D (with all the structures C6
+# kept for it) if a charge state passes, and every native defect (is_native) goes on anyway. With
+# excite : false, everything C6 kept goes on.
+#   Called by: main() (step C7)
+#   Calls:     Project.batch(), Project.host(), Project.production_param(), delta_q(),
+#              deltascf_block(), excitation(), excite_job(), format_table(), is_native(),
+#              load_cell(), qtag(), read_bands(), save_cell(), start_spin(), sc.final_atoms()
+def step_excite(p):
+    structures = p.out("rank")["structures"]
+    if not p.s.excite:
+        return {"structures": structures, "excited": {}, "relaxed": None,
+                "_note": "excite is off, so every structure C6 kept goes on to D"}
+    cands, defects = p.out("generate")["candidates"], p.out("prerelax")["defects"]
+    host_el = set(p.host().get_chemical_symbols())
+    edges = p.out("screen")["host"]
+    ground = [dict(t, gs=f"{t['cand']}_{qtag(t['q'])}_gs") for t in structures if t["k"] == 0]
+    jobs = [excite_job(p, t["gs"], load_cell(p, t["structure"]), defects[t["cand"]], t["q"],
+                       t["spin"], "sp") for t in ground]
+    res = p.batch("C_screen/jobs/excite_gs", jobs, "excite", p.production_param(),
+                  keep_check=True)
+    if not res["complete"]:
+        return None
+    exc, jobs = {}, []
+    exdir = p.dir / "C_screen" / "jobs" / "excite"
+    for t in ground:
+        r, calc = res["jobs"][t["gs"]], res["calcs"][t["gs"]]
+        e = {"structure": t["structure"], "gs_job": t["gs"], "energy_gs": None,
+             "excitation": None, "job": None, "energy": None, "dq": None, "verdict": "unknown",
+             "why": ""}
+        exc.setdefault(t["cand"], {})[str(t["q"])] = e
+        bands = calc.dir / f"{calc.seed}.bands"
+        if r["status"] != "done" or r["energy"] is None or not r["scf_converged"]:
+            e["why"] = ("ground state: " + (r["reason"] or "no converged energy")).splitlines()[0]
+            continue
+        if not bands.exists():
+            e["why"] = "ground state: no .bands file"
+            continue
+        e["energy_gs"] = r["energy"]
+        b = read_bands(bands)
+        ex = excitation(b, edges["vbm"], edges["cbm"], p.s.level_margin, p.s.excite_min)
+        if ex is None:
+            e.update(verdict="none", why=f"no step >= {p.s.excite_min:g} eV in the gap")
+            continue
+        name = f"{t['cand']}_{qtag(t['q'])}_ex"
+        check = os.path.relpath(calc.dir / f"{calc.seed}.check", exdir / name)
+        atoms = load_cell(p, t["structure"])
+        job = excite_job(p, name, atoms, defects[t["cand"]], t["q"],
+                         start_spin(atoms, t["q"], r["spin"]),
+                         "geom" if p.s.excite_relax else "sp",
+                         {"calculate_deltascf": "true", "deltascf_method": "simple",
+                          "reuse": check, "deltascf_checkpoint": check})
+        job["param_text"] = p.production_param().rstrip() + "\n" + deltascf_block(ex, b["nspin"])
+        jobs.append(job)
+        e.update(excitation=ex, job=name)
+    if jobs:
+        res = p.batch("C_screen/jobs/excite", jobs, "excite", p.production_param())
+        if not res["complete"]:
+            return None
+    lo, hi = p.s.excite_window or (None, None)
+    for per_q in exc.values():
+        for e in per_q.values():
+            if not e["job"]:
+                continue
+            r = res["jobs"][e["job"]]
+            if r["status"] != "done" or r["energy"] is None or not r["scf_converged"]:
+                e["why"] = ("excited state: " + (r["reason"] or "no converged energy")
+                            ).splitlines()[0]
+                continue
+            if p.s.excite_relax and not r["geom_converged"]:
+                e["why"] = "excited state: the relaxation did not converge"
+                continue
+            e["energy"] = round(r["energy"] - e["energy_gs"], 4)
+            if p.s.excite_relax:
+                atoms = sc.final_atoms(res["calcs"][e["job"]])
+                if atoms is not None:
+                    e["dq"] = round(delta_q(load_cell(p, e["structure"]), atoms), 3)
+                    e["structure_ex"] = save_cell(
+                        p, p.phase_dir("C") / "structures" / "excite" / f"{e['job']}.cell", atoms,
+                        f"{e['job']}: relaxed excited state (C7, screening settings)")
+            inside = lo is None or lo <= e["energy"] <= hi
+            e["verdict"] = "pass" if inside else "outside"
+    native = sorted(cid for cid in exc if is_native(cands[cid], host_el))
+    keep = sorted(cid for cid, per_q in exc.items() if cid in native
+                  or any(e["verdict"] in ("pass", "unknown") for e in per_q.values()))
+    rows = []
+    for cid, per_q in sorted(exc.items()):
+        goes = ("yes (native)" if cid in native else "yes") if cid in keep else "no"
+        for qs, e in sorted(per_q.items(), key=lambda kv: int(kv[0])):
+            ex = e["excitation"]
+            if e["verdict"] == "unknown":
+                log(f"WARNING: C7: {cid} {cands[cid]['name']} q {int(qs):+d}: {e['why']} - kept")
+            rows.append([cid, cands[cid]["name"], f"{int(qs):+d}",
+                         f"{ex['spin'] + 1}: {ex['from_band']}->{ex['to_band']}" if ex else "",
+                         ex["step"] if ex else None, e["energy"], e["dq"],
+                         e["verdict"] + (f": {e['why']}" if e["why"] else ""), goes])
+    what = "ZPL" if p.s.excite_relax else "vertical E"
+    table = format_table(["id", "defect", "q", "spin: bands", "KS step/eV", f"{what}/eV",
+                          "dQ/amu^0.5 A", "verdict", "on to D"], rows,
+                         "Excited states (ΔSCF at the screening settings)"
+                         + (f", window {lo:g}-{hi:g} eV" if lo is not None else ""))
+    out = [t for t in structures if t["cand"] in keep]
+    return {"structures": out, "excited": exc, "relaxed": p.s.excite_relax, "native": native,
+            "kept": keep, "_table": table,
+            "_note": f"{len(keep)} of {len(exc)} defects go on to D ({len(native)} native); "
+                     f"{len(out)} structures"}
+
+
 SCREEN_KEYS = ("screen_cutoff", "screen_max_steps", "screen_overrides", "level_margin", "energy")
 
 
@@ -3032,7 +3213,9 @@ def freeze_block(atoms, points, radius):
             k // 3)
 
 
-# D1: the production relaxations. One job per structure phase C kept (C6): its charge state,
+# D1: the production relaxations. One job per structure phase C passed on (C7: the structures C6
+# kept, of the defects that passed C7 and of every native defect; all of them without excite): its
+# charge state,
 # starting spin (spin_polarized : true with spin S when S is not 0; a spin-0 state runs without
 # spin polarisation unless %block production_overrides sets spin_polarized), the production .param
 # with %block production_overrides, the production k-points, fixed cell, no symmetry; with
@@ -3045,9 +3228,9 @@ def freeze_block(atoms, points, radius):
 #              save_cell(), sc.final_atoms()
 def step_production(p):
     d = p.phase_dir("D")
-    todo = [dict(t) for t in p.out("rank")["structures"]]
+    todo = [dict(t) for t in p.out("excite")["structures"]]
     if not todo:
-        die("phase C kept no structures, so there is nothing to relax")
+        die("phase C passed no structures on, so there is nothing to relax")
     prim, P = p.host(), np.array(p.out("choose")["matrix"])
     host = host_supercell(prim, P)
     defects = p.out("prerelax")["defects"]
@@ -3393,30 +3576,36 @@ def step_formation(p):
 
 
 # E3: the decision before phase F. A defect is interesting if one of its transition levels lies
-# more than deep_level_margin from both band edges (a deep level), or if phase C found an internal
-# transition for it (a first ZPL estimate between occupied and empty gap levels). The list
-# (for_F in the results) is for phase F (optical lineshapes), which is not scripted yet.
+# more than deep_level_margin from both band edges (a deep level), or, with excite : true, if one
+# of its charge states passed C7 (an internal transition: its ΔSCF ZPL, or vertical energy, is
+# given) or its C7 runs failed (to check by hand). Without excite, only deep levels count. The
+# list (for_F in the results) is for phase F (optical lineshapes), which is not scripted yet.
 #   Called by: main() (step E3)
 #   Calls:     format_table()
 def step_interest(p):
     form = p.out("formation")
     gap, m = form["gap"], p.s.deep_level_margin
-    surv = {s["cand"]: s for s in p.out("zpl")["survivors"]}
+    c7 = p.out("excite")
+    what = "ZPL" if c7.get("relaxed") else "vertical energy"
     picks, rows = [], []
     for cid, dd in sorted(form["defects"].items()):
         why = [f"deep level ({a:+d}/{b:+d}) at {e:.2f} eV" for a, b, e in dd["levels"]
                if m <= e <= gap - m]
-        s = surv.get(cid)
-        if s:
-            zpl = [s["best"][str(q)]["zpl"] for q in s.get("good", [])
-                   if s["best"].get(str(q), {}).get("zpl") is not None]
-            if zpl:
-                why.append(f"internal transition, first estimate {min(zpl):.2f} eV")
+        if c7.get("excited"):
+            per_q = c7["excited"].get(cid, {})
+            ok = sorted((e["energy"], int(q)) for q, e in per_q.items() if e["verdict"] == "pass")
+            if ok:
+                why.append(f"internal transition, ΔSCF {what} {ok[0][0]:.2f} eV "
+                           f"(q {ok[0][1]:+d})")
+            if any(e["verdict"] == "unknown" for e in per_q.values()):
+                why.append("C7 excited state unknown (its runs failed): check by hand")
         rows.append([cid, dd["name"], "yes: " + "; ".join(why) if why else "no"])
         if why:
             picks.append({"cand": cid, "name": dd["name"], "why": why})
     table = format_table(["id", "defect", "on to F?"], rows,
-                         f"Deep levels (>= {m:g} eV from both edges) or internal transitions")
+                         f"Deep levels (>= {m:g} eV from both edges)"
+                         + (" or internal transitions (C7)" if c7.get("excited") else
+                            " (internal transitions need excite : true)"))
     return {"for_F": picks, "_table": table,
             "_note": f"{len(picks)} defect(s) for the lineshape phase (F, not scripted yet)"}
 
@@ -3473,12 +3662,11 @@ STEPS = [
          owns=("C_screen/jobs/screen", "C_screen/structures/screen")),
     Step("filter", "C3", "defect hull and property filters", step_filter,
          keys=("hull_margin", "require_gap_states", "require_spin", "require_bound",
-               "distort_charges", "charge_correction"),
+               "distort_charges", "charge_correction", "excite"),
          needs=("screen", "dielectric", "prerelax")),
-    Step("zpl", "C3b", "quick ZPL filter", step_zpl, keys=("zpl_window",), needs=("filter",)),
     Step("distort", "C4", "ShakeNBreak distortions of the survivors", step_distort,
          keys=("distortions", "distort_around", "rattle_stdev", "rattle_dmin",
-               "oxidation_states"), needs=("zpl", "prerelax"),
+               "oxidation_states"), needs=("filter", "prerelax"),
          owns=("C_screen/structures/distortions",)),
     Step("drelax", "C5", "cheap CASTEP relaxations of the distortions", step_drelax,
          keys=SCREEN_KEYS, needs=("distort",),
@@ -3486,10 +3674,15 @@ STEPS = [
     Step("rank", "C6", "rank, merge, share distortions between charge states", step_rank,
          keys=SCREEN_KEYS + ("distortion_min_gain", "share_rounds", "keep_structures"),
          needs=("drelax",), owns=("C_screen/jobs/share_*", "C_screen/structures/share")),
+    Step("excite", "C7", "excited states (ΔSCF); the defects that pass and the native ones go on",
+         step_excite, keys=SCREEN_KEYS + ("excite", "excite_window", "excite_min", "excite_relax",
+                                         "excite_overrides"),
+         needs=("rank", "screen", "generate", "prerelax", "relax"),
+         owns=("C_screen/jobs/excite_gs", "C_screen/jobs/excite", "C_screen/structures/excite")),
     # D: production relaxations
     Step("production", "D1", "production relaxations", step_production,
          keys=("production_overrides", "freeze_radius", "energy"),
-         needs=("rank", "choose", "converge", "relax"),
+         needs=("excite", "choose", "converge", "relax"),
          owns=("D_production/jobs", "D_production/structures")),
     # E: thermodynamics
     Step("corrections", "E1", "finite-size corrections", step_corrections,
@@ -3499,7 +3692,7 @@ STEPS = [
          needs=("corrections", "production", "bands", "limits", "generate"),
          owns=("E_thermo/formation.png",)),
     Step("interest", "E3", "which defects go on to the lineshape (F)", step_interest,
-         keys=("deep_level_margin",), needs=("formation", "zpl")),
+         keys=("deep_level_margin",), needs=("formation", "excite")),
 ]
 STEP_INDEX = {s.name: s for s in STEPS}
 
@@ -3547,13 +3740,14 @@ max_restarts : 20              # a relaxation that runs out of time carries on t
 poll      : 300
 delete_check : true            # delete each .check once its calculation has finished
 # ... and for some steps only, in a runner block: runner_host for all of phase A's CASTEP
-# steps (A1 to A3.1) and runner_screen for all of phase C's (C2, C5, C6); for one step:
+# steps (A1 to A3.1) and runner_screen for all of phase C's (C2, C5, C6, C7); for one step:
 # runner_converge (A1), runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3),
 # runner_phases (A3.1), runner_series (B3), runner_drelax (C5), runner_rank (C6),
-# runner_production (D1). A step's own block wins over runner_host or runner_screen, and
-# they win over the settings above, for the keywords they give (a %block partitions in one
-# replaces the whole list). pack : N runs N of a step's jobs side by side on one node, each
-# on 1/N of it: for small jobs, as a node is charged whole however few cores a job uses.
+# runner_excite (C7), runner_production (D1). A step's own block wins over runner_host or
+# runner_screen, and they win over the settings above, for the keywords they give (a %block
+# partitions in one replaces the whole list). pack : N runs N of a step's jobs side by side on
+# one node, each on 1/N of it: for small jobs, as a node is charged whole however few cores a
+# job uses.
 # Starting points for CaO:Sb on ARCHER2 - set your own:
 %block runner_host             # A1 to A3.1: the primitive cell and the competing phases
 max_walltime : 4:00:00
@@ -3569,7 +3763,7 @@ standard   2   --qos=short
 %block runner_series           # B3: up to the 512-atom cell of size 4
 max_nodes    : 12
 %endblock runner_series
-%block runner_screen           # C2, C5, C6: Gamma-only screening jobs are small
+%block runner_screen           # C2, C5, C6, C7: Gamma-only screening jobs are small
 max_nodes    : 1
 max_restarts : 0               # (the default for screening: a job that fails is flagged)
 %endblock runner_screen
@@ -3650,7 +3844,6 @@ require_gap_states : none      # none | occupied | empty | both (filled and empt
 !require_spin : 2              # e.g. 2 = triplet ground state
 require_bound : false          # bound against its isolated components
 level_margin  : 0.1 eV
-!zpl_window   : 0.8 3.5 eV     # C3b: keep estimates in this window (wide and lopsided)
 distortions   : -0.6 -0.5 -0.4 -0.3 -0.2 -0.1 0.1 0.2 0.3 0.4 0.5 0.6
 distort_charges : stable       # stable (in the gap for that arrangement) | screened
 distort_around  : anchor       # anchor (the first component, e.g. the dopant) | vacancy
@@ -3663,6 +3856,16 @@ distort_around  : anchor       # anchor (the first component, e.g. the dopant) |
 distortion_min_gain : 0.05 eV  # a distortion counts if it beats the unperturbed by this
 share_rounds    : 2            # C6: try a winning distortion in the other charge states
 keep_structures : 1            # per charge state, on to D
+# C7: the excited state of each defect's ground state (CASTEP's ΔSCF, at the screening
+# settings). Only the defects that pass, and every native defect, go on to D. Test it on one
+# defect first: CASTEP's ΔSCF must work on your build (Sb_Ca-V_O, q -1: ZPL about 0.53 eV).
+!excite        : true          # C7 on (default off: everything C6 kept goes on)
+!excite_window : 0.3 3.5 eV    # pass if the ZPL is in this window (default: any converged one)
+excite_min     : 0.4 eV        # the smallest Kohn-Sham step taken as an excitation
+excite_relax   : true          # relax the excited state (the ZPL); false: vertical energy
+!%block excite_overrides       # any other .param keywords for C7's runs
+!deltascf_smearing : 0.01
+!%endblock excite_overrides
 
 # ======================================================================= D: production
 %block production_overrides
