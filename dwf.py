@@ -163,7 +163,7 @@ PROJECT_KEYWORDS = {
     "screen_spins": (sc._choice("low", "both"), "both"),
     "screen_cutoff": (sc._num("eV"), None), "screen_max_steps": (sc._num(cast=int), 50),
     "screen_overrides": ("kv", {}),
-    "triage": (_b, False), "triage_window": (sc._num("eV"), 1.0),
+    "configuration_margin": (sc._num("eV"), None),
     "hull_margin": (sc._num("eV"), 0.2), "level_margin": (sc._num("eV"), 0.1),
     "require_bound": (_b, False), "require_spin": (sc._num(), None),
     "require_gap_states": (sc._choice("none", "occupied", "empty", "both"), "none"),
@@ -252,6 +252,12 @@ def item_key(x):
 # given as, the runner items, {group or step: runner items}).
 #   Called by: Project.__init__()
 #   Calls:     item_key(), kgrid_list(), sc.block_rows(), sc.parse_castep_input()
+# Keywords that have been renamed, with what to write instead.
+#   Used by: read_project()
+RENAMED = {"triage": "use configuration_margin (in eV; giving it switches the filter on)",
+           "triage_window": "use configuration_margin (in eV; giving it switches the filter on)"}
+
+
 def read_project(path):
     name = path.name
     vals, raw, runner, blocks = {}, {}, [], {}
@@ -264,6 +270,8 @@ def read_project(path):
             die(f"{name}: there is no {key}: the runner blocks are runner_host (all of phase A's "
                 "CASTEP steps), runner_screen (all of phase C's) and, for one step, "
                 + ", ".join(f"runner_{s}" for s in RUNNER_STEPS if s != "screen"))
+        if key in RENAMED:
+            die(f"{name}: '{key}' has been renamed: {RENAMED[key]}")
         if key not in known:
             close = difflib.get_close_matches(key, sorted(known), n=1)
             die(f"{name}: unknown keyword '{key}'" + (f" - did you mean '{close[0]}'?" if close
@@ -330,8 +338,8 @@ def read_project(path):
         die(f"{name}: give the jobscript template, as 'jobscript : file' or %block jobscript")
     if s.transform is not None and round(np.linalg.det(np.reshape(s.transform, (3, 3)))) <= 0:
         die(f"{name}: transform must have a positive determinant")
-    for key in ("pair_max_distance", "scan_tol", "series_tol", "triage_window", "converge_tol",
-                "mace_fmax"):
+    for key in ("pair_max_distance", "scan_tol", "series_tol", "configuration_margin",
+                "converge_tol", "mace_fmax"):
         if getattr(s, key) is not None and getattr(s, key) <= 0:
             die(f"{name}: {key} must be greater than 0")
     s.converge_kgrids = kgrid_list(name, s.converge_kgrid_min, s.converge_kgrid_max,
@@ -2430,10 +2438,11 @@ def problem_table(runs):
 # C1: builds every candidate in the B5 supercell (build_defect) and, with mace : true, relaxes
 # it with MACE (positions only, the cell fixed; finetuned_model if given, else mace_model). A pair
 # too far apart for this cell (more than half the shortest image distance) is left out. With
-# triage : true (and MACE), arrangements more than triage_window above the lowest MACE energy of
-# the same composition are dropped. Each structure is saved as
-# C_screen/structures/candidates/<id>.cell, and the results give where its defect is (its centre,
-# each component's position, the anchor atom's index, the vacancies) and its MACE energy.
+# configuration_margin (and MACE), arrangements whose configurational energy (MACE energy above
+# the lowest arrangement of the same composition) is more than configuration_margin are dropped.
+# Each structure is saved as C_screen/structures/candidates/<id>.cell, and the results give where
+# its defect is (its centre, each component's position, the anchor atom's index, the vacancies)
+# and its MACE energy.
 #   Called by: main() (step C1)
 #   Calls:     Project.file(), build_defect(), format_table(), mace_relax(), save_cell(),
 #              screen_setup()
@@ -2457,16 +2466,16 @@ def step_prerelax(p):
         defects[cid] = dict(structure=save_cell(p, d / "structures" / "candidates" / f"{cid}.cell",
                                                 atoms, title), mace_energy=e, **info)
         energies[cid] = e
-    if p.s.triage and p.s.mace:
+    if p.s.configuration_margin is not None and p.s.mace:
         groups = {}
         for cid in defects:
             groups.setdefault(cands[cid]["group"], []).append(cid)
         for g, ids in groups.items():
             low = min(energies[i] for i in ids)
             for i in ids:
-                if energies[i] - low > p.s.triage_window:
+                if energies[i] - low > p.s.configuration_margin:
                     skipped[i] = (f"MACE energy {energies[i] - low:.2f} eV above the lowest "
-                                  f"{g} arrangement (triage)")
+                                  f"{g} arrangement (configuration_margin)")
                     defects.pop(i)
     for cid, why in skipped.items():
         log(f"C1: {cid} {cands[cid]['name']} left out: {why}")
@@ -3456,7 +3465,7 @@ STEPS = [
          keys=("supercell", "transform"), needs=("series", "relax")),
     # C: screening and ground states
     Step("prerelax", "C1", "build the candidates and pre-relax them with MACE", step_prerelax,
-         keys=("mace", "mace_model", "mace_fmax", "mace_steps", "triage", "triage_window"),
+         keys=("mace", "mace_model", "mace_fmax", "mace_steps", "configuration_margin"),
          files=("finetuned_model",), needs=("generate", "choose", "relax"),
          owns=("C_screen/structures/candidates", "C_screen/mace")),
     Step("screen", "C2", "cheap CASTEP screening of every candidate", step_screen,
@@ -3634,8 +3643,8 @@ screen_max_steps : 50          # geometry steps per screening relaxation
 %block screen_overrides        # any other .param keywords for the screening runs
 elec_energy_tol : 1e-5
 %endblock screen_overrides
-triage        : false          # C1: drop arrangements far above the lowest by MACE energy
-triage_window : 1.0 eV
+!configuration_margin : 1.0 eV # C1: drop arrangements this far above the lowest of their
+                               # composition by MACE energy (off unless given)
 hull_margin   : 0.2 eV         # C3: keep arrangements within this of the defect hull
 require_gap_states : none      # none | occupied | empty | both (filled and empty levels)
 !require_spin : 2              # e.g. 2 = triplet ground state

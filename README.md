@@ -447,7 +447,7 @@ the properties you ask for get a search for their ground-state structure.
 
 | Label | Step | What it does | Decision |
 |---|---|---|---|
-| C1 | `prerelax` | builds every candidate in the B5 supercell and relaxes it with MACE | pairs too far apart for the cell are left out; `triage` drops arrangements far above the lowest |
+| C1 | `prerelax` | builds every candidate in the B5 supercell and relaxes it with MACE | pairs too far apart for the cell are left out; `configuration_margin` drops arrangements far above the lowest |
 | C2 | `screen` | one cheap CASTEP relaxation per candidate, charge state and starting spin | — |
 | C3 | `filter` | defect hull, duplicates, property filters | within `hull_margin` of the hull; the `require_*` filters |
 | C3b | `zpl` | optional ZPL window | first ZPL estimate inside `zpl_window` |
@@ -462,9 +462,9 @@ flagged while the others carry on (`--resubmit-failed` tries it again).
 **C1 prerelax.** Each candidate is built in the chosen supercell; a pair whose components are
 more than half the shortest image distance apart is left out. With `mace : true` it is relaxed
 with MACE (positions only), with `finetuned_model` if set, else `mace_model`. With
-`triage : true`, arrangements whose MACE energy is more than `triage_window` above the lowest of
-their composition group are dropped before any CASTEP run (MACE knows nothing of charge or spin,
-so keep the window generous).
+`configuration_margin`, arrangements whose configurational energy (MACE energy above the lowest
+arrangement of the same composition) is more than the margin are dropped before any CASTEP run
+(MACE knows nothing of charge or spin, so keep the margin generous).
 
 **C2 screen.** For each candidate, charge state (its own `q=` from `%block defects`, else
 `screen_charges`) and starting spin, one CASTEP
@@ -598,7 +598,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 
 - **A**: [`antisites`](#b-candidates-and-cell-size) (B)
 - **B**: [`bands_kspacing`](#a-host) (A) · [`baseline_mb`](#runner-settings) (runner)
-- **C**: [`charge_correction`](#e-thermodynamics) (E) · [`%block chemical_potentials`](#a-host) (A) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kgrid_max`](#a-host) (A) · [`converge_kgrid_min`](#a-host) (A) · [`converge_kgrid_step`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
+- **C**: [`charge_correction`](#e-thermodynamics) (E) · [`%block chemical_potentials`](#a-host) (A) · [`configuration_margin`](#c-screening) (C) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kgrid_max`](#a-host) (A) · [`converge_kgrid_min`](#a-host) (A) · [`converge_kgrid_step`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
 - **D**: [`deep_level_margin`](#e-thermodynamics) (E) · [`%block defects`](#b-candidates-and-cell-size) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#c-screening) (C) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-and-cell-size) (B) · [`dopants`](#b-candidates-and-cell-size) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_pack`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
 - **E**: [`energy`](#general) (general)
 - **F**: [`fermi_temperature`](#e-thermodynamics) (E) · [`finetune`](#b-candidates-and-cell-size) (B) · [`finetune_args`](#b-candidates-and-cell-size) (B) · [`finetuned_model`](#mace) (MACE) · [`freeze_radius`](#d-production) (D)
@@ -615,7 +615,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **Q**: [`quench_temperature`](#e-thermodynamics) (E)
 - **R**: [`rattle_dmin`](#c-screening) (C) · [`rattle_stdev`](#c-screening) (C) · [`require_bound`](#c-screening) (C) · [`require_gap_states`](#c-screening) (C) · [`require_spin`](#c-screening) (C) · [`%block runner_host`, `runner_screen`, `runner_<step>`](#runner-settings) (runner)
 - **S**: [`scan`](#b-candidates-and-cell-size) (B) · [`scan_sizes`](#b-candidates-and-cell-size) (B) · [`scan_tol`](#b-candidates-and-cell-size) (B) · [`screen_charges`](#c-screening) (C) · [`screen_cutoff`](#c-screening) (C) · [`screen_max_steps`](#c-screening) (C) · [`%block screen_overrides`](#c-screening) (C) · [`screen_spins`](#c-screening) (C) · [`series_charge`](#b-candidates-and-cell-size) (B) · [`series_choice`](#b-candidates-and-cell-size) (B) · [`series_defect`](#b-candidates-and-cell-size) (B) · [`series_sizes`](#b-candidates-and-cell-size) (B) · [`series_tol`](#b-candidates-and-cell-size) (B) · [`share_rounds`](#c-screening) (C) · [`sp_walltime`](#runner-settings) (runner) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-and-cell-size) (B)
-- **T**: [`tolerate_failures`](#runner-settings) (runner) · [`transform`](#general) (general) · [`triage`](#c-screening) (C) · [`triage_window`](#c-screening) (C)
+- **T**: [`tolerate_failures`](#runner-settings) (runner) · [`transform`](#general) (general)
 - **V**: [`vacancies`](#b-candidates-and-cell-size) (B)
 - **W**: [`walltime`](#runner-settings) (runner) · [`walltime_safety`](#runner-settings) (runner) · [`workdir`](#general) (general)
 - **Z**: [`zpl_window`](#c-screening) (C)
@@ -643,7 +643,7 @@ it only prepares structures and never ranks charge states.
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
-| `mace` | `true` | B2, B3, C1 | Use MACE for the size scan (B2), the pre-relaxation of each cell of the size series (B3), and the pre-relaxation and triage of the candidates (C1). With `false`, B2 is skipped, the series and C1 start from the unrelaxed structures, and `triage` does nothing. |
+| `mace` | `true` | B2, B3, C1 | Use MACE for the size scan (B2), the pre-relaxation of each cell of the size series (B3), and the pre-relaxation and configurational-energy filter of the candidates (C1). With `false`, B2 is skipped, the series and C1 start from the unrelaxed structures, and `configuration_margin` does nothing. |
 | `mace_model` | `medium-mpa-0` | B2, B3, B4, C1 | The model: the name of a `mace_mp` foundation model, or a model file. B4's `finetune.sh` starts from it. Changing it after B3 has run makes B3 run again, and `supercell_convergence.py` then stops because the series was set up with another model (`--redo series` starts the series again). To change only C1's model, use `finetuned_model`. |
 | `finetuned_model` | — | C1 | A model file that C1 uses instead of `mace_model`, such as the one `finetune.sh` (B4) writes. A new file, or a new version of it, makes C1 run again. |
 | `mace_fmax` | `0.05 eV/ang` | B2, C1 | A MACE relaxation stops when the largest force is below this. B3 passes it to the size series when the series is set up. |
@@ -710,8 +710,7 @@ phase D redoes the survivors properly.
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
-| `triage` | `false` | C1 | Before any CASTEP run, drop arrangements whose MACE energy is more than `triage_window` above the lowest of their composition group (needs `mace : true`). |
-| `triage_window` | `1.0 eV` | C1 | How far above the group's lowest MACE energy an arrangement may be. MACE has no charge or spin, so keep it generous. |
+| `configuration_margin` | — | C1 | Before any CASTEP run, drop arrangements whose configurational energy (MACE energy above the lowest arrangement of the same composition) is more than this, e.g. `1.0 eV`. Off unless given; needs `mace : true`. MACE has no charge or spin, so keep it generous. Replaces `triage` and `triage_window`. |
 | `screen_charges` | `-1 0 1` (*list*) | C2 | The charge states every candidate is screened in, except one with its own `q=` in `%block defects`. |
 | `screen_spins` | `both` | C2 | The starting spins: `low` is the lowest the electron count allows (0 or 1); `both` adds that + 2. They are starting values: the results keep the final spin. |
 | `screen_cutoff` | the production cut-off | C2, C5, C6 | The cut-off of the screening runs. |
@@ -972,7 +971,7 @@ energies, spins and band structures, so these runs check the workflow's logic, n
 
 | Test project | What it covered |
 |---|---|
-| `Final` | A to E with MACE: convergence, DFPT, competing phases and limits, generated candidates, MACE scan, size series, fine-tuning data (B4), `triage`, a MACE model file for C1 (`finetuned_model`), `require_gap_states`, `zpl_window`, `hull_margin`, distortions and sharing, Fermi level with a quench |
+| `Final` | A to E with MACE: convergence, DFPT, competing phases and limits, generated candidates, MACE scan, size series, fine-tuning data (B4), `configuration_margin`, a MACE model file for C1 (`finetuned_model`), `require_gap_states`, `zpl_window`, `hull_margin`, distortions and sharing, Fermi level with a quench |
 | `Opts2` | A to E with `mace : false`, antisites, native and dopant pairs, a charged size series, `series_choice : larger`, `screen_cutoff`, `%block screen_overrides`, `require_spin`, `require_bound`, `distort_charges : screened`, `distort_around : vacancy`, `%block oxidation_states`, `keep_structures : 2`, `%block production_overrides`, `freeze_radius`, `charge_correction : mp`, `gap`, `fermi_temperature` |
 | `User` | A to E with Voronoi interstitials (`interstitials : dopants`), `supercell`, `zpl_window`, a quench |
 | `Opts` | phase A with `converge : false`, `kspacing`, `dielectric`, `%block chemical_potentials` |

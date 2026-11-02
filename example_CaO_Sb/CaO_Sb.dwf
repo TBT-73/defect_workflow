@@ -135,8 +135,7 @@ screen_max_steps : 50          # geometry steps per screening relaxation
 elec_energy_tol : 1e-5
 finite_basis_corr : 0	       # Removes finite basis correction for the fixed cell relaxations
 %endblock screen_overrides
-triage        : false          # C1: drop arrangements far above the lowest by MACE energy
-triage_window : 1.0 eV
+!configuration_margin : 1.0 eV   # C1: drop arrangements far above the lowest by MACE energy
 hull_margin   : 0.2 eV         # C3: keep arrangements within this of the defect hull
 require_gap_states : none      # none | occupied | empty | both (filled and empty levels)
 !require_spin : 2              # e.g. 2 = triplet ground state
