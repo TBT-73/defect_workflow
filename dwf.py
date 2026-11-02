@@ -1497,6 +1497,9 @@ def step_relax(p):
     if r["status"] != "done" or r["energy"] is None:
         die(f"the host relaxation did not finish: {r['reason'] or 'see ' + r['dir']}")
     atoms = sc.final_atoms(res["calcs"]["host"])
+    if atoms is None:
+        die(f"could not read the relaxed host from host-out.cell or host.castep in {r['dir']}: "
+            "its atoms don't match those of the host cell")
     keep = [it for it in sc.parse_castep_input(p.cell_text())
             if not (it["type"] == "block" and it["name"] in sc.STRUCT_BLOCKS | sc.DROP_BLOCKS)
             and not (it["type"] == "kw" and it["key"] in sc.SET_KEYS)]
@@ -2402,7 +2405,9 @@ def job_summary(p, res, name, edges, structdir):
         out["levels"], out["zpl"] = lv, zpl_estimate(lv)
     if r["energy"] is not None:
         atoms = sc.final_atoms(calc)
-        if atoms is not None:
+        if atoms is None:
+            log(f"WARNING: could not read the final structure of {name} ({calc.dir})")
+        else:
             out["structure"] = save_cell(p, structdir / f"{name}.cell", atoms,
                                          f"{name}: final structure of its screening-type run")
     return out
@@ -3085,7 +3090,9 @@ def step_production(p):
         path = None
         if e is not None:
             atoms = sc.final_atoms(res["calcs"][t["job"]])
-            if atoms is not None:
+            if atoms is None:
+                log(f"WARNING: could not read the relaxed structure of {t['job']}")
+            else:
                 path = save_cell(p, d / "structures" / f"{t['job']}.cell", atoms,
                                  f"{t['job']}: relaxed at the production settings (D1)")
         out.append(dict(t, energy=e if r["status"] == "done" else None, energy_any=e,

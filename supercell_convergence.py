@@ -547,14 +547,36 @@ def write_cell(path, atoms, grid, keep_items, title, fix_cell=True, extra=None, 
 
 
 # The atom order write_cell uses: grouped by species, original order within each.
-# CASTEP keeps this order in its output, so relaxed_atoms and last_geometry use it to match
-# CASTEP's atoms back to the script's Atoms objects.
-#   Called by: final_atoms(), last_geometry(), relaxed_atoms(), write_cell()
+# (CASTEP reorders the species by atomic number in its output, but keeps this order within each
+# species: castep_order.)
+#   Called by: write_cell()
 def written_order(atoms):
-    """Atom order used by write_cell (grouped by species), which CASTEP keeps."""
+    """Atom order used by write_cell (grouped by species)."""
     syms = atoms.get_chemical_symbols()
     species = list(dict.fromkeys(syms))
     return sorted(range(len(atoms)), key=lambda i: (species.index(syms[i]), i))
+
+
+# Where the atoms CASTEP lists (their element symbols, in its order) are in an Atoms object.
+# CASTEP groups the atoms by species, in order of increasing atomic number (not the order of the
+# .cell), and keeps the order of the .cell within each species, which is the order within each
+# species of the Atoms object (write_cell). So the k-th atom of an element in CASTEP's list is its
+# k-th atom in the Atoms object, whatever order CASTEP puts the elements in. Returns the indices
+# into atoms in CASTEP's order, or None if the elements don't match.
+#   Called by: final_atoms(), last_geometry()
+def castep_order(atoms, symbols):
+    """Indices into atoms of the atoms CASTEP lists as symbols (in its order), or None."""
+    ours = atoms.get_chemical_symbols()
+    if sorted(ours) != sorted(symbols):
+        return None
+    where, seen = {}, {}
+    for i, s in enumerate(ours):
+        where.setdefault(s, []).append(i)
+    order = []
+    for s in symbols:
+        order.append(where[s][seen.get(s, 0)])
+        seen[s] = seen.get(s, 0) + 1
+    return order
 
 
 # Writes the .param text for one kind of calculation from your .param.
@@ -1991,28 +2013,19 @@ def finalize(calc, text, ctx, args, quiet=False, show=True, pack=None):
 
 
 # Reads the relaxed structure of a finished relaxation and reports on it.
-# Uses <seed>-out.cell if CASTEP wrote it, otherwise the last 'Fractional coordinates' table in the
-# .castep. Matches CASTEP's atom order to the script's (written_order), checks the cell didn't
-# change, and logs the largest displacement, how far CASTEP moved the atoms from the MACE start
-# (prerelax.json) and the number of geometry steps. Returns the relaxed Atoms.
+# final_atoms reads it (from <seed>-out.cell, or the last 'Fractional coordinates' table in the
+# .castep) in the order of geom.atoms; then the cell is checked not to have changed, and the
+# largest displacement, how far CASTEP moved the atoms from the MACE start (prerelax.json) and the
+# number of geometry steps are logged. Returns the relaxed Atoms.
 #   Called by: main(), prepare_sp()
-#   Calls:     Calc.output(), atom_label(), displacements(), parse_castep_input(),
-#              read_primitive(), written_order()
+#   Calls:     Calc.output(), atom_label(), displacements(), final_atoms()
 def relaxed_atoms(geom):
     """Relaxed defect cell: <seed>-out.cell if CASTEP wrote it, else the last fractional
     coordinates in the .castep. Checks the cell didn't change and reports the relaxation."""
-    out_cell = geom.dir / f"{geom.seed}-out.cell"
-    order = written_order(geom.atoms)              # CASTEP keeps the order we wrote
-    start = geom.atoms[order]
-    if out_cell.exists():
-        atoms = read_primitive(parse_castep_input(out_cell.read_text(errors="replace")))
-    else:
-        tail = geom.output().rsplit("Fractional coordinates of atoms", 1)[-1]
-        rows = ATOM_ROW.findall(tail)[:len(start)]
-        atoms = Atoms([r[0] for r in rows], scaled_positions=[[float(v) for v in r[1:]]
-                      for r in rows], cell=start.cell, pbc=True)
-    if atoms.get_chemical_symbols() != start.get_chemical_symbols():
-        die(f"could not read the relaxed structure of {geom.name} (atoms don't match)")
+    atoms, start = final_atoms(geom), geom.atoms
+    if atoms is None:
+        die(f"could not read the relaxed structure of {geom.name} from {geom.seed}-out.cell or "
+            f"{geom.castep.name}: its atoms don't match those of {geom.seed}.cell")
     if np.abs(np.asarray(atoms.cell) - np.asarray(start.cell)).max() > 1e-4:
         die(f"the cell of {geom.name} changed during the relaxation; it should stay fixed")
     atoms.set_cell(start.cell, scale_atoms=False)
@@ -2022,7 +2035,7 @@ def relaxed_atoms(geom):
     if pre.exists():                       # how far CASTEP went from the MACE structure
         mace = geom.atoms.copy()
         mace.set_scaled_positions(json.loads(pre.read_text())["scaled_positions"])
-        off = displacements(mace[order], atoms)
+        off = displacements(mace, atoms)
         note = f", {off.max():.3f} A from the MACE start ({atom_label(atoms, int(off.argmax()))})"
     steps = len(GEOM_STEP.findall(geom.output()))
     log(f"{geom.name}: relaxed, largest atomic displacement {moved.max():.3f} A "
@@ -2344,12 +2357,12 @@ def killed_at_time_limit(calc, args):
 # The structure to restart a relaxation from when it can't carry on from its .check.
 # Takes the last 'Fractional coordinates' table printed before the last 'finished iteration' in the
 # .castep (all runs) - the structure of the last geometry step CASTEP finished - or, if the .castep
-# has none, <seed>-out.cell. Maps CASTEP's atom order back onto calc.atoms (written_order). For a
+# has none, <seed>-out.cell. Maps CASTEP's atom order back onto calc.atoms (castep_order). For a
 # variable-cell relaxation (batch mode) the lattice of that step is taken too (last_lattice).
 # Returns (Atoms, steps finished, the file it came from), or (None, steps, None).
 #   Called by: restart()
-#   Calls:     Calc.output(), last_lattice(), parse_castep_input(), read_primitive(),
-#              written_order()
+#   Calls:     Calc.output(), castep_order(), last_lattice(), parse_castep_input(),
+#              read_primitive()
 def last_geometry(calc):
     """The structure of the last geometry step a relaxation finished, read from its .castep
     (all runs): calc.atoms with those positions, and the number of steps finished. CASTEP
@@ -2361,19 +2374,19 @@ def last_geometry(calc):
     ends = [m.start() for m in GEOM_STEP.finditer(text)]
     if not ends:
         return None, 0, None
-    order = written_order(calc.atoms)              # CASTEP keeps the order we wrote
-    syms = [calc.atoms.get_chemical_symbols()[i] for i in order]
     head = text[:ends[-1]].rsplit("Fractional coordinates of atoms", 1)
-    rows = ATOM_ROW.findall(head[-1]) if len(head) > 1 else []
-    frac, source = [[float(x) for x in r[1:]] for r in rows[:len(order)]], calc.castep
+    rows = (ATOM_ROW.findall(head[-1]) if len(head) > 1 else [])[:len(calc.atoms)]
+    order = castep_order(calc.atoms, [r[0] for r in rows])     # CASTEP's order of the atoms
+    frac, source = [[float(x) for x in r[1:]] for r in rows], calc.castep
     lattice = None if calc.fix_cell else last_lattice(text[:ends[-1]])
-    if [r[0] for r in rows[:len(order)]] != syms:
+    if order is None:
         source = calc.dir / f"{calc.seed}-out.cell"
         try:
             out = read_primitive(parse_castep_input(source.read_text(errors="replace")))
         except (OSError, SystemExit, ValueError, IndexError):
             return None, len(ends), None
-        if out.get_chemical_symbols() != syms:
+        order = castep_order(calc.atoms, out.get_chemical_symbols())
+        if order is None:
             return None, len(ends), None
         frac = out.get_scaled_positions(wrap=False)
         lattice = None if calc.fix_cell else np.asarray(out.cell)
@@ -2774,28 +2787,30 @@ def last_lattice(text):
 # The final structure of a calculation: calc.atoms (same atom order and starting spins) with the
 # positions and, for a variable-cell relaxation, the lattice CASTEP ended with.
 # From <seed>-out.cell if CASTEP wrote it, otherwise from the last lattice and 'Fractional
-# coordinates' table in the .castep (for a single point that is its starting structure). None if
-# neither can be read. dwf.py uses it to carry a relaxed structure on to the next step.
-#   Called by: dwf.py
-#   Calls:     Calc.output(), last_lattice(), parse_castep_input(), read_primitive(),
-#              written_order()
+# coordinates' table in the .castep (for a single point that is its starting structure); CASTEP's
+# atoms are matched to calc.atoms by element (castep_order). None if neither can be read. dwf.py
+# uses it to carry a relaxed structure on to the next step.
+#   Called by: relaxed_atoms(), dwf.py
+#   Calls:     Calc.output(), castep_order(), last_lattice(), parse_castep_input(),
+#              read_primitive()
 def final_atoms(calc):
-    order = written_order(calc.atoms)              # CASTEP keeps the order we wrote
-    syms = [calc.atoms.get_chemical_symbols()[i] for i in order]
-    out_cell, atoms = calc.dir / f"{calc.seed}-out.cell", None
+    out_cell, atoms, order = calc.dir / f"{calc.seed}-out.cell", None, None
     if out_cell.exists():
         try:
             atoms = read_primitive(parse_castep_input(out_cell.read_text(errors="replace")))
+            order = castep_order(calc.atoms, atoms.get_chemical_symbols())
         except (SystemExit, ValueError, IndexError):
             atoms = None
-    if atoms is None or atoms.get_chemical_symbols() != syms:
+    if order is None:
         text = calc.output()
         rows = ATOM_ROW.findall(text.rsplit("Fractional coordinates of atoms", 1)[-1])
-        rows = rows[:len(order)]
-        if [r[0] for r in rows] != syms:
+        rows = rows[:len(calc.atoms)]
+        order = castep_order(calc.atoms, [r[0] for r in rows])
+        if order is None:
             return None
         lattice = None if calc.fix_cell else last_lattice(text)
-        atoms = Atoms(syms, scaled_positions=[[float(v) for v in r[1:]] for r in rows],
+        atoms = Atoms([r[0] for r in rows],
+                      scaled_positions=[[float(v) for v in r[1:]] for r in rows],
                       cell=calc.atoms.cell if lattice is None else lattice, pbc=True)
     result = calc.atoms.copy()
     result.set_cell(atoms.cell, scale_atoms=False)

@@ -1024,6 +1024,13 @@ the same three projects ran their dry runs up to 16 to a job (e.g. `Opts2`'s 138
 runs in 9 jobs) and gave the same results, also with `--no-wait`. Without it, every dry-run
 script (`dryrun.sh`) and job script is the same as before.
 
+The first real run (CaO:Sb on ARCHER2) stopped after A2.1: CASTEP lists the atoms in its output
+grouped by species in order of atomic number (O before Ca), keeping the order of the `.cell` only
+within each species, and the scripts expected the order of the `.cell`, so they couldn't read
+the relaxed structure. They now match CASTEP's atoms to their own by element, which works
+whatever order CASTEP uses. The mock CASTEP now lists the atoms the same way: with it the old
+scripts fail as they did on ARCHER2, and the new ones give the same results as before.
+
 Not tested: `phases_from : doped` (no Materials Project access here), a real fine-tuned model
 (`finetune.sh` is written but was not run), and real CASTEP output for the DFPT permittivity and
 the `.bands` of spin-polarised runs.
