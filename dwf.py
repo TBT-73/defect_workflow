@@ -13,11 +13,11 @@ or --until STEP to stop after a step or phase.
 
   A  host            A1 converge, A2.1 relax, A2.2 bands, A2.3 dielectric, A3.1 phases,
                      A3.2 limits
-  B  candidates      B1 generate, B2 scan (MACE), B3 series (CASTEP size series),
-                     B4 finetune, B5 choose (the supercell)
-  C  screening       C1 prerelax (MACE), C2 screen, C3 filter, C4 distort (ShakeNBreak),
-                     C5 drelax, C6 rank, C7 excite (ΔSCF)
-  D  production      D1 production (D2: freeze_radius)
+  B  candidates      B1 generate, B2 scan (the supercell sizes, and MACE on every candidate),
+                     B3 choose (the screening cell)
+  C  screening       C1 prerelax (MACE), C2 screen, C2b dispersion (the Gamma-only check),
+                     C3 filter, C4 distort (ShakeNBreak), C5 drelax, C6 rank, C7 excite (ΔSCF)
+  D  production      D0 cells (each defect's production cell), D1 production, D2 finetune
   E  thermodynamics  E1 corrections, E2 formation, E3 interest
 
 Files. Everything goes in the work directory, dwf_<name>/ next to the project file:
@@ -36,12 +36,14 @@ jobs whose inputs did not change are reused, and a job that already ran with oth
 stops the script, so results from two sets of settings never mix (--redo STEP starts a step
 again from scratch).
 
-All CASTEP jobs go through supercell_convergence.py, which must be in the same directory: the
-B3 size series in its usual mode, which builds its own cells, every other step in its batch
-mode, which runs the structures this script builds. Its runner settings (jobscript,
+All CASTEP jobs go through supercell_convergence.py's batch mode (it must be in the same
+directory), which runs the structures this script builds. Its runner settings (jobscript,
 partitions, cores_per_node, max_nodes, max_walltime, pack, ...) go in the project file, for
-every step; %block runner_host and runner_screen change them for all of phase A's or phase C's
-CASTEP steps, and %block runner_<step> for one step (e.g. runner_converge, runner_excite).
+every step; %block runner_host, runner_screen and runner_production change them for all of
+phase A's, C's or D's CASTEP steps, and %block runner_<step> for one step (e.g.
+runner_converge, runner_excite). The MACE relaxations (B2, C1) run where this script runs, or,
+with mace_jobscript, as jobs on compute nodes (each job runs this script as a worker:
+python3 dwf.py --mace-worker <tasks>.json).
 """
 
 import argparse
@@ -53,8 +55,9 @@ import json
 import math
 import os
 import re
+import shlex
+import shutil
 import socket
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -62,6 +65,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from ase import Atoms
+from ase.cell import Cell
 from ase.data import atomic_numbers
 
 HERE = Path(__file__).resolve().parent
@@ -88,9 +92,12 @@ log, die = sc.log, sc.die
 #       write_summary    the phase's summary.txt, from the notes and tables of its steps
 #
 # Helpers the steps share: structures (save_cell, load_cell, build_defect, host_supercell,
-# symmetry_ops, equivalent_sites, electron_parity, spin_states), CASTEP output (read_bands,
-# occupied_bands, band_edges, gap_levels, internal_pair, read_permittivity, read_trajectory), the
-# charge correction (correction), MACE (Project.mace, mace_relax) and tables (format_table).
+# symmetry_ops, equivalent_sites, electron_parity, spin_states), supercell sizes (min_image,
+# size_matrix, size_ladder) and moving a defect between them (carry_over, same_basin), CASTEP
+# output (read_bands, occupied_bands, band_edges, gap_levels, internal_pair, read_permittivity,
+# read_trajectory), the charge correction (correction), MACE (mace_relaxations, which runs
+# mace_relax here or mace_jobs on compute nodes, whose workers are mace_worker) and tables
+# (format_table).
 # Project.out() and Project.phase_dir() are used by almost every step, so they are left out of
 # the "Calls" lists, as are log() and die().
 # ==========================================================================================
@@ -99,9 +106,22 @@ HARTREE = 27.211386245988                     # eV
 STATE, RESULTS, SUMMARY = "state.json", "results.json", "summary.txt"
 PHASE_DIRS = {"A": "A_host", "B": "B_candidates", "C": "C_screen", "D": "D_production",
               "E": "E_thermo"}
-PHASE_TITLES = {"A": "host", "B": "candidate defects and cell size",
-                "C": "screening and ground states", "D": "production relaxations",
+PHASE_TITLES = {"A": "host", "B": "candidate defects and the screening cell",
+                "C": "screening and ground states", "D": "production cells and relaxations",
                 "E": "thermodynamics"}
+HB2M = 3.80998                                # hbar^2 / (2 m_e), eV Ang^2
+# B2: the atoms at a supercell's edge, whose MACE displacements show whether a defect's strain
+# field fits in it, are those further than this fraction of the shortest image distance from it
+EDGE_FRACTION = 0.35
+# B3: the Gamma-only floor is this many decay lengths of the shallowest deep level
+FLOOR_DECAYS = 4.0
+# C2: a Gamma-point gap of the screening cell this much above A2.2's means band edges that don't
+# fold onto Gamma (eV)
+FOLD_GAP_TOL = 0.05
+# D0: two relaxations of a defect in different cells are in the same basin if no atom near the
+# defect is displaced from its site by more than this differently (Ang)
+BASIN_TOL = 0.2
+MACE_ATTEMPTS = 3                             # a MACE relaxation's jobs before giving up on it
 
 
 # --------------------------------------------------------------------------
@@ -123,9 +143,27 @@ def _floats(n=None):
     return conv
 
 
+# A supercell size, as a converter for the supercell keyword: a whole number n (n x transform, or
+# n x n x n primitive cells) or a length with its unit (15 ang: the most compact supercell with
+# every periodic image at least that far away). Returns ['n', n] or ['length', L].
+def _size(v):
+    parts = v.split()
+    try:
+        if len(parts) == 2 and parts[1].lower() in ("ang", "a", "angstrom"):
+            if float(parts[0]) > 0:
+                return ["length", float(parts[0])]
+        elif len(parts) == 1 and int(parts[0]) >= 1:
+            return ["n", int(parts[0])]
+    except ValueError:
+        pass
+    raise ValueError("expected a whole number n (n x transform) or a length with its unit, "
+                     "e.g. 15 ang")
+
+
 _t, _b, _w = sc._text, sc._bool, sc._words
 # keyword: (converter, default). Blocks of whole lines ('lines') keep their rows; 'kv' blocks
-# hold "keyword : value" lines (.param keywords to set).
+# hold "keyword : value" lines (.param keywords to set); a 'template' is a file name or a block
+# holding the text itself (like supercell_convergence's jobscript).
 PROJECT_KEYWORDS = {
     # general
     "name": (_t, None), "workdir": (_t, None), "host_cell": (_t, None), "param": (_t, None),
@@ -133,6 +171,8 @@ PROJECT_KEYWORDS = {
     "mace": (_b, True), "mace_model": (_t, "medium-mpa-0"), "mace_device": (_t, "cpu"),
     "mace_threads": (sc._num(cast=int), 8), "mace_fmax": (sc._num("eV/ang", "eV/A"), 0.05),
     "mace_steps": (sc._num(cast=int), 500),
+    "mace_jobscript": ("template", None), "mace_pack": (sc._num(cast=int), None),
+    "mace_max_jobs": (sc._num(cast=int), 4), "mace_python": (_t, None),
     # A: host
     "converge": (_b, True), "converge_cutoffs": (_floats(), [300, 400, 500, 600, 700, 800]),
     "converge_kgrid_min": (sc._ints(), [4]), "converge_kgrid_max": (sc._ints(), [12]),
@@ -146,24 +186,22 @@ PROJECT_KEYWORDS = {
     "phases": ("lines", None), "phases_from": (sc._choice("none", "doped"), "none"),
     "mp_api_key": (_t, None), "phases_e_above_hull": (sc._num("eV/atom", "eV"), 0.05),
     "chemical_potentials": ("lines", None),
-    # B: candidates and cell size
+    # B: candidates and the screening cell
     "dopants": (_w, []), "defects": ("lines", None), "vacancies": (_b, True),
     "antisites": (_b, False),
     "interstitials": (sc._choice("none", "dopants", "all"), "none"),
     "pairs": (_b, True), "pair_max_distance": (sc._num("ang", "A"), 5.0),
     "native_pairs": (_b, False), "dopant_pairs": (_b, False),
-    "scan": (_b, True), "scan_sizes": (sc._ints(), [2, 3, 4, 5]),
-    "scan_tol": (sc._num("eV"), 0.02),
-    "series_defect": (_t, None), "series_charge": (sc._num(cast=int), 0),
-    "series_sizes": (sc._ints(), [2, 3, 4]), "series_tol": (sc._num("eV"), 0.05),
-    "series_choice": (sc._choice("smaller", "larger"), "smaller"),
-    "supercell": (sc._num(cast=int), None),
-    "finetune": (_b, False), "finetune_args": (_t, ""), "finetuned_model": (_t, None),
+    "scan": (_b, True), "scan_lengths": (_floats(), [8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0]),
+    "scan_tol": (sc._num("eV"), 0.02), "scan_edge_tol": (sc._num("ang", "A"), 0.05),
+    "supercell": (_size, None), "screen_min_image": (sc._num("ang", "A"), None),
     # C: screening
     "screen_charges": (sc._ints(), [-1, 0, 1]),
     "screen_spins": (sc._choice("low", "both"), "both"),
     "screen_cutoff": (sc._num("eV"), None), "screen_max_steps": (sc._num(cast=int), 50),
     "screen_overrides": ("kv", {}),
+    "dispersion_check": (sc._choice("warn", "stop", "off"), "warn"),
+    "dispersion_defect": (_t, None), "dispersion_tol": (sc._num("eV"), 0.05),
     "configuration_margin": (sc._num("eV"), None),
     "hull_margin": (sc._num("eV"), 0.2), "level_margin": (sc._num("eV"), 0.1),
     "require_bound": (_b, False), "require_spin": (sc._num(), None),
@@ -180,14 +218,16 @@ PROJECT_KEYWORDS = {
     "excite_min": (sc._num("eV"), 0.4), "excite_relax": (_b, True),
     "excite_overrides": ("kv", {}),
     # D: production
+    "series_tol": (sc._num("eV"), 0.05),
     "production_overrides": ("kv", {}), "freeze_radius": (sc._num("ang", "A"), 0.0),
+    "finetune": (_b, False), "finetune_args": (_t, ""),
     # E: thermodynamics
     "charge_correction": (sc._choice("lz", "mp", "none"), "lz"), "gap": (sc._num("eV"), None),
     "fermi_temperature": (sc._num("K"), None), "quench_temperature": (sc._num("K"), None),
     "deep_level_margin": (sc._num("eV"), 0.5),
 }
-LIST_KEYS = {"transform", "converge_cutoffs", "dopants", "scan_sizes",
-             "series_sizes", "screen_charges", "distortions", "excite_window"}   # block or keyword
+LIST_KEYS = {"transform", "converge_cutoffs", "dopants", "scan_lengths", "screen_charges",
+             "distortions", "excite_window"}                                  # block or keyword
 # supercell_convergence keywords that control how jobs run (allowed in the project file, for every
 # step, and in %block runner_<group> or runner_<step>)
 RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "cores",
@@ -199,16 +239,18 @@ RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "core
                "tolerate_failures", "pack", "dryrun_pack"}
 # The steps that run CASTEP jobs, and the group of steps each belongs to. The runner settings of a
 # step: the project's, changed by its group's defaults (GROUP_DEFAULTS), then by %block
-# runner_<group>, then by %block runner_<step> (Project.runner_items). series, screen and
-# production are both a step and a group: runner_screen is for all four screening steps (C2, C5,
-# C6, C7), and runner_drelax, runner_rank and runner_excite change it for C5, C6 or C7 only.
+# runner_<group>, then by %block runner_<step> (Project.runner_items). screen and production are
+# both a step and a group: runner_screen is for all five screening steps (C2, C2b, C5, C6, C7),
+# and runner_dispersion, runner_drelax, runner_rank and runner_excite change it for one of them;
+# runner_production is for D0 and D1, and runner_cells for D0 only.
 RUNNER_STEPS = {"converge": "host", "relax": "host", "bands": "host", "dielectric": "host",
-                "phases": "host", "series": "series", "screen": "screen", "drelax": "screen",
-                "rank": "screen", "excite": "screen", "production": "production"}
-RUNNER_GROUPS = ("host", "series", "screen", "production")
+                "phases": "host", "screen": "screen", "dispersion": "screen", "drelax": "screen",
+                "rank": "screen", "excite": "screen", "cells": "production",
+                "production": "production"}
+RUNNER_GROUPS = ("host", "screen", "production")
 RUNNER_BLOCKS = RUNNER_GROUPS + tuple(s for s in RUNNER_STEPS if s not in RUNNER_GROUPS)
 # what each group of steps uses unless the project file's runner blocks say otherwise
-GROUP_DEFAULTS = {"host": "", "series": "",
+GROUP_DEFAULTS = {"host": "",
                   "screen": "max_restarts : 0\ntolerate_failures : true",
                   "production": "tolerate_failures : true"}
 
@@ -242,19 +284,35 @@ def kgrid_list(name, lo, hi, step):
 
 
 # The keyword, or the block's name, of an item of a CASTEP-style file (sc.parse_castep_input).
-#   Called by: Project.runner(), Project.runner_items(), read_project(), runner_conv_lines()
+#   Called by: Project.runner(), Project.runner_items(), read_project()
 def item_key(x):
     return x["name"] if x["type"] == "block" else x["key"]
 
 
 # Keywords that have been renamed or removed, with what to do instead.
 #   Used by: read_project()
+_NO_SERIES = ("has been removed with the CASTEP size series of one defect (the old B3): B2 now "
+              "scans every candidate with MACE, and D0 converges each defect's own production "
+              "cell")
 RETIRED = {"triage": "has been renamed: use configuration_margin (in eV; giving it switches the "
                      "filter on)",
            "triage_window": "has been renamed: use configuration_margin (in eV; giving it switches "
                             "the filter on)",
            "zpl_window": "has been removed, with step C3b and its Kohn-Sham ZPL estimate: C7 "
-                         "filters on the ΔSCF ZPL instead (excite : true, excite_window)"}
+                         "filters on the ΔSCF ZPL instead (excite : true, excite_window)",
+           "series_defect": _NO_SERIES,
+           "series_charge": _NO_SERIES + " (in every charge state the defect reaches D in)",
+           "series_sizes": _NO_SERIES + "; the sizes are now lengths: scan_lengths (Ang), which "
+                           "D0 steps through too",
+           "series_choice": _NO_SERIES + ", taking the smaller of the first two sizes that agree "
+                            "within series_tol",
+           "runner_series": _NO_SERIES + ": D0's runs use runner_production (or runner_cells)",
+           "scan_sizes": "has been replaced by scan_lengths: the sizes are lengths in Ang, each "
+                         "the most compact supercell with every periodic image at least that "
+                         "far away",
+           "finetuned_model": "has been removed: B2 and C1 use mace_model (a foundation model or "
+                              "your own .model file), and the fine-tuning data are now written "
+                              "after D1 (D2, for phase F)"}
 
 
 # Reads the project file into a namespace of settings.
@@ -274,12 +332,13 @@ def read_project(path):
         if it["type"] == "raw":
             continue
         key = item_key(it)
-        if key.startswith("runner_") and key not in known:
-            die(f"{name}: there is no {key}: the runner blocks are runner_host (all of phase A's "
-                "CASTEP steps), runner_screen (all of phase C's) and, for one step, "
-                + ", ".join(f"runner_{s}" for s in RUNNER_STEPS if s != "screen"))
         if key in RETIRED:
             die(f"{name}: '{key}' {RETIRED[key]}")
+        if key.startswith("runner_") and key not in known:
+            die(f"{name}: there is no {key}: the runner blocks are runner_host (all of phase A's "
+                "CASTEP steps), runner_screen (all of phase C's), runner_production (D's) and, "
+                "for one step, " + ", ".join(f"runner_{s}" for s in RUNNER_STEPS
+                                             if s not in RUNNER_GROUPS))
         if key not in known:
             close = difflib.get_close_matches(key, sorted(known), n=1)
             die(f"{name}: unknown keyword '{key}'" + (f" - did you mean '{close[0]}'?" if close
@@ -303,13 +362,18 @@ def read_project(path):
                 if k in seen:
                     die(f"{name}: '{k}' is given more than once in %block {key}")
                 seen.add(k)
-            for k in sorted(seen & {"pack", "dryrun_pack"} if key == "runner_series" else ()):
-                die(f"{name}: {k} can't be used for the B3 size series (it runs as a size series, "
-                    f"not a batch) - take it out of %block runner_series")
             blocks[key[len("runner_"):]] = items
             raw[key] = "(%block)"
             continue
         conv, _ = PROJECT_KEYWORDS[key]
+        if conv == "template":                     # a file name, or the text in a block
+            if it["type"] == "block":
+                vals[key] = ["text", "\n".join(it["body"]).strip("\n") + "\n"]
+                raw[key] = "(%block)"
+            else:
+                vals[key] = ["file", it["value"]]
+                raw[key] = it["value"]
+            continue
         if conv in ("lines", "kv"):
             if it["type"] != "block":
                 die(f"{name}: {key} is a block - write %block {key} ... %endblock {key}")
@@ -346,10 +410,18 @@ def read_project(path):
         die(f"{name}: give the jobscript template, as 'jobscript : file' or %block jobscript")
     if s.transform is not None and round(np.linalg.det(np.reshape(s.transform, (3, 3)))) <= 0:
         die(f"{name}: transform must have a positive determinant")
-    for key in ("pair_max_distance", "scan_tol", "series_tol", "configuration_margin",
-                "converge_tol", "mace_fmax", "excite_min"):
+    for key in ("pair_max_distance", "scan_tol", "scan_edge_tol", "series_tol",
+                "configuration_margin", "converge_tol", "mace_fmax", "excite_min",
+                "dispersion_tol"):
         if getattr(s, key) is not None and getattr(s, key) <= 0:
             die(f"{name}: {key} must be greater than 0")
+    for key in ("mace_threads", "mace_steps", "mace_pack", "mace_max_jobs"):
+        if getattr(s, key) is not None and getattr(s, key) < 1:
+            die(f"{name}: {key} must be at least 1")
+    if min(s.scan_lengths) <= 0:
+        die(f"{name}: scan_lengths are lengths in Ang, greater than 0")
+    if s.screen_min_image is not None and s.screen_min_image < 0:
+        die(f"{name}: screen_min_image can't be negative (0 switches the Gamma-only floor off)")
     s.converge_kgrids = kgrid_list(name, s.converge_kgrid_min, s.converge_kgrid_max,
                                    s.converge_kgrid_step)
     if s.excite_window and s.excite_window[0] >= s.excite_window[1]:
@@ -362,15 +434,19 @@ def read_project(path):
 # switches, and passes it to the steps.
 class Project:
     # Reads the project file and the state of earlier runs, and checks the runner settings of
-    # every step now (rather than when the step starts, perhaps days later).
+    # every step now (rather than when the step starts, perhaps days later), and the MACE jobs'
+    # template.
     #   Called by: main()
-    #   Calls:     Project.runner(), read_project()
+    #   Calls:     Project.mace_template(), Project.runner(), read_project()
     def __init__(self, path, cl):
         self.path, self.base, self.cl = path, path.parent, cl
         self.s, self.raw, self.runner_project, self.runner_blocks = read_project(path)
         self._runners, self._mace, self._model_ids, self._results = {}, {}, {}, {}
+        self._mace_args = None
         for step in RUNNER_STEPS:
             self.runner(step)
+        if self.s.mace and self.s.mace_jobscript:
+            self.mace_template()
         self.name = self.s.name or path.stem
         self.dir = self.base / (self.s.workdir or f"dwf_{self.name}")
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -380,7 +456,7 @@ class Project:
 
     # A file named by a project keyword (relative to the project file); stops if it is missing.
     #   Called by: Project.cell_text(), Project.production_param(), inputs_hash(), step_converge(),
-    #              step_dielectric(), step_prerelax(), step_relax()
+    #              step_dielectric(), step_relax()
     def file(self, key):
         value = getattr(self.s, key)
         p = self.base / value
@@ -447,7 +523,7 @@ class Project:
     # The runner items of a step that runs CASTEP jobs (one of RUNNER_STEPS): the project's runner
     # keywords, changed by its group's defaults (GROUP_DEFAULTS), then by %block runner_<group>,
     # then by %block runner_<step>; each replaces the keywords (and %block partitions) it gives.
-    #   Called by: Project.runner(), runner_conv_lines()
+    #   Called by: Project.runner()
     #   Calls:     item_key(), sc.parse_castep_input()
     def runner_items(self, step):
         group = RUNNER_STEPS[step]
@@ -483,8 +559,9 @@ class Project:
     # the runner settings of the step (its name, e.g. 'relax') and the project's STOP file;
     # keep_check : True keeps the jobs' .check files even with delete_check : true (for jobs that
     # later jobs start from). Returns run_batch's result ({'complete', 'jobs', 'calcs'}).
-    #   Called by: run_screen_jobs(), step_bands(), step_converge(), step_dielectric(),
-    #              step_excite(), step_phases(), step_production(), step_relax(), step_screen()
+    #   Called by: run_screen_jobs(), step_bands(), step_cells(), step_converge(),
+    #              step_dielectric(), step_dispersion(), step_excite(), step_phases(),
+    #              step_production(), step_relax(), step_screen()
     #   Calls:     Project.cell_text(), Project.runner(), sc.run_batch()
     def batch(self, subdir, jobs, step, param_text, cell_text=None, spacing=None,
               keep_check=False):
@@ -504,8 +581,9 @@ class Project:
 
     # The .param of the production settings: A1's (with the converged cut-off) once it has run,
     # else the project's .param as it is.
-    #   Called by: run_screen_jobs(), step_bands(), step_dielectric(), step_excite(), step_phases(),
-    #              step_production(), step_relax(), step_screen(), step_series()
+    #   Called by: run_screen_jobs(), step_bands(), step_cells(), step_dielectric(),
+    #              step_dispersion(), step_excite(), step_phases(), step_production(), step_relax(),
+    #              step_screen()
     #   Calls:     Project.file(), Project.finished()
     def production_param(self):
         if self.finished("converge"):
@@ -513,8 +591,8 @@ class Project:
         return self.file("param").read_text()
 
     # The production k-point spacing (1/Ang): A1's, else kspacing, else from the host .cell's grid.
-    #   Called by: step_bands(), step_converge(), step_dielectric(), step_phases(),
-    #              step_production(), step_relax(), step_series()
+    #   Called by: step_bands(), step_cells(), step_converge(), step_dielectric(), step_phases(),
+    #              step_production(), step_relax()
     #   Calls:     Project.cell_text(), Project.finished(), sc.parse_castep_input(),
     #              sc.read_primitive(), sc.target_spacing()
     def kspacing(self):
@@ -528,24 +606,29 @@ class Project:
         return sc.target_spacing(items, prim, ns)[0]
 
     # The relaxed host primitive cell from A2.1 (ASE Atoms, from A_host/host_relaxed.cell).
-    #   Called by: doped_phases(), screen_setup(), step_bands(), step_choose(), step_corrections(),
-    #              step_dielectric(), step_excite(), step_formation(), step_generate(),
-    #              step_limits(), step_production(), step_scan(), step_series()
+    #   Called by: doped_phases(), screen_setup(), step_bands(), step_cells(), step_choose(),
+    #              step_corrections(), step_dielectric(), step_excite(), step_formation(),
+    #              step_generate(), step_limits(), step_production(), step_scan()
     #   Calls:     load_cell()
     def host(self):
         return load_cell(self, self.out("relax")["cell"])
 
-    # The supercell matrix for size n: n x transform (or n x identity).
-    #   Called by: step_choose(), step_scan(), step_series()
-    def supercell_matrix(self, n):
-        T = np.reshape(self.s.transform, (3, 3)) if self.s.transform else np.eye(3, dtype=int)
-        return (n * T).astype(int)
+    # A MACE model as mace-torch takes it: the path of a model file (mace_model, or the model
+    # given, relative to the project file), or else a foundation model's name.
+    #   Called by: Project.mace(), Project.mace_model_file(), Project.model_id(), step_finetune()
+    def model_path(self, model=None):
+        model = str(model or self.s.mace_model)
+        for path in (self.base / model, Path(model)):
+            if path.is_file():
+                return str(path.resolve())
+        return model
 
     # The MACE calculator for a model (default mace_model: a foundation model's name, or a model
-    # file), loaded once (mace-torch, on mace_device).
+    # file), loaded once (mace-torch, on mace_device), for the relaxations run here.
     #   Called by: mace_relax()
+    #   Calls:     Project.model_path()
     def mace(self, model=None):
-        model = str(model or self.s.mace_model)
+        model = self.model_path(model)
         if model not in self._mace:
             import warnings
             warnings.filterwarnings("ignore")
@@ -565,14 +648,84 @@ class Project:
 
     # What identifies a MACE model in the caches: its name, or for a model file its contents
     # (MD5), so a model trained again under the same name isn't mistaken for the old one.
-    #   Called by: mace_relax()
+    #   Called by: mace_key()
+    #   Calls:     Project.model_path()
     def model_id(self, model=None):
-        model = str(model or self.s.mace_model)
+        model = self.model_path(model)
         if model not in self._model_ids:
             path = Path(model)
             self._model_ids[model] = (hashlib.md5(path.read_bytes()).hexdigest()
                                       if path.is_file() else model)
         return self._model_ids[model]
+
+    # The MACE model as a file the MACE jobs can read: mace_model if it is a file; else the
+    # foundation model of that name, which mace-torch downloads here (ARCHER2's compute nodes have
+    # no network) into its cache in your home directory, copied into <workdir>/mace_models/
+    # (compute nodes may not see your home directory, as on ARCHER2).
+    #   Called by: mace_jobs()
+    #   Calls:     Project.model_path()
+    def mace_model_file(self):
+        model = self.model_path()
+        if Path(model).is_file():
+            return model
+        import contextlib
+        import io
+        try:
+            import warnings
+            warnings.filterwarnings("ignore")
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                from mace.calculators import foundations_models as fm
+        except ImportError as err:
+            die(f"the MACE jobs need the foundation model '{model}' as a file: run dwf.py with a "
+                f"Python that has mace-torch (pip install mace-torch), which downloads it, or set "
+                f"mace_model to a .model file ({err})")
+        names = getattr(fm, "mace_mp_names", None)
+        if not hasattr(fm, "download_mace_mp_checkpoint"):
+            die("this mace-torch can't fetch foundation models for the MACE jobs: update it (pip "
+                "install -U mace-torch), or set mace_model to a .model file")
+        if names is not None and model not in names:
+            die(f"mace_model '{model}' is neither a file nor a MACE foundation model ("
+                + ", ".join(sorted(str(x) for x in names if x)) + ")")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                src = Path(fm.download_mace_mp_checkpoint(model))
+        except Exception as err:              # no network, ...
+            die(f"could not download the MACE model '{model}': {err}")
+        dest = self.dir / "mace_models" / (re.sub(r"[^\w.-]", "_", model) + ".model")
+        if not dest.exists() or dest.stat().st_size != src.stat().st_size:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dest)
+            log(f"copied the MACE model {model} to {dest} for the MACE jobs")
+        return str(dest.resolve())
+
+    # The MACE jobs' template (mace_jobscript: a file relative to the project file, or the text of
+    # %block mace_jobscript), checked for its one {COMMAND} line (comment lines don't count),
+    # which the job's workers go in place of.
+    #   Called by: Project.__init__(), mace_jobs()
+    def mace_template(self):
+        kind, value = self.s.mace_jobscript
+        if kind == "file":
+            f = self.base / value
+            if not f.is_file():
+                die(f"{self.path.name}: the mace_jobscript file was not found: {f}")
+            value = f.read_text()
+        if sum("{COMMAND}" in line and not line.lstrip().startswith("#")
+               for line in value.splitlines()) != 1:
+            die(f"{self.path.name}: the mace_jobscript template needs one line with {{COMMAND}} "
+                "where the MACE workers go, e.g.\n    {COMMAND}\n(or with srun in front, e.g. "
+                "srun --exact --ntasks=1 --cpus-per-task=8 {COMMAND}, to start each one with srun)")
+        return value
+
+    # The settings the MACE jobs share with the CASTEP jobs: submit_cmd, status_cmd and poll, from
+    # the project's runner keywords (supercell_convergence.batch_args).
+    #   Called by: mace_jobs()
+    #   Calls:     sc.batch_args()
+    def mace_runner(self):
+        if self._mace_args is None:
+            self._mace_args = sc.batch_args(self.runner_project, self.base,
+                                            f"{self.path.name} (runner settings)")
+        return self._mace_args
 
 
 # --------------------------------------------------------------------------
@@ -702,11 +855,12 @@ def reset_step(p, step):
 # inputs, and stops at the first that isn't finished (jobs still queued with --no-wait). A step
 # that finishes has its results put in its phase's results.json, its checkpoint (with its note
 # and table) in state.json, and its phase's summary.txt written again. --status prints the
-# checkpoints; --redo starts steps again from scratch; --example prints an annotated project file.
+# checkpoints; --redo starts steps again from scratch; --example prints an annotated project file;
+# --mace-worker is what a MACE job runs (mace_worker), not a project.
 #   Called by: the main block
 #   Calls:     Project.__init__(), Project.finished(), Project.save_results(),
-#              Project.save_state(), inputs_hash(), outputs_hash(), print_status(),
-#              reset_step(), write_summary()
+#              Project.save_state(), inputs_hash(), mace_worker(), outputs_hash(),
+#              print_status(), reset_step(), write_summary()
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -726,7 +880,12 @@ def main():
                     help="start failed CASTEP jobs again")
     ap.add_argument("--force", action="store_true",
                     help="keep the results of jobs whose inputs have changed")
+    ap.add_argument("--mace-worker", metavar="TASKS",
+                    help="(what a MACE job runs) relax the structures in this task file")
     cl = ap.parse_args()
+    if cl.mace_worker:
+        mace_worker(cl.mace_worker)
+        return
     if cl.example:
         print(EXAMPLE_PROJECT, end="")
         return
@@ -820,7 +979,7 @@ def main():
 # --------------------------------------------------------------------------
 # An ASE Atoms object as plain data (species, cell, fractional positions, starting spins), for the
 # MACE caches.
-#   Called by: mace_relax()
+#   Called by: mace_jobs(), mace_key(), save_mace_result()
 def atoms_to_dict(atoms):
     return {"symbols": atoms.get_chemical_symbols(),
             "cell": np.asarray(atoms.cell).round(10).tolist(),
@@ -829,7 +988,7 @@ def atoms_to_dict(atoms):
 
 
 # The reverse of atoms_to_dict.
-#   Called by: mace_relax()
+#   Called by: mace_cached(), mace_worker()
 def atoms_from_dict(d):
     a = Atoms(d["symbols"], scaled_positions=d["frac"], cell=d["cell"], pbc=True)
     a.set_initial_magnetic_moments(d.get("magmoms") or [0.0] * len(a))
@@ -841,7 +1000,8 @@ def atoms_from_dict(d):
 # (load_cell) gives the same atom numbers. Only the structure: each job adds its k-points,
 # species_pot and the rest. Returns the path relative to the work directory, as the results give
 # it.
-#   Called by: job_summary(), step_distort(), step_excite(), step_prerelax(), step_production()
+#   Called by: job_summary(), production_summary(), step_distort(), step_excite(),
+#              step_prerelax()
 def save_cell(p, path, atoms, title):
     path.parent.mkdir(parents=True, exist_ok=True)
     frac = atoms.get_scaled_positions(wrap=True)
@@ -858,8 +1018,9 @@ def save_cell(p, path, atoms, title):
 
 # Reads a structure saved by save_cell (rel: relative to the work directory), as ASE Atoms with
 # the starting spins as initial magnetic moments.
-#   Called by: Project.host(), distinct_states(), duplicates(), run_screen_jobs(),
-#              step_distort(), step_excite(), step_production(), step_rank(), step_screen()
+#   Called by: Project.host(), distinct_states(), duplicates(), run_screen_jobs(), step_cells(),
+#              step_dispersion(), step_distort(), step_excite(), step_production(), step_rank(),
+#              step_screen()
 #   Calls:     sc.read_structure()
 def load_cell(p, rel):
     return sc.read_structure(p.dir / rel)
@@ -875,7 +1036,7 @@ def read_structure_file(path):
 # 0 or 1: whether a structure with charge q has an even or odd number of electrons. Core shells
 # are full, so the parity of the valence electrons (whatever the pseudopotentials) is that of the
 # sum of the atomic numbers, minus the charge.
-#   Called by: spin_states(), start_spin(), step_series()
+#   Called by: spin_states(), start_spin()
 def electron_parity(atoms, q):
     return int(sum(atomic_numbers[s] for s in atoms.get_chemical_symbols()) - q) % 2
 
@@ -891,7 +1052,7 @@ def spin_states(atoms, q, which):
 
 # The symmetry operations of a cell (spglib), as (rotations, translations) in fractional
 # coordinates.
-#   Called by: candidate_points(), equivalent_sites(), site_rotations()
+#   Called by: band_masses(), candidate_points(), equivalent_sites(), site_rotations()
 def symmetry_ops(atoms, symprec=1e-3):
     try:
         import spglib
@@ -975,7 +1136,8 @@ def composition_change(comps):
 # spin. Returns (Atoms, info): info has the defect's centre (the mean position of its components,
 # cartesian), each component's position, the anchor's atom index (None for a vacancy) and the
 # positions of the vacancies.
-#   Called by: step_prerelax(), step_scan(), step_series()
+#   Called by: carry_over(), displacement_field(), step_cells(), step_prerelax(),
+#              step_production(), step_scan()
 #   Calls:     comp_name(), sc.anchor_site(), sc.build_supercell(), sc.get_distances(),
 #              sc.pure_translations(), sc.translation_copies()
 def build_defect(prim, P, comps, label="defect"):
@@ -1075,13 +1237,122 @@ def build_defect(prim, P, comps, label="defect"):
 
 
 # The pristine supercell P x (primitive cell), without the site labels build_supercell adds.
-#   Called by: step_choose(), step_corrections(), step_distort(), step_filter(),
-#              step_production(), step_screen()
+#   Called by: step_cells(), step_dispersion(), step_distort(), step_filter(), step_screen()
 #   Calls:     sc.build_supercell()
 def host_supercell(prim, P):
     atoms = sc.build_supercell(prim, P)
     del atoms.arrays["prim_index"]
     return atoms
+
+
+# The shortest distance between a point and its periodic images (the shortest lattice vector),
+# from the Minkowski-reduced cell, so that it is right for skewed cells too.
+#   Called by: carry_over(), cell_record(), same_basin(), size_matrix()
+#   Calls:     sc.min_image_distance()
+def min_image(cell):
+    return sc.min_image_distance(Cell(np.asarray(cell, float)).minkowski_reduce()[0])
+
+
+# Whether a candidate can be built in a supercell whose images are L apart: a pair's components
+# must be less than half of that apart (with 0.05 Ang to spare), or the nearest copy of one of them
+# would be a periodic image of the other.
+#   Called by: step_cells(), step_dispersion(), step_prerelax(), step_scan()
+def fits(cand, L):
+    return not (cand["separation"] and cand["separation"] > L / 2 - 0.05)
+
+
+# The vectors from each of the points a to each of the points b (N x M x 3, Ang), each the nearest
+# periodic image in fractional coordinates: right for the short distances they are used for in a
+# Minkowski-reduced cell, and lighter than ASE's general search for big cells.
+#   Called by: displacement_field()
+def frac_mic(a, b, cell):
+    cell = np.asarray(cell, float)
+    df = (np.asarray(b)[None, :, :] - np.asarray(a)[:, None, :]) @ np.linalg.inv(cell)
+    return (df - np.round(df)) @ cell
+
+
+# The displacement field of a defect's relaxed structure: the defect built in the same supercell
+# (build_defect: the ideal structure, every atom on its perfect-crystal site), each of its atoms
+# matched to one of the relaxed structure's of the same element by the assignment that moves them
+# least in total (scipy's linear_sum_assignment on the distances through the periodic images), so
+# a matched pair is the same atom even when it has moved a long way. Returns (the ideal Atoms, its
+# info, each ideal atom's displacement (N x 3, Ang), each ideal atom's position relative to the
+# defect's centre (N x 3, the shortest way through the images)).
+#   Called by: carry_over(), same_basin()
+#   Calls:     build_defect(), frac_mic()
+def displacement_field(prim, comps, P, relaxed, label="defect"):
+    from ase.geometry import find_mic
+    from scipy.optimize import linear_sum_assignment
+    ideal, info = build_defect(prim, P, comps, label)
+    syms, rsyms = np.array(ideal.get_chemical_symbols()), np.array(relaxed.get_chemical_symbols())
+    if sorted(syms) != sorted(rsyms) or not np.allclose(ideal.cell, relaxed.cell, atol=1e-4):
+        die(f"{label}: the relaxed structure is not of the defect built in this cell")
+    u = np.zeros((len(ideal), 3))
+    for el in sorted(set(syms)):
+        i, r = np.flatnonzero(syms == el), np.flatnonzero(rsyms == el)
+        D = frac_mic(ideal.positions[i], relaxed.positions[r], ideal.cell)
+        rows, cols = linear_sum_assignment(np.linalg.norm(D, axis=2))
+        u[i[rows]] = D[rows, cols]
+    v, _ = find_mic(ideal.positions - np.asarray(info["centre"]), ideal.cell, pbc=True)
+    return ideal, info, u, v
+
+
+# The atoms of two cells that are the same atom of a defect: of the same element, at the same
+# position relative to the defect's centre (within 0.1 Ang), both within radius of it. Takes the
+# positions relative to the centre (v1, v2) and the elements of each. Returns (indices in 1,
+# indices in 2).
+#   Called by: carry_over(), same_basin()
+def common_atoms(v1, syms1, v2, syms2, radius):
+    from scipy.spatial import cKDTree
+    syms1, syms2 = np.asarray(syms1), np.asarray(syms2)
+    a, b = [], []
+    for el in sorted(set(syms1) & set(syms2)):
+        i = np.flatnonzero((syms1 == el) & (np.linalg.norm(v1, axis=1) <= radius))
+        j = np.flatnonzero((syms2 == el) & (np.linalg.norm(v2, axis=1) <= radius))
+        if not len(i) or not len(j):
+            continue
+        dist, k = cKDTree(v1[i]).query(v2[j], distance_upper_bound=0.1)
+        hit = np.isfinite(dist)
+        a += i[k[hit]].tolist()
+        b += j[hit].tolist()
+    return np.array(a, int), np.array(b, int)
+
+
+# A defect's relaxed structure in one supercell (src_P, src_atoms) carried into another (dst_P):
+# the defect is built in the new cell (build_defect: the same components, at the same place in the
+# crystal) and each atom within radius of its centre is moved by the displacement the same atom has
+# in the relaxed structure (displacement_field, common_atoms); the atoms further out stay on their
+# perfect-crystal sites. radius defaults to just under half the smaller cell's shortest image
+# distance, the region the two cells describe in the same way. Works for any host and any pair of
+# supercells of it. Returns (Atoms, info) as build_defect does.
+#   Called by: step_cells(), step_dispersion(), step_production()
+#   Calls:     build_defect(), common_atoms(), displacement_field(), min_image()
+def carry_over(prim, comps, src_P, src_atoms, dst_P, radius=None, label="defect"):
+    ideal, _, u, v = displacement_field(prim, comps, src_P, src_atoms, label)
+    new, info = build_defect(prim, dst_P, comps, label)
+    from ase.geometry import find_mic
+    w, _ = find_mic(new.positions - np.asarray(info["centre"]), new.cell, pbc=True)
+    if radius is None:
+        radius = 0.5 * min(min_image(ideal.cell), min_image(new.cell)) - 0.1
+    a, b = common_atoms(v, ideal.get_chemical_symbols(), w, new.get_chemical_symbols(), radius)
+    new.positions[b] += u[a]
+    new.wrap()
+    return new, info
+
+
+# Whether two relaxed structures of a defect in different supercells are in the same basin: the
+# displacements of the atoms near the defect (within EDGE_FRACTION of the smaller cell's shortest
+# image distance of its centre; displacement_field, common_atoms) differ by no more than BASIN_TOL.
+# Returns (same, the largest difference in Ang).
+#   Called by: step_cells()
+#   Calls:     common_atoms(), displacement_field(), min_image()
+def same_basin(prim, comps, P1, atoms1, P2, atoms2, label="defect"):
+    i1, _, u1, v1 = displacement_field(prim, comps, P1, atoms1, label)
+    i2, _, u2, v2 = displacement_field(prim, comps, P2, atoms2, label)
+    radius = EDGE_FRACTION * min(min_image(i1.cell), min_image(i2.cell))
+    a, b = common_atoms(v1, i1.get_chemical_symbols(), v2, i2.get_chemical_symbols(), radius)
+    worst = float(np.linalg.norm(u1[a] - u2[b], axis=1).max()) if len(a) else 0.0
+    return worst <= BASIN_TOL, worst
 
 
 # --------------------------------------------------------------------------
@@ -1090,7 +1361,8 @@ def host_supercell(prim, P):
 # Reads a CASTEP .bands file: k-points, weights, eigenvalues (eV, [spin][k-point][band]), the
 # electrons in each spin channel (one number, the total, when the calculation is not spin-
 # polarised) and the Fermi energies (eV).
-#   Called by: job_summary(), step_bands(), step_excite(), step_formation(), step_screen()
+#   Called by: job_summary(), step_bands(), step_choose(), step_dispersion(), step_excite(),
+#              step_formation(), step_screen()
 def read_bands(path):
     lines = Path(path).read_text().splitlines()
 
@@ -1123,7 +1395,8 @@ def read_bands(path):
 # The number of occupied bands in each spin channel of a .bands (read_bands). From the electron
 # counts when CASTEP gives one per spin (or the total, not spin-polarised); otherwise the bands
 # below the Fermi energy at the first k-point.
-#   Called by: band_edges(), carriers(), excitation(), gap_levels()
+#   Called by: band_edges(), band_masses(), carriers(), excitation(), gap_levels(),
+#              level_dispersion()
 def occupied_bands(b):
     if b["nspin"] == 1:
         return [int(round(b["nelec"][0] / 2))]
@@ -1233,7 +1506,7 @@ def read_permittivity(text):
 
 # The finite-size correction (eV) for charge q in a supercell (supercell_convergence's
 # charge_correction: Lany-Zunger, Makov-Payne or none), with the static dielectric constant eps.
-#   Called by: relative_formation(), step_corrections()
+#   Called by: relative_formation(), step_cells(), step_corrections()
 #   Calls:     sc.charge_correction()
 def correction(q, cell, eps, method):
     if not q or method == "none":
@@ -1248,35 +1521,290 @@ def correction(q, cell, eps, method):
 # --------------------------------------------------------------------------
 # MACE
 # --------------------------------------------------------------------------
-# Relaxes the positions of a structure with MACE (the cell fixed) with model (default
-# mace_model), unless cache (a JSON file) already holds the result for the same structure, model
-# and settings. Returns (relaxed Atoms, energy before, energy after, steps). The starting spins are
-# kept (MACE ignores them).
+# What identifies one MACE relaxation in the caches: the structure, the model (Project.model_id)
+# and the optimiser's settings (mace_fmax, mace_steps).
+#   Called by: mace_relax(), mace_relaxations()
+#   Calls:     Project.model_id(), atoms_to_dict()
+def mace_key(p, atoms, model=None):
+    return hashlib.md5(json.dumps({"atoms": atoms_to_dict(atoms), "model": p.model_id(model),
+                                   "fmax": p.s.mace_fmax, "steps": p.s.mace_steps},
+                                  sort_keys=True).encode()).hexdigest()
+
+
+# The cache file of a candidate's MACE relaxation in one supercell (tag: the size's tag, e.g.
+# n144). B2 and C1 share them, so C1 reuses the scan's relaxations in the screening cell.
 #   Called by: step_prerelax(), step_scan()
-#   Calls:     Project.mace(), Project.model_id(), atoms_from_dict(), atoms_to_dict()
-def mace_relax(p, atoms, cache, model=None):
-    key = hashlib.md5(json.dumps({"atoms": atoms_to_dict(atoms), "model": p.model_id(model),
-                                  "fmax": p.s.mace_fmax, "steps": p.s.mace_steps},
-                                 sort_keys=True).encode()).hexdigest()
+def mace_cache(p, cid, tag):
+    return p.phase_dir("B") / "mace" / f"{cid}_{tag}.json"
+
+
+# A MACE relaxation's result from its cache file: (relaxed Atoms, energy before, energy after,
+# steps), or None if the file doesn't hold this relaxation (key: mace_key). One that failed in a
+# MACE job (the error is in the file) stops the script with its error.
+#   Called by: mace_jobs(), mace_relax(), mace_relaxations()
+#   Calls:     atoms_from_dict()
+def mace_cached(cache, key):
     cache = Path(cache)
-    if cache.exists():
+    if not cache.exists():
+        return None
+    try:
         saved = json.loads(cache.read_text())
-        if saved.get("key") == key:
-            return atoms_from_dict(saved["atoms"]), saved["e0"], saved["e1"], saved["steps"]
+    except ValueError:                            # being written: not there yet
+        return None
+    if saved.get("key") != key:
+        return None
+    if saved.get("error"):
+        die(f"the MACE relaxation in {cache} failed: {saved['error']} (the workers' logs are in "
+            "the jobs/mace_<step> folder of its phase; delete the file to try it again)")
+    return atoms_from_dict(saved["atoms"]), saved["e0"], saved["e1"], saved["steps"]
+
+
+# Writes a MACE relaxation's result (relaxed Atoms, energy before, energy after, steps), or the
+# error that stopped it, to its cache file, through a temporary file (so a job killed while writing
+# leaves no half-written file).
+#   Called by: mace_relax(), mace_worker()
+#   Calls:     atoms_to_dict()
+def save_mace_result(cache, key, result=None, error=None):
+    data = {"key": key}
+    if error:
+        data["error"] = error
+    else:
+        atoms, e0, e1, steps = result
+        data.update(atoms=atoms_to_dict(atoms), e0=e0, e1=e1, steps=steps)
+    cache = Path(cache)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_name(cache.name + ".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(cache)
+
+
+# Relaxes the positions of a structure with a MACE calculator, the cell fixed (ASE's LBFGS, to
+# fmax, in at most steps steps). Returns (relaxed Atoms, energy before, energy after, steps); the
+# starting spins are kept (MACE ignores them). The same here (mace_relax) and in the MACE jobs
+# (mace_worker).
+#   Called by: mace_relax(), mace_worker()
+def mace_run(calc, atoms, fmax, steps):
     from ase.optimize import LBFGS
     work = atoms.copy()
-    work.calc = p.mace(model)
+    work.calc = calc
     e0 = float(work.get_potential_energy())
     opt = LBFGS(work, logfile=None)
-    opt.run(fmax=p.s.mace_fmax, steps=p.s.mace_steps)
+    opt.run(fmax=fmax, steps=steps)
     e1 = float(work.get_potential_energy())
     work.calc = None
     work.set_initial_magnetic_moments(atoms.get_initial_magnetic_moments())
-    steps = int(getattr(opt, "nsteps", 0))
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps({"key": key, "atoms": atoms_to_dict(work), "e0": e0, "e1": e1,
-                                 "steps": steps}))
-    return work, e0, e1, steps
+    return work, e0, e1, int(getattr(opt, "nsteps", 0))
+
+
+# Relaxes a structure with MACE here, in this process (model: default mace_model), unless its
+# cache file already holds the result (mace_cached). Returns (relaxed Atoms, energy before, energy
+# after, steps).
+#   Called by: mace_relaxations()
+#   Calls:     Project.mace(), mace_cached(), mace_key(), mace_run(), save_mace_result()
+def mace_relax(p, atoms, cache, model=None):
+    key = mace_key(p, atoms, model)
+    hit = mace_cached(cache, key)
+    if hit:
+        return hit
+    result = mace_run(p.mace(model), atoms, p.s.mace_fmax, p.s.mace_steps)
+    save_mace_result(cache, key, result)
+    return result
+
+
+# A step's MACE relaxations (mace_model): {cache file: (relaxed Atoms, energy before, energy
+# after, steps)}, or None while MACE jobs are still queued (--no-wait) or after --prepare-only.
+# tasks: [{'atoms', 'cache', 'label'}]. A relaxation whose cache file already holds it (the same
+# structure, model and settings: mace_key) is not run again. The others run as jobs on compute
+# nodes with mace_jobscript (mace_jobs), else here, one after the other (mace_relax).
+#   Called by: step_prerelax(), step_scan()
+#   Calls:     mace_cached(), mace_jobs(), mace_key(), mace_relax()
+def mace_relaxations(p, step, tasks):
+    out, todo = {}, []
+    for t in tasks:
+        t = dict(t, key=mace_key(p, t["atoms"]))
+        hit = mace_cached(t["cache"], t["key"])
+        if hit:
+            out[str(t["cache"])] = hit
+        else:
+            todo.append(t)
+    if todo and p.s.mace_jobscript:
+        if not mace_jobs(p, step, todo):
+            return None
+        for t in todo:
+            out[str(t["cache"])] = mace_cached(t["cache"], t["key"])
+    for k, t in enumerate([] if p.s.mace_jobscript else todo):
+        log(f"{STEP_INDEX[step].label}: {t['label']}: MACE relaxation ({len(t['atoms'])} atoms; "
+            f"{k + 1} of {len(todo)})")
+        out[str(t["cache"])] = mace_relax(p, t["atoms"], t["cache"])
+    return out
+
+
+# The MACE relaxations a step still needs (mace_relaxations), run as batch jobs on compute nodes,
+# in <phase>/jobs/mace_<step>/job_NNN/. Each job is the mace_jobscript template with its {COMMAND}
+# line made into mace_pack workers, each running  python3 dwf.py --mace-worker tasks_KK.json  in
+# the background with mace_threads threads (whatever is in front of {COMMAND} on its line, e.g.
+# srun ..., goes in front of each), then wait. The relaxations are shared out between at most
+# mace_max_jobs jobs, biggest first, onto whichever worker has the fewest atoms so far, so the
+# workers finish together. The jobs go in jobs.json there; waiting polls the queue (status_cmd)
+# every poll seconds, like the CASTEP jobs, and the project's STOP file stops it. A relaxation still
+# missing once its job has ended (e.g. it ran out of time) goes into a new job, at most
+# MACE_ATTEMPTS times. Returns True when every relaxation is done, False while jobs are queued
+# (--no-wait) or after --prepare-only (the job scripts are then in prepared/).
+#   Called by: mace_relaxations()
+#   Calls:     Project.mace_model_file(), Project.mace_runner(), Project.mace_template(),
+#              atoms_to_dict(), mace_cached(), write_json(), sc.job_active(), sc.send_job()
+def mace_jobs(p, step, todo):
+    args = p.mace_runner()
+    d = p.phase_dir(STEP_INDEX[step].phase) / "jobs" / f"mace_{step}"
+    d.mkdir(parents=True, exist_ok=True)
+    state_file = d / "jobs.json"
+    state = (json.loads(state_file.read_text()) if state_file.exists()
+             else {"jobs": [], "tries": {}})
+    template, stop = p.mace_template(), p.dir / "STOP"
+    pack = p.s.mace_pack or max(1, (args.cores_per_node or p.s.mace_threads) // p.s.mace_threads)
+    label, model = STEP_INDEX[step].label, p.mace_model_file()
+    announced = False
+
+    # Whether a job is over: not in the queue, and either its end mark is there or it was
+    # submitted long enough ago that the queue must know it (so a slow queue isn't taken for a
+    # job that has ended).
+    def ended(job):
+        if sc.job_active(job["jobid"], args):
+            return False
+        return (Path(job["dir"]) / "finished").exists() or time.time() - job["time"] > 120
+
+    # Writes the scripts of new jobs for some relaxations into a folder each (its task files, one
+    # per worker, and job.sh); returns [(folder, [cache files])].
+    def write_jobs(tasks, where):
+        n_jobs = min(p.s.mace_max_jobs, math.ceil(len(tasks) / pack))
+        slots = [{"tasks": [], "atoms": 0} for _ in range(min(len(tasks), n_jobs * pack))]
+        for t in sorted(tasks, key=lambda t: -len(t["atoms"])):
+            s = min(slots, key=lambda s: s["atoms"])
+            s["tasks"].append(t)
+            s["atoms"] += len(t["atoms"])
+        made = []
+        for j in range(n_jobs):
+            jdir = where(j)
+            jdir.mkdir(parents=True, exist_ok=True)
+            files, caches = [], []
+            for k, s in enumerate(slots[j::n_jobs]):
+                f = jdir / f"tasks_{k + 1:02d}.json"
+                f.write_text(json.dumps({
+                    "model": model, "device": p.s.mace_device, "threads": p.s.mace_threads,
+                    "fmax": p.s.mace_fmax, "steps": p.s.mace_steps,
+                    "tasks": [{"cache": str(Path(t["cache"]).resolve()), "key": t["key"],
+                               "label": t["label"], "atoms": atoms_to_dict(t["atoms"])}
+                              for t in s["tasks"]]}))
+                files.append(f)
+                caches += [str(t["cache"]) for t in s["tasks"]]
+            lines = template.splitlines()
+            i = next(k for k, line in enumerate(lines)
+                     if "{COMMAND}" in line and not line.lstrip().startswith("#"))
+            pre, post = lines[i].split("{COMMAND}", 1)
+            py, me = p.s.mace_python or sys.executable, str(Path(__file__).resolve())
+            run = [f"{pre}env OMP_NUM_THREADS={p.s.mace_threads} {shlex.quote(py)} "
+                   f"{shlex.quote(me)} --mace-worker {shlex.quote(str(f.resolve()))}{post} > "
+                   f"{shlex.quote(str((jdir / f'worker_{k + 1:02d}.log').resolve()))} 2>&1 &"
+                   for k, f in enumerate(files)]
+            run += ["wait", f"echo finished > {shlex.quote(str((jdir / 'finished').resolve()))}"]
+            text = "\n".join(lines[:i] + run + lines[i + 1:]) + "\n"
+            name = f"dwf_mace_{step}_{jdir.name}"
+            (jdir / "job.sh").write_text(text.replace("{JOBNAME}", name))
+            made.append((jdir, caches))
+        return made
+
+    while True:
+        left = [t for t in todo if mace_cached(t["cache"], t["key"]) is None]
+        if not left:
+            if announced:
+                log(f"{label}: the MACE jobs have finished")
+            return True
+        for job in state["jobs"]:
+            if not job.get("ended") and ended(job):
+                job["ended"] = True
+        active = [j for j in state["jobs"] if not j.get("ended")]
+        busy = {c for j in active for c in j["caches"]}
+        new = [t for t in left if str(t["cache"]) not in busy]
+        if new:
+            worn = [t["label"] for t in new if state["tries"].get(str(t["cache"]), 0)
+                    >= MACE_ATTEMPTS]
+            if worn:
+                die(f"{label}: the MACE jobs ended {MACE_ATTEMPTS} times without these "
+                    f"relaxations: {', '.join(worn[:8])}"
+                    + (f" and {len(worn) - 8} more" if len(worn) > 8 else "")
+                    + f". See the workers' logs and slurm output in {d}/job_*/ (e.g. a longer "
+                    "--time in mace_jobscript)")
+            if p.cl.prepare_only:
+                shutil.rmtree(d / "prepared", ignore_errors=True)
+                write_jobs(new, lambda j: d / "prepared" / f"job_{j + 1:03d}")
+                log(f"{label}: the scripts of the MACE jobs for {len(new)} relaxations are in "
+                    f"{d / 'prepared'} - check them, then rerun without --prepare-only")
+                return False
+            first = 1 + max([int(x.name[4:]) for x in d.glob("job_*") if x.name[4:].isdigit()],
+                            default=0)
+            for jdir, caches in write_jobs(new, lambda j: d / f"job_{first + j:03d}"):
+                jobid = sc.send_job(jdir, "job.sh", args)
+                state["jobs"].append({"jobid": jobid, "dir": str(jdir), "caches": caches,
+                                      "time": time.time()})
+                for c in caches:
+                    state["tries"][c] = state["tries"].get(c, 0) + 1
+                log(f"{label}: submitted MACE job {jobid} ({jdir.name}: {len(caches)} "
+                    f"relaxation{'s' if len(caches) > 1 else ''})")
+            write_json(state_file, state)
+            continue
+        write_json(state_file, state)
+        if p.cl.no_wait:
+            log(f"{label}: {len(left)} MACE relaxations still queued or running (jobs "
+                + ", ".join(j["jobid"] for j in active) + "); rerun the same command later")
+            return False
+        if stop.exists():
+            stop.unlink()
+            log(f"found {stop.name} - stopping. Jobs already submitted keep running; rerun the "
+                "same command to carry on.")
+            sys.exit(0)
+        if not announced:
+            log(f"{label}: waiting for {len(left)} MACE relaxations (jobs "
+                + ", ".join(j["jobid"] for j in active) + f"; polling every {args.poll} s)")
+            announced = True
+        time.sleep(args.poll)
+
+
+# What a MACE job's worker does (python3 dwf.py --mace-worker <tasks>.json, written by
+# mace_jobs): relaxes each structure in the file (mace_run, with the model file and settings given
+# there) that its cache file doesn't hold yet, and writes each result to its cache file as soon as
+# it has it (save_mace_result); an error goes into the cache file instead, for the workflow to
+# report.
+#   Called by: main()
+#   Calls:     atoms_from_dict(), mace_run(), save_mace_result()
+def mace_worker(path):
+    spec = json.loads(Path(path).read_text())
+    calc = None
+    log(f"MACE worker: {len(spec['tasks'])} relaxations, model {spec['model']}, "
+        f"{spec['threads']} threads")
+    for t in spec["tasks"]:
+        cache = Path(t["cache"])
+        try:
+            if json.loads(cache.read_text()).get("key") == t["key"]:
+                continue                          # done already (an earlier job)
+        except (OSError, ValueError):
+            pass
+        start = time.time()
+        try:
+            if calc is None:
+                import warnings
+                warnings.filterwarnings("ignore")
+                import torch
+                from mace.calculators import mace_mp
+                torch.set_num_threads(spec["threads"])
+                calc = mace_mp(model=spec["model"], device=spec["device"],
+                               default_dtype="float64")
+            res = mace_run(calc, atoms_from_dict(t["atoms"]), spec["fmax"], spec["steps"])
+            save_mace_result(cache, t["key"], res)
+            log(f"{t['label']}: {len(res[0])} atoms, {res[3]} steps, "
+                f"{time.time() - start:.0f} s")
+        except Exception as err:                  # anything MACE or torch raises
+            save_mace_result(cache, t["key"], error=f"{type(err).__name__}: {err}")
+            log(f"{t['label']}: FAILED: {type(err).__name__}: {err}")
 
 
 # --------------------------------------------------------------------------
@@ -1284,7 +1812,7 @@ def mace_relax(p, atoms, cache, model=None):
 # --------------------------------------------------------------------------
 # Writes a JSON file, made readable, through a temporary file so that it is never left half
 # written (state.json, results.json).
-#   Called by: Project.save_results(), Project.save_state()
+#   Called by: Project.save_results(), Project.save_state(), mace_jobs(), size_ladder()
 def write_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -1295,10 +1823,10 @@ def write_json(path, data):
 # A text table for summary.txt and the log: a title, a header row, a rule and the rows, in columns
 # as wide as needed (numbers to the right, text to the left). Floats are shown with 4 decimals,
 # None as blank.
-#   Called by: problem_table(), step_converge(), step_corrections(), step_excite(),
-#              step_filter(), step_formation(), step_generate(), step_interest(), step_limits(),
-#              step_phases(), step_prerelax(), step_production(), step_rank(), step_scan(),
-#              step_series()
+#   Called by: ladder_table(), problem_table(), step_cells(), step_choose(), step_converge(),
+#              step_corrections(), step_dispersion(), step_excite(), step_filter(),
+#              step_formation(), step_generate(), step_interest(), step_limits(), step_phases(),
+#              step_prerelax(), step_production(), step_rank(), step_scan()
 def format_table(header, rows, title=""):
     cells = [[("" if v is None else (f"{v:.4f}" if isinstance(v, float) else str(v)))
               for v in r] for r in rows]
@@ -1327,7 +1855,8 @@ def counts(atoms):
 
 
 # The tag of a charge state in job names (which can't hold + or -): q0, qp1, qm1, ...
-#   Called by: step_distort(), step_excite(), step_production(), step_rank(), step_screen()
+#   Called by: step_cells(), step_dispersion(), step_distort(), step_excite(),
+#              step_production(), step_rank(), step_screen()
 def qtag(q):
     return "q0" if q == 0 else f"q{'p' if q > 0 else 'm'}{abs(q)}"
 
@@ -1498,7 +2027,7 @@ def step_converge(p):
 # --------------------------------------------------------------------------
 # A2.1: relaxes the host primitive cell (lattice and positions, with symmetry) at the production
 # settings. Saves the relaxed cell as A_host/host_relaxed.cell (with your .cell's species_pot and
-# the rest, so the size series can use it too), and the energy per atom, e_bulk.
+# the rest, a complete .cell to run by hand too), and the energy per atom, e_bulk.
 #   Called by: main() (step A2.1)
 #   Calls:     Project.batch(), Project.cell_text(), Project.file(), Project.kspacing(),
 #              Project.production_param(), read_structure_file(), sc.final_atoms(), sc.kgrid(),
@@ -1826,7 +2355,7 @@ def step_limits(p):
 
 
 # ==========================================================================================
-# PHASE B: CANDIDATE DEFECTS AND CELL SIZE (flowchart B1-B5)
+# PHASE B: CANDIDATE DEFECTS AND THE SCREENING CELL (flowchart B1-B3)
 # ==========================================================================================
 # --------------------------------------------------------------------------
 # B1: candidates
@@ -1963,7 +2492,7 @@ def pair_arrangements(prim, a, b, dmax):
 
 # Turns a component token (Sb_Ca, Vac_O, Vac_O:2, Sb_Ca@2) into a component dict; 'sites' is how
 # many symmetry-equivalent sites of that kind the primitive cell has.
-#   Called by: representative(), user_defects()
+#   Called by: user_defects()
 #   Calls:     equivalent_sites(), sc.parse_defect()
 def parse_token(tok, prim):
     comps = sc.parse_defect([tok], prim)
@@ -1977,8 +2506,8 @@ def parse_token(tok, prim):
 # The candidates from %block defects (B1 'yes'): one line per defect, components joined by '+'
 # (e.g. Sb_Ca + Vac_O). A pair with 'all' on its line gives every arrangement up to
 # pair_max_distance; otherwise each further component goes on the nearest site of its kind (as in
-# the size series). q=... on a line (q=-1, or q=+1,0) gives the charge states of that line's
-# candidates, used instead of screen_charges.
+# supercell_convergence.py's size series). q=... on a line (q=-1, or q=+1,0) gives the charge
+# states of that line's candidates, used instead of screen_charges.
 #   Called by: step_generate()
 #   Calls:     candidate(), pair_arrangements(), parse_token(), sc.defect_vectors(),
 #              sc.parse_defect()
@@ -2091,290 +2620,370 @@ def step_generate(p):
 
 
 # --------------------------------------------------------------------------
-# B2-B5: cell size
+# B2, B3: supercell sizes and the screening cell
 # --------------------------------------------------------------------------
-# The defect the size scan and series use: series_defect (tokens, e.g. Sb_Ca@1 + Vac_O) or the
-# nearest arrangement of the first pair with a dopant (else the first candidate). Returns
-# (component dicts for build_defect, tokens for supercell_convergence.py, its name, the charge
-# states of its line in %block defects or None). A token names
-# the primitive-cell site (:k) its component sits on when its element has more than one, so that
-# supercell_convergence.py builds the same arrangement.
-#   Called by: step_scan(), step_series()
-#   Calls:     parse_token(), sc.defect_vectors(), sc.parse_defect()
-def representative(p, prim):
-    if p.s.series_defect:
-        toks = p.s.series_defect.replace("+", " ").split()
-        comps = sc.parse_defect(toks, prim)
-        vecs = sc.defect_vectors(prim, comps)
-        full = [parse_token(toks[0], prim)] + [
-            dict(parse_token(t, prim), vec=np.asarray(v).tolist()) for t, v in zip(toks[1:], vecs)]
-        return full, toks, " + ".join(toks), None
-    cands = list(p.out("generate")["candidates"].values())
-    pairs = [c for c in cands if len(c["comps"]) == 2 and any(x["new"] in p.s.dopants
-                                                              for x in c["comps"])]
-    c = min(pairs, key=lambda c: c["separation"]) if pairs else cands[0]
-    if any(x["host"] is None for x in c["comps"]):
-        die(f"the representative defect {c['name']} has an interstitial, which the size series "
-            "can't build: set series_defect (e.g. Sb_Ca + Vac_O) or supercell")
-    prim_syms, frac, cell = prim.get_chemical_symbols(), prim.get_scaled_positions(), prim.cell
-    ra = prim.positions[c["comps"][0]["prim_site"]]
-    toks = []
-    for x in c["comps"]:
-        site = x["prim_site"]
-        if "vec" in x:                              # the site its vector lands on
-            f = np.linalg.solve(np.asarray(cell).T, ra + np.asarray(x["vec"]))
-            d = (frac - f + 0.5) % 1.0 - 0.5
-            site = int(np.argmin(np.linalg.norm(d @ np.asarray(cell), axis=1)))
-        same = [i for i, s in enumerate(prim_syms) if s == x["host"]]
-        tok = f"{x['new'] or 'Vac'}_{x['host']}"
-        if len(same) > 1:
-            tok += f":{same.index(site) + 1}"
-        toks.append(tok)
-    return c["comps"], toks, c["name"], c.get("charges")
-
-
-# B2: MACE size scan. Builds the representative defect in each of scan_sizes, relaxes it with
-# MACE (positions only) and records its relaxation energy (unrelaxed - relaxed) and the largest
-# displacement of the atoms in the outer part of the cell (beyond 35% of the shortest image
-# distance from the defect). The CASTEP series goes no further than the first size whose
-# relaxation energy is within scan_tol of the size before (the cap). Skipped with mace : false,
-# scan : false or supercell (the cap is only for the series).
-#   Called by: main() (step B2)
-#   Calls:     Project.host(), Project.supercell_matrix(), build_defect(), format_table(),
-#              mace_relax(), representative(), sc.displacements(), sc.get_distances(),
-#              sc.min_image_distance()
-def step_scan(p):
-    if not (p.s.mace and p.s.scan) or p.s.supercell:
-        return {"cap": None, "_note": "skipped (" + ("supercell given" if p.s.supercell else
-                                                    "mace or scan is false") + ")"}
-    d = p.phase_dir("B")
-    prim = p.host()
-    comps, _, name, _ = representative(p, prim)
-    rows, out, prev, cap = [], [], None, None
-    for n in sorted(p.s.scan_sizes):
-        P = p.supercell_matrix(n)
-        atoms, info = build_defect(prim, P, comps, name)
-        L = sc.min_image_distance(atoms.cell)
-        log(f"B2: {name} in size {n} ({len(atoms)} atoms): MACE relaxation")
-        relaxed, e0, e1, steps = mace_relax(p, atoms, d / "mace" / f"n{n}.json")
-        moved = sc.displacements(atoms, relaxed)
-        _, r = sc.get_distances(np.array(info["centre"])[None], atoms.positions, cell=atoms.cell,
-                                pbc=True)
-        far = moved[r[0] > 0.35 * L]
-        erel = e0 - e1
-        row = {"n": n, "atoms": len(atoms), "L_min": L, "E_relax": erel, "steps": steps,
-               "far_move": float(far.max()) if far.size else 0.0}
-        row["change"] = None if prev is None else erel - prev
-        out.append(row)
-        rows.append([n, len(atoms), L, erel, row["change"], row["far_move"], steps])
-        if prev is not None and abs(erel - prev) < p.s.scan_tol and cap is None:
-            cap = n
-            break
-        prev = erel
-    table = format_table(["n", "atoms", "L_min/A", "E_relax/eV", "change/eV",
-                          "far-field move/A", "MACE steps"], rows,
-                         f"MACE size scan of {name} (scan_tol {p.s.scan_tol:g} eV)")
-    if cap is None:
-        log(f"note: the MACE relaxation energy has not levelled off within scan_sizes "
-            f"{p.s.scan_sizes}; the CASTEP series is not capped")
-    return {"cap": cap, "sizes": out, "_table": table,
-            "_note": f"levels off at size {cap}" if cap else "did not level off"}
-
-
-# The runner settings of a step, as lines of a .conv file: its runner items (the project's runner
-# keywords, changed by its runner blocks), with file names made absolute (the .conv is elsewhere).
-# Batch-only keywords (max_jobs, tolerate_failures, pack, dryrun_pack) are left out.
-#   Called by: step_series()
-#   Calls:     Project.runner_items(), item_key()
-def runner_conv_lines(p, step):
-    lines = []
-    for it in p.runner_items(step):
-        k = item_key(it)
-        if k in ("max_jobs", "tolerate_failures", "pack", "dryrun_pack"):
-            continue
-        if it["type"] == "block":
-            lines += [f"%block {k}"] + it["body"] + [f"%endblock {k}"]
-        elif k in ("jobscript", "dryrun_jobscript"):
-            lines.append(f"{k} : {(p.base / it['value']).resolve()}")
-        else:
-            lines.append(f"{k} : {it['value']}")
-    return lines
-
-
-# B3: the CASTEP size series of the representative defect, run by supercell_convergence.py in
-# B_candidates/series: its .conv is written from the project (relaxed host cell, production
-# .param and k-points, e_bulk, transform, series_sizes up to the B2 cap, series_tol, MACE
-# pre-relaxation with mace : true, the charge with its correction: series_charge if given, else
-# the defect's own q= in %block defects (0 if it allows it), else 0), then the script runs in
-# a subprocess (output to this terminal) and its convergence.json is read. A charged or
-# odd-electron defect runs spin-polarised with a starting spin (the lowest its electron count
-# allows, also put on the first component); otherwise the .param's own spin_polarized is kept.
-# Not finished while jobs are queued (--no-wait).
-#   Called by: main() (step B3)
-#   Calls:     Project.host(), Project.kspacing(), Project.production_param(),
-#              Project.supercell_matrix(), build_defect(), electron_parity(), format_table(),
-#              representative(), runner_conv_lines(), sc.strip_comment()
-def step_series(p):
-    if p.s.supercell:
-        return {"skipped": True, "_note": f"supercell : {p.s.supercell} given"}
-    d = p.phase_dir("B") / "series"
-    d.mkdir(parents=True, exist_ok=True)
-    prim = p.host()
-    comps, toks, name, qs = representative(p, prim)
-    cap = p.out("scan").get("cap")
-    sizes = [n for n in sorted(p.s.series_sizes) if cap is None or n <= cap]
-    if len(sizes) < 2:
-        sizes = sorted(p.s.series_sizes)[:2]
-    q = p.s.series_charge
-    if qs and "series_charge" not in p.raw:      # its own q= in %block defects: 0 if allowed
-        q = 0 if 0 in qs else qs[0]
-        log(f"B3: series in charge state {q:+d} (from q= in %block defects)")
-    spin = electron_parity(build_defect(prim, p.supercell_matrix(sizes[0]), comps, name)[0], q)
-    drop = (r"(charge|spin|spin_polari[sz]ed)" if spin or q       # set below (either spelling)
-            else r"(charge|spin)")
-    param = "\n".join(line for line in p.production_param().splitlines()
-                      if not sc.re.match(rf"\s*{drop}\b", sc.strip_comment(line),
-                                         sc.re.I)).rstrip() + "\n"
-    if q:
-        param += f"charge : {q}\n"
-    if spin or q:
-        param += f"spin_polarized : true\nspin : {spin}\n"
-    (d / "series.param").write_text(param)
-    host = p.out("relax")
-    toks = [toks[0] + (f"@{spin}" if spin and "@" not in toks[0] and not
-                       toks[0].lower().startswith("vac") else "")] + toks[1:]
-    conv = [f"# size series of {name} (written by dwf.py, step B3)",
-            f"cell : {(p.dir / host['cell']).resolve()}", "param : series.param",
-            "%block defect"] + toks + ["%endblock defect",
-                                       f"e_bulk : {host['e_bulk']:.10f} eV",
-                                       f"sizes : {' '.join(map(str, sizes))}",
-                                       f"kspacing : {p.kspacing():.8f}",
-                                       f"tol : {p.s.series_tol:g} eV", "singlepoint : false",
-                                       f"energy : {p.s.energy}", "workdir : run"]
-    if p.s.transform:
-        conv += ["%block transform"] + [" ".join(map(str, p.s.transform[i:i + 3]))
-                                         for i in (0, 3, 6)] + ["%endblock transform"]
-    if q:
-        eps = p.out("dielectric")["eps0"]
-        conv += [f"charge_correction : {p.s.charge_correction}", f"dielectric : {eps:.6f}"]
-    if p.s.mace:
-        conv += ["prerelax : mace", f"prerelax_model : {p.s.mace_model}",
-                 f"prerelax_device : {p.s.mace_device}", f"prerelax_threads : {p.s.mace_threads}",
-                 f"prerelax_fmax : {p.s.mace_fmax:g}", f"prerelax_steps : {p.s.mace_steps}"]
-    conv += runner_conv_lines(p, "series")
-    (d / "series.conv").write_text("\n".join(conv) + "\n")
-    cmd = [sys.executable, str(HERE / "supercell_convergence.py"), "series.conv"]
-    for flag in ("no_wait", "prepare_only", "force", "resubmit_failed"):
-        if getattr(p.cl, flag, False):
-            cmd.append("--" + flag.replace("_", "-"))
-    log(f"B3: size series of {name}, sizes {sizes}, in {d}")
-    sys.stdout.flush()
-    ret = subprocess.run(cmd, cwd=d)
-    if ret.returncode != 0:
-        die(f"the size series stopped with an error (above); fix it and rerun ({d})")
-    res = d / "run" / "convergence.json"
-    if not res.exists():
-        return None
-    rows = json.loads(res.read_text())
-    ns = [int(sc.re.findall(r"\d+", r["size"])[0]) for r in rows]
-    converged = len(rows) > 1 and abs(rows[-1]["dE_f"]) < p.s.series_tol
-    if not converged and ns[-1] < sizes[-1]:
-        return None                                   # more sizes still to come
-    series = [{"n": n, "atoms": r["atoms"], "E_f": r["E_f"], "dE_f": r.get("dE_f")}
-              for n, r in zip(ns, rows)]
-    table = format_table(["n", "atoms", "E_f*/eV", "change/eV"],
-                         [[x["n"], x["atoms"], x["E_f"], x["dE_f"]] for x in series],
-                         f"CASTEP size series of {name} (series_tol {p.s.series_tol:g} eV; "
-                         "the jobs are in series/run/)")
-    return {"converged": converged, "series": series,
-            "choice": (ns[-2] if p.s.series_choice == "smaller" else ns[-1]) if converged else None,
-            "_note": (f"converged: E_f* changed by {rows[-1]['dE_f']:+.4f} eV from size {ns[-2]} "
-                      f"to {ns[-1]}" if converged else f"not converged within sizes {ns}"),
-            "_table": table}
-
-
-# B4 (optional): MACE fine-tuning data from the series' smallest-cell relaxation. Every geometry
-# step with energy and forces (read_trajectory, all runs of the job; steps with a force above
-# 2 eV/A left out) goes into B_candidates/finetune/train.xyz (REF_energy, REF_forces), and
-# finetune.sh runs mace_run_train from mace_model on it (finetune_args adds options). Run it
-# yourself (a GPU helps), then set finetuned_model to the .model it writes: C1 uses it (B2 and
-# B3 keep mace_model, so they don't run again).
-#   Called by: main() (step B4)
-#   Calls:     read_trajectory()
-def step_finetune(p):
-    if not p.s.finetune:
-        return {"skipped": True, "_note": "finetune : false"}
-    import ase.io
-    d = p.phase_dir("B") / "finetune"
-    d.mkdir(parents=True, exist_ok=True)
-    series = p.out("series")
-    if series.get("skipped"):
-        die("finetune : true needs the size series (B3), which supercell skipped")
-    run = p.dir / "B_candidates" / "series" / "run"
-    castep = sorted(run.glob("*/sc_*_defect_geom.castep"),
-                    key=lambda f: len(f.read_text(errors="replace")))
-    if not castep:
-        die(f"no relaxation output found under {run}")
-    first = min(castep, key=lambda f: int(sc.re.findall(r"\d+", f.parent.name)[0]))
-    images = []
-    for a, e, f in read_trajectory(first.read_text(errors="replace")):
-        if np.abs(f).max() > 2.0:                     # far from the minimum: leave out
-            continue
-        a.info["REF_energy"] = e
-        a.arrays["REF_forces"] = f
-        images.append(a)
-    if not images:
-        log(f"WARNING: no geometry steps with forces in {first}; nothing to fine-tune on")
-        return {"images": 0, "_note": "no training data"}
-    ase.io.write(str(d / "train.xyz"), images, format="extxyz")
-    script = ("#!/bin/bash\n# Fine-tune the MACE foundation model on the size series' CASTEP data "
-              "(written by dwf.py, step B4)\n"
-              f"mace_run_train --name=dwf_finetuned --foundation_model={p.s.mace_model} "
-              "--multiheads_finetuning=False --train_file=train.xyz --valid_fraction=0.1 "
-              "--energy_key=REF_energy --forces_key=REF_forces --E0s=average --loss=weighted "
-              "--energy_weight=1 --forces_weight=10 --max_num_epochs=50 --batch_size=2 "
-              f"--default_dtype=float64 --device={p.s.mace_device} {p.s.finetune_args}\n"
-              f"# then set  finetuned_model : {(d / 'dwf_finetuned.model').resolve()}  in the "
-              "project file (C1 uses it)\n")
-    (d / "finetune.sh").write_text(script)
-    (d / "finetune.sh").chmod(0o755)
-    return {"images": len(images), "train": str((d / "train.xyz").relative_to(p.dir)),
-            "script": str((d / "finetune.sh").relative_to(p.dir)),
-            "_note": f"{len(images)} structures in train.xyz: to use them, run finetune.sh and "
-                     "set finetuned_model (C1 uses it)"}
-
-
-# B5: the supercell for C and D: supercell : n if given, else the size series' choice (the
-# smaller of the two sizes that agreed within series_tol, or the larger with series_choice :
-# larger). Stops if the series did not converge. Every arrangement of one composition uses this
-# cell, so their energies can be compared directly.
-#   Called by: main() (step B5)
-#   Calls:     Project.host(), Project.supercell_matrix(), host_supercell(),
-#              sc.min_image_distance()
-def step_choose(p):
-    if p.s.supercell:
-        n, why = p.s.supercell, "supercell in the project file"
+# The supercell matrix P (the supercell is P x the primitive cell) for a size: ['n', n] is n x
+# transform (n x n x n primitive cells without it); ['length', L] the most compact supercell whose
+# periodic images are all at least L apart: n x transform for the smallest n that gives it, or
+# without transform doped's search for the most compact cell (get_ideal_supercell_matrix), or,
+# without doped, n x n x n primitive cells. The matrix is Minkowski-reduced (the same supercell
+# with its shortest vectors as lattice vectors) and right-handed.
+#   Called by: size_ladder(), step_choose()
+#   Calls:     min_image()
+def size_matrix(p, prim, size):
+    kind, value = size
+    cell = np.asarray(prim.cell, float)
+    T = (np.reshape(p.s.transform, (3, 3)) if p.s.transform else np.eye(3)).astype(int)
+    if kind == "n":
+        P = value * T
+    elif p.s.transform:
+        n = 1
+        while min_image(n * T @ cell) < value - 1e-6:
+            n += 1
+        P = n * T
     else:
-        s = p.out("series")
-        if not s.get("converged"):
-            die("the size series did not converge within sizes "
-                f"{[x['n'] for x in s.get('series', [])]}: add bigger "
-                "sizes to series_sizes (or raise series_tol), or choose the cell yourself with "
-                "supercell : n")
-        n, why = s["choice"], "size series"
+        P = None
+        try:
+            import warnings
+            warnings.filterwarnings("ignore")
+            from doped.generation import get_ideal_supercell_matrix
+            from pymatgen.io.ase import AseAtomsAdaptor
+            P = get_ideal_supercell_matrix(AseAtomsAdaptor.get_structure(prim),
+                                           min_image_distance=value, min_atoms=0,
+                                           ideal_threshold=0)
+        except ImportError:
+            log("note: without doped (pip install doped) the supercells are n x n x n primitive "
+                "cells; doped finds more compact ones, or give a transform")
+        if P is None:
+            n = 1
+            while min_image(n * cell) < value - 1e-6:
+                n += 1
+            P = n * np.eye(3, dtype=int)
+        P = np.rint(P).astype(int)
+    _, op = Cell(P @ cell).minkowski_reduce()
+    P = np.rint(op @ P).astype(int)
+    return (-P if np.linalg.det(P) < 0 else P).tolist()
+
+
+# A size of the ladder: its supercell matrix, the atoms of the pristine supercell, its shortest
+# image distance (L, Ang) and the length it was made for (None for a size given as n).
+#   Called by: size_ladder(), step_choose()
+#   Calls:     min_image()
+def cell_record(prim, P, length=None):
+    P = np.asarray(P, int)
+    return {"matrix": P.tolist(), "natoms": int(round(abs(np.linalg.det(P)))) * len(prim),
+            "L": round(min_image(P @ np.asarray(prim.cell, float)), 4), "length": length}
+
+
+# Puts a size into a ladder (a list of cell_record dicts, smallest image distance first) unless the
+# same supercell is there already (the same lattice: one matrix is an integer recombination of the
+# other), giving it a tag for job names, n<atoms> (with b, c, ... for another cell with as many
+# atoms). Returns the ladder's record of that supercell.
+#   Called by: size_ladder(), step_choose()
+def add_cell(ladder, rec):
+    P = np.array(rec["matrix"], float)
+    for c in ladder:
+        M = np.array(c["matrix"], float) @ np.linalg.inv(P)
+        if np.allclose(M, np.rint(M), atol=1e-6) and abs(abs(np.linalg.det(M)) - 1) < 1e-6:
+            return c
+    tags = {c["tag"] for c in ladder}
+    tag = next(f"n{rec['natoms']}{s}" for s in ("",) + tuple("bcdefghijk")
+               if f"n{rec['natoms']}{s}" not in tags)
+    rec = dict(rec, tag=tag)
+    ladder.append(rec)
+    ladder.sort(key=lambda c: (c["L"], c["natoms"]))
+    return rec
+
+
+# The size ladder: the supercell for each of scan_lengths (size_matrix), each supercell once,
+# smallest first. B2 scans it, B3 picks the screening cell from it and D0 steps through it. doped
+# takes seconds to find each cell, so the ladder is kept in B_candidates/ladder.json for the same
+# host cell, lengths and transform (and doped there or not).
+#   Called by: step_scan()
+#   Calls:     add_cell(), cell_record(), size_matrix(), write_json()
+def size_ladder(p, prim):
+    import importlib.util
+    key = hashlib.md5(json.dumps([np.asarray(prim.cell).round(6).tolist(),
+                                  prim.get_chemical_symbols(), sorted(p.s.scan_lengths),
+                                  p.s.transform, importlib.util.find_spec("doped") is not None]
+                                 ).encode()).hexdigest()
+    f = p.phase_dir("B") / "ladder.json"
+    if f.exists():
+        saved = json.loads(f.read_text())
+        if saved.get("key") == key:
+            return saved["ladder"]
+    ladder = []
+    for L in sorted(set(p.s.scan_lengths)):
+        log(f"B2: the most compact supercell with its images at least {L:g} A apart")
+        add_cell(ladder, cell_record(prim, size_matrix(p, prim, ["length", L]), L))
+    write_json(f, {"key": key, "ladder": ladder})
+    return ladder
+
+
+# The sizes of a ladder as a table: tag, shortest image distance, atoms, the length asked for and
+# the supercell matrix.
+#   Called by: step_choose(), step_scan()
+#   Calls:     format_table()
+def ladder_table(ladder, title, mark=None):
+    return format_table(["size", "L/A", "atoms", "for", "matrix"],
+                        [[c["tag"] + (" <-" if c["tag"] == mark else ""), c["L"], c["natoms"],
+                          f"{c['length']:g} A" if c.get("length") else "",
+                          " / ".join(" ".join(map(str, r)) for r in c["matrix"])]
+                         for c in ladder], title)
+
+
+# B2: the size ladder (size_ladder: the supercell for each of scan_lengths) and, with mace : true
+# and scan : true, the MACE scan of every candidate. Each candidate is built in every size it fits
+# (fits) and relaxed with MACE (positions only, mace_model; mace_relaxations, on compute nodes
+# with mace_jobscript). Its relaxation energy (unrelaxed - relaxed) and the largest displacement
+# of the atoms at the cell's edge (further than EDGE_FRACTION of the shortest image distance from
+# the defect's centre) show whether the cell holds its relaxation: it is converged at the smallest
+# size whose relaxation energy is within scan_tol of that of every bigger size, with its edge
+# displacement below scan_edge_tol. One that never is (or fits only the largest size) is not
+# converged, and B3 counts it as needing the largest size.
+#   Called by: main() (step B2)
+#   Calls:     Project.host(), build_defect(), fits(), format_table(), ladder_table(),
+#              mace_cache(), mace_relaxations(), size_ladder(), sc.displacements(),
+#              sc.get_distances()
+def step_scan(p):
     prim = p.host()
-    P = p.supercell_matrix(n)
-    host = host_supercell(prim, P)
-    L = sc.min_image_distance(host.cell)
-    return {"n": n, "matrix": P.tolist(), "natoms": len(host), "L_min": L,
-            "_note": f"size {n}: {len(host)} atoms, images {L:.2f} A apart ({why})"}
+    ladder = size_ladder(p, prim)
+    sizes = ladder_table(ladder, "The size ladder (scan_lengths): the most compact supercell for "
+                                 "each length")
+    if not (p.s.mace and p.s.scan):
+        return {"ladder": ladder, "candidates": {}, "_table": sizes,
+                "_note": f"{len(ladder)} sizes; no MACE scan (mace or scan is false)"}
+    cands = p.out("generate")["candidates"]
+    tasks, plan = [], {}
+    for cid, c in cands.items():
+        for cell in ladder:
+            if not fits(c, cell["L"]):
+                continue
+            atoms, info = build_defect(prim, np.array(cell["matrix"]), c["comps"],
+                                       f"{cid} ({c['name']})")
+            cache = mace_cache(p, cid, cell["tag"])
+            tasks.append({"atoms": atoms, "cache": cache,
+                          "label": f"{cid} {c['name']} in {cell['tag']}"})
+            plan[(cid, cell["tag"])] = (atoms, info, cache)
+    res = mace_relaxations(p, "scan", tasks)
+    if res is None:
+        return None
+    out, rows = {}, []
+    for cid, c in cands.items():
+        seen = []
+        for cell in ladder:
+            if (cid, cell["tag"]) not in plan:
+                continue
+            atoms, info, cache = plan[(cid, cell["tag"])]
+            relaxed, e0, e1, steps = res[str(cache)]
+            moved = sc.displacements(atoms, relaxed)
+            _, r = sc.get_distances(np.array(info["centre"])[None], atoms.positions,
+                                    cell=atoms.cell, pbc=True)
+            edge = moved[r[0] > EDGE_FRACTION * cell["L"]]
+            seen.append({"tag": cell["tag"], "L": cell["L"], "E_relax": round(e0 - e1, 5),
+                         "edge": round(float(edge.max()) if edge.size else 0.0, 4),
+                         "steps": steps})
+        conv = next((x["tag"] for i, x in enumerate(seen[:-1])
+                     if x["edge"] < p.s.scan_edge_tol and
+                     all(abs(y["E_relax"] - x["E_relax"]) < p.s.scan_tol for y in seen[i + 1:])),
+                    None)
+        out[cid] = {"sizes": seen, "converged": conv}
+        by = {x["tag"]: x for x in seen}
+        here = by.get(conv)
+        rows.append([cid, c["name"]]
+                    + [f"{by[t]['E_relax']:.3f}" + ("*" if t == conv else "") if t in by else ""
+                       for t in (cell["tag"] for cell in ladder)]
+                    + [f"{here['L']:.2f}" if here else "not converged",
+                       here["edge"] if here else None])
+    table = format_table(["id", "defect"] + [cell["tag"] for cell in ladder]
+                         + ["converged at L/A", "edge move/A"], rows,
+                         "MACE relaxation energies (eV) of each candidate in each size; * where "
+                         f"it is converged (within scan_tol {p.s.scan_tol:g} eV of every bigger "
+                         f"size, edge atoms moved less than scan_edge_tol {p.s.scan_edge_tol:g} "
+                         "A)")
+    bad = sorted(cid for cid, x in out.items() if not x["converged"])
+    if bad:
+        log(f"note: B2: {len(bad)} candidates did not converge within the ladder (up to "
+            f"{ladder[-1]['L']:.1f} A): {', '.join(bad)}; B3 counts them as needing the largest "
+            "size")
+    return {"ladder": ladder, "candidates": out, "_table": sizes + "\n" + table,
+            "_note": f"{len(ladder)} sizes, {len(out) - len(bad)} of {len(out)} candidates "
+                     "converged" + (f" ({', '.join(bad)} not)" if bad else "")}
+
+
+# The band edges of a .bands of the host primitive cell (read_bands; A2.2's) and their effective
+# masses. For the VBM and the CBM: the k-points where it is (the star of the k-point CASTEP gives,
+# fractional) and the lightest mass (in m_e) of the bands that meet there, from the nearest
+# k-points around it, E = E_edge -+ hbar^2 dk^2 / 2m*: each nearest k-point gives a mass, and the
+# lightest (the direction and band whose defect levels reach furthest) is taken. The .bands'
+# k-points are unfolded with the host's symmetry operations and time reversal, so the irreducible
+# wedge CASTEP writes is enough. Returns {'vbm': {'k', 'mass', 'energy'}, 'cbm': {...}}; a mass is
+# None when the k-points don't show the band curving away from the edge (a grid too coarse, or an
+# edge between grid points).
+#   Called by: step_choose()
+#   Calls:     occupied_bands(), symmetry_ops()
+def band_masses(b, prim):
+    occ = occupied_bands(b)
+    eig, kf = b["eig"], np.asarray(b["kpts"], float)
+    rots, _ = symmetry_ops(prim)
+    recip = 2 * np.pi * np.linalg.inv(np.asarray(prim.cell, float)).T
+    imgs = np.concatenate([s * kf @ R for R in rots for s in (1, -1)])
+    src = np.tile(np.arange(len(kf)), 2 * len(rots))
+    shifts = np.array(list(itertools.product((-1, 0, 1), repeat=3)))
+    out = {}
+    for edge, sign in (("vbm", -1), ("cbm", 1)):
+        top = [(sign * eig[s, k, occ[s] - (sign < 0)], s, k) for s in range(b["nspin"])
+               for k in range(len(kf)) if np.isfinite(eig[s, k, occ[s] - (sign < 0)])]
+        _, s0, k0 = min(top)
+        e0 = float(eig[s0, k0, occ[s0] - (sign < 0)])
+        dk = imgs - kf[k0]
+        dk -= np.round(dk)
+        dist = np.linalg.norm((dk[:, None, :] + shifts[None]) @ recip, axis=2).min(axis=1)
+        star = [kf[k0]]
+        for x in (imgs[src == k0] % 1.0):
+            if not any(np.allclose((x - y + 0.5) % 1.0 - 0.5, 0, atol=1e-5) for y in star):
+                star.append(x)
+        near = dist > 1e-6
+        shell = near & (dist <= 1.05 * dist[near].min()) if near.any() else near
+        masses = []
+        for s in range(b["nspin"]):
+            band_range = range(occ[s]) if sign < 0 else range(occ[s], eig.shape[2])
+            for n in band_range:
+                if not (np.isfinite(eig[s, k0, n]) and abs(eig[s, k0, n] - e0) < 0.05):
+                    continue
+                for j in np.flatnonzero(shell):
+                    de = sign * (eig[s, src[j], n] - e0)
+                    if de > 1e-4:
+                        masses.append(HB2M * dist[j] ** 2 / de)
+        out[edge] = {"k": [np.round(x, 6).tolist() for x in star], "energy": e0,
+                     "mass": round(min(masses), 4) if masses else None}
+    return out
+
+
+# Whether a k-point of the primitive cell (fractional) folds onto Gamma of the supercell P x
+# (primitive cell): its coordinates in the supercell's reciprocal lattice, k P^T, are whole
+# numbers.
+#   Called by: step_choose()
+def folds_to_gamma(k, P):
+    f = np.asarray(k, float) @ np.asarray(P, float).T
+    return bool(np.allclose(f, np.rint(f), atol=1e-4))
+
+
+# The Gamma-only floor (B3): the shortest image distance a supercell needs for Gamma-point
+# screening to see a defect's levels as an isolated defect has them. A level E_b inside the gap
+# decays away from the defect as exp(-r/xi), with 1/xi^2 = (2 m*/hbar^2) E_b (1 - E_b/E_g) in a
+# two-band (Kane) model; neighbouring images overlap, and the level spreads into a band, unless
+# they are several xi apart. The floor is FLOOR_DECAYS xi of the shallowest level that counts as
+# deep (E_b = deep_level_margin), for the lighter of the hole and electron masses (band_masses)
+# and A2.2's gap. screen_min_image instead, if given (0: no floor). Returns {'L', 'source', ...}
+# or None (no floor, or the masses couldn't be found: a warning says to set screen_min_image).
+#   Called by: step_choose()
+def gamma_floor(p, masses):
+    if p.s.screen_min_image is not None:
+        return ({"L": p.s.screen_min_image, "source": "screen_min_image"}
+                if p.s.screen_min_image > 0 else None)
+    eb, eg = p.s.deep_level_margin, p.out("bands")["gap"]
+    if eb >= eg:
+        log(f"note: B3: no Gamma-only floor: deep_level_margin {eb:g} eV is not inside the gap")
+        return None
+    best = None
+    for edge, what in (("vbm", "holes"), ("cbm", "electrons")):
+        m = masses[edge]["mass"]
+        if m:
+            xi = 1 / math.sqrt(m * eb * (1 - eb / eg) / HB2M)
+            if best is None or xi > best["xi"]:
+                best = {"L": round(FLOOR_DECAYS * xi, 2), "xi": round(xi, 3), "mass": m,
+                        "edge": edge, "carrier": what, "E_b": eb, "gap": round(eg, 4),
+                        "source": "band masses"}
+    if best is None:
+        log("WARNING: B3: the effective masses could not be found from A2.2's band edges (its "
+            "k-point grid may be too coarse), so there is no Gamma-only floor: set "
+            "screen_min_image (Ang) to give one")
+    return best
+
+
+# B3: the screening cell, which every candidate in C is built in and D0's size series starts from.
+# supercell if given (n x transform, or the most compact cell for a length); otherwise the smallest
+# size of the ladder at least as big as every candidate's converged size (B2; a candidate that never
+# converged counts as needing the largest size) and as the Gamma-only floor (gamma_floor), with
+# what set it. A floor beyond the ladder gets a cell of its own, added to the ladder. Also says
+# whether A2.2's band edges fold onto Gamma of this cell (folds_to_gamma): if not, the
+# Gamma-point screening sees a wider gap (C2 measures it).
+#   Called by: main() (step B3)
+#   Calls:     Project.host(), add_cell(), band_masses(), cell_record(), folds_to_gamma(),
+#              format_table(), gamma_floor(), ladder_table(), read_bands(), size_matrix()
+def step_choose(p):
+    prim = p.host()
+    scan = p.out("scan")
+    ladder = [dict(c) for c in scan["ladder"]]
+    masses = band_masses(read_bands(p.dir / p.out("bands")["bands_file"]), prim)
+    floor = gamma_floor(p, masses)
+    conv, set_by = scan.get("candidates") or {}, None
+    if p.s.supercell:
+        kind, value = p.s.supercell
+        cell = add_cell(ladder, cell_record(prim, size_matrix(p, prim, p.s.supercell),
+                                            value if kind == "length" else None))
+        why = f"supercell : {p.raw['supercell']}"
+        if floor and cell["L"] < floor["L"] - 1e-6:
+            log(f"WARNING: B3: the supercell's images are {cell['L']:.2f} A apart, less than the "
+                f"Gamma-only floor ({floor['L']:.2f} A): the Gamma-point screening may see its "
+                "defect levels spread into bands (C2b measures it)")
+    else:
+        if not conv and not floor:
+            die("B3 has nothing to choose the screening cell from: without the MACE scan (mace "
+                "or scan false) give supercell (n, or a length such as 15 ang) or "
+                "screen_min_image")
+        need = 0.0
+        L = {c["tag"]: c["L"] for c in ladder}
+        for cid in sorted(conv):
+            x = L[conv[cid]["converged"]] if conv[cid]["converged"] else ladder[-1]["L"]
+            if x > need + 1e-6:
+                need, set_by = x, cid
+        if floor and floor["L"] > need + 1e-6:
+            need, set_by = floor["L"], "floor"
+        cell = next((c for c in ladder if c["L"] >= need - 1e-6), None)
+        if cell is None:
+            log(f"note: B3: the Gamma-only floor ({need:.2f} A) is beyond the ladder (up to "
+                f"{ladder[-1]['L']:.2f} A): the screening cell is made for it")
+            cell = add_cell(ladder, cell_record(prim, size_matrix(p, prim, ["length", need]),
+                                                need))
+        if set_by == "floor":
+            why = f"the Gamma-only floor, {floor['L']:.2f} A"
+        else:
+            r = conv[set_by]
+            why = (f"{set_by} {p.out('generate')['candidates'][set_by]['name']}, "
+                   + (f"converged at {L[r['converged']]:.2f} A" if r["converged"] else
+                      "not converged in the ladder"))
+    fold = {e: any(folds_to_gamma(k, cell["matrix"]) for k in masses[e]["k"])
+            for e in ("vbm", "cbm")}
+    if not all(fold.values()):
+        log("WARNING: B3: " + " and ".join(e.upper() for e, ok in fold.items() if not ok)
+            + " of the host (A2.2) don't fold onto Gamma of the screening cell, so the Gamma-point "
+            "screening sees a wider gap and may misjudge levels near the edges (C2 measures it)")
+    rows = [[e.upper(), " ".join(f"{x:.3f}" for x in masses[e]["k"][0]), masses[e]["energy"],
+             masses[e]["mass"], "yes" if fold[e] else "NO"] for e in ("vbm", "cbm")]
+    table = (ladder_table(ladder, f"The screening cell: {cell['tag']} ({why})", cell["tag"])
+             + "\n" + format_table(["edge", "k (fractional)", "E/eV", "m*/m_e", "folds to Gamma"],
+                                   rows, "Band edges (A2.2) and their effective masses")
+             + (f"\nGamma-only floor: {floor['L']:.2f} A ("
+                + (f"{FLOOR_DECAYS:g} x the decay length {floor['xi']:.2f} A of a level "
+                   f"{floor['E_b']:g} eV from the band edge of the {floor['carrier']}, m* "
+                   f"{floor['mass']:.3g} m_e, gap {floor['gap']:.2f} eV)"
+                   if floor["source"] == "band masses" else "screen_min_image)") + "\n"
+                if floor else "\nGamma-only floor: none\n"))
+    idx = ladder.index(cell)
+    return {"matrix": cell["matrix"], "natoms": cell["natoms"], "L_min": cell["L"],
+            "tag": cell["tag"], "ladder": ladder, "index": idx, "floor": floor,
+            "set_by": set_by, "masses": masses, "fold": fold, "_table": table,
+            "_note": f"{cell['tag']}: {cell['natoms']} atoms, images {cell['L']:.2f} A apart "
+                     f"({why})"}
 
 
 # ==========================================================================================
-# PHASE C: SCREENING AND GROUND STATES (flowchart C1-C6)
+# PHASE C: SCREENING AND GROUND STATES (flowchart C1-C7)
 # ==========================================================================================
-# The candidates (B1) and the chosen supercell (B5): (candidates by id, primitive host, matrix).
-#   Called by: step_distort(), step_filter(), step_prerelax(), step_screen()
+# The candidates (B1) and the screening cell (B3): (candidates by id, primitive host, matrix).
+#   Called by: step_dispersion(), step_distort(), step_filter(), step_prerelax(), step_screen()
 #   Calls:     Project.host()
 def screen_setup(p):
     return p.out("generate")["candidates"], p.host(), np.array(p.out("choose")["matrix"])
@@ -2382,7 +2991,7 @@ def screen_setup(p):
 
 # The .param keywords of the screening runs: screen_cutoff, screen_max_steps and
 # %block screen_overrides.
-#   Called by: excite_job(), screen_job(), step_screen()
+#   Called by: excite_job(), screen_job(), step_dispersion(), step_screen()
 def screen_overrides(p):
     o = {"geom_max_iter": p.s.screen_max_steps}
     if p.s.screen_cutoff:
@@ -2394,7 +3003,7 @@ def screen_overrides(p):
 # A screening or distortion job for one structure in charge state q, starting with spin S
 # (spin_polarized, spin : S, and SPIN=S on the anchor atom when there is one): a Gamma-point
 # relaxation without symmetry, with the screening keywords.
-#   Called by: excite_job(), run_screen_jobs(), step_screen()
+#   Called by: excite_job(), run_screen_jobs(), step_dispersion(), step_screen()
 #   Calls:     screen_overrides()
 def screen_job(p, name, atoms, info, q, S):
     a = atoms.copy()
@@ -2442,36 +3051,44 @@ def problem_table(runs):
 
 
 # --------------------------------------------------------------------------
-# C1, C2
+# C1, C2, C2b
 # --------------------------------------------------------------------------
-# C1: builds every candidate in the B5 supercell (build_defect) and, with mace : true, relaxes
-# it with MACE (positions only, the cell fixed; finetuned_model if given, else mace_model). A pair
-# too far apart for this cell (more than half the shortest image distance) is left out. With
+# C1: builds every candidate in the screening cell (B3; build_defect) and, with mace : true,
+# relaxes it with MACE (positions only, the cell fixed, mace_model): B2's relaxation in that cell
+# when it ran there (the same cache file), else a new one (mace_relaxations, on compute nodes with
+# mace_jobscript). A pair too far apart for this cell (fits) is left out. With
 # configuration_margin (and MACE), arrangements whose configurational energy (MACE energy above
 # the lowest arrangement of the same composition) is more than configuration_margin are dropped.
 # Each structure is saved as C_screen/structures/candidates/<id>.cell, and the results give where
 # its defect is (its centre, each component's position, the anchor atom's index, the vacancies)
 # and its MACE energy.
 #   Called by: main() (step C1)
-#   Calls:     Project.file(), build_defect(), format_table(), mace_relax(), save_cell(),
-#              screen_setup()
+#   Calls:     build_defect(), fits(), format_table(), mace_cache(), mace_relaxations(),
+#              save_cell(), screen_setup()
 def step_prerelax(p):
     cands, prim, P = screen_setup(p)
     d = p.phase_dir("C")
-    L = p.out("choose")["L_min"]
-    defects, skipped, energies = {}, {}, {}
-    model = p.file("finetuned_model") if p.s.finetuned_model else None
+    choose = p.out("choose")
+    L, tag = choose["L_min"], choose["tag"]
+    built, skipped, energies, defects = {}, {}, {}, {}
     for cid, c in cands.items():
-        if c["separation"] and c["separation"] > L / 2 - 0.05:
+        if not fits(c, L):
             skipped[cid] = f"components {c['separation']:.2f} A apart, too far for this cell"
             continue
-        atoms, info = build_defect(prim, P, c["comps"], f"{cid} ({c['name']})")
+        built[cid] = build_defect(prim, P, c["comps"], f"{cid} ({c['name']})")
+    if p.s.mace:
+        res = mace_relaxations(p, "prerelax",
+                               [{"atoms": atoms, "cache": mace_cache(p, cid, tag),
+                                 "label": f"{cid} {cands[cid]['name']} in {tag}"}
+                                for cid, (atoms, _) in built.items()])
+        if res is None:
+            return None
+    for cid, (atoms, info) in built.items():
         e = None
         if p.s.mace:
-            log(f"C1: {cid} {c['name']}: MACE pre-relaxation ({len(atoms)} atoms)")
-            atoms, e0, e, steps = mace_relax(p, atoms, d / "mace" / f"{cid}.json", model)
-        title = f"{cid} {c['name']} in the chosen supercell" + (", MACE pre-relaxed"
-                                                                 if p.s.mace else "")
+            atoms, _, e, _ = res[str(mace_cache(p, cid, tag))]
+        title = f"{cid} {cands[cid]['name']} in the screening cell" + (", MACE pre-relaxed"
+                                                                        if p.s.mace else "")
         defects[cid] = dict(structure=save_cell(p, d / "structures" / "candidates" / f"{cid}.cell",
                                                 atoms, title), mace_energy=e, **info)
         energies[cid] = e
@@ -2502,7 +3119,9 @@ def step_prerelax(p):
 # the spin is not held fixed), plus the pristine supercell at the same settings for the band edges
 # and host energy. All at the Gamma point with the screening keywords; failures are flagged, not
 # rescued (runner group 'screen': max_restarts 0, tolerate_failures). The results give each run's
-# energy, final spin and gap levels, and the pristine cell's band edges.
+# energy, final spin and gap levels, and the pristine cell's band edges. The pristine cell's gap
+# at Gamma is checked against A2.2's: one more than FOLD_GAP_TOL wider means band edges that don't
+# fold onto Gamma of this cell (B3 names them), which the Gamma-point levels are measured against.
 #   Called by: main() (step C2)
 #   Calls:     Project.batch(), Project.production_param(), band_edges(), host_supercell(),
 #              job_summary(), load_cell(), problem_table(), qtag(), read_bands(), screen_job(),
@@ -2530,7 +3149,15 @@ def step_screen(p):
         die(f"the pristine screening cell did not finish ({hc.dir}); the band edges and host "
             "energy come from it")
     vbm, cbm = band_edges(read_bands(hc.dir / f"{hc.seed}.bands"))
-    host_out = {"energy": res["jobs"]["host"]["energy"], "vbm": vbm, "cbm": cbm, "gap": cbm - vbm}
+    wider = (cbm - vbm) - p.out("bands")["gap"]
+    host_out = {"energy": res["jobs"]["host"]["energy"], "vbm": vbm, "cbm": cbm, "gap": cbm - vbm,
+                "gap_A22": p.out("bands")["gap"], "folded": wider <= FOLD_GAP_TOL}
+    if wider > FOLD_GAP_TOL:
+        log(f"WARNING: C2: the screening cell's gap at Gamma ({cbm - vbm:.3f} eV) is {wider:.3f} "
+            f"eV wider than the host's (A2.2, {p.out('bands')['gap']:.3f} eV): its band edges "
+            "don't fold onto Gamma of this cell (see B3), so levels near the edges are measured "
+            "against edges that are too far out. A cell that folds them (another supercell, or "
+            "transform) avoids it; a bigger level_margin makes it matter less")
     runs = {}
     for name, meta in plan.items():
         runs[name] = dict(meta, **job_summary(p, res, name, (vbm, cbm),
@@ -2538,7 +3165,155 @@ def step_screen(p):
     bad = sum(r["energy"] is None for r in runs.values())
     return {"host": host_out, "runs": runs, "_table": problem_table(runs),
             "_note": f"{len(runs)} runs, gap {cbm - vbm:.2f} eV at Gamma"
+                     + (f" ({wider:+.2f} eV against A2.2: band edges not at Gamma)"
+                        if wider > FOLD_GAP_TOL else "")
                      + (f", {bad} without a usable energy" if bad else "")}
+
+
+# How the gap levels of one defect calculation on a k-point grid spread across its k-points (C2b),
+# from its .bands and the pristine cell's at the same settings (both read_bands): the host's band
+# edges over the grid; the defect's bands that are in the gap at Gamma (more than margin inside);
+# for each, its width W (highest minus lowest energy over the k-points) and whether it crosses
+# into a band at some k-point; and, in each spin channel, whether its highest occupied band at
+# some k-point is above its lowest empty one at another (the occupations would change across the
+# k-points, which a calculation with fixed occupations can't show). Returns {'W' (the largest),
+# 'levels', 'crossing', 'overlap'}.
+#   Called by: step_dispersion()
+#   Calls:     occupied_bands()
+def level_dispersion(bd, bh, margin):
+    occ_h, occ = occupied_bands(bh), occupied_bands(bd)
+    vbm = max(np.nanmax(bh["eig"][s, :, occ_h[s] - 1]) for s in range(bh["nspin"]))
+    cbm = min(np.nanmin(bh["eig"][s, :, occ_h[s]]) for s in range(bh["nspin"]))
+    g = int(np.argmin(np.abs(bd["kpts"] - np.round(bd["kpts"])).sum(axis=1)))
+    levels, overlap = [], False
+    for s in range(bd["nspin"]):
+        e = bd["eig"][s]
+        if np.nanmax(e[:, occ[s] - 1]) > np.nanmin(e[:, occ[s]]):
+            overlap = True
+        for n in range(e.shape[1]):
+            if np.isfinite(e[g, n]) and vbm + margin < e[g, n] < cbm - margin:
+                band = e[:, n]
+                levels.append({"spin": s, "band": n + 1, "e": round(float(band[g] - vbm), 4),
+                               "W": round(float(np.nanmax(band) - np.nanmin(band)), 4),
+                               "occupied": n < occ[s],
+                               "crossing": bool(np.nanmin(band) <= vbm + margin or
+                                                np.nanmax(band) >= cbm - margin)})
+    return {"W": max((x["W"] for x in levels), default=0.0), "levels": levels,
+            "crossing": any(x["crossing"] for x in levels), "overlap": overlap}
+
+
+# C2b: the Gamma-only check (dispersion_check : warn, the default, or stop; off skips it). One
+# defect - dispersion_defect (an id, or id:q for one charge state), else the screened state whose
+# gap level is nearest a band edge (the most spread-out level, the first to feel its images) - is
+# run as a single point on a Gamma-centred 2x2x2 k-point grid in the screening cell and in the size
+# below it (B3's ladder; its structure carried over, carry_over), with each pristine cell at the
+# same settings for the band edges. How much its gap levels change across the k-points
+# (level_dispersion: W) measures how much its images interact: W falls as exp(-d/xi) with the image
+# distance d, so the two sizes give xi, xi = (d2 - d1) / ln(W1/W2), and the image distance at which
+# W would be dispersion_tol. The screening cell passes if its W is below dispersion_tol and no level
+# crosses into a band or changes occupation across the k-points. If not, a warning; with stop, C3
+# stops before it filters (raise the floor with screen_min_image, or set supercell, and rerun).
+#   Called by: main() (step C2b)
+#   Calls:     Project.batch(), Project.production_param(), carry_over(), fits(),
+#              format_table(), host_supercell(), level_dispersion(), load_cell(), qtag(),
+#              read_bands(), screen_job(), screen_overrides(), screen_setup(), start_spin()
+def step_dispersion(p):
+    if p.s.dispersion_check == "off":
+        return {"skipped": True, "ok": None, "_note": "dispersion_check : off"}
+    cands, prim, P = screen_setup(p)
+    choose, scr = p.out("choose"), p.out("screen")
+    runs, host_s = scr["runs"], scr["host"]
+    pick = None
+    if p.s.dispersion_defect:
+        cid, _, qs = p.s.dispersion_defect.partition(":")
+        mine = [(r["energy"], n) for n, r in runs.items() if r["cand"] == cid and r["energy"]
+                is not None and (not qs or r["q"] == int(qs))]
+        if not mine:
+            die(f"dispersion_defect {p.s.dispersion_defect}: no screened run of it with a usable "
+                "energy (C2)")
+        pick = min(mine)[1]
+    else:
+        near = [(min(min(x["e"], host_s["gap"] - x["e"]) for x in r["levels"]), n)
+                for n, r in sorted(runs.items()) if r["energy"] is not None and r["levels"]]
+        if near:
+            pick = min(near)[1]
+    if pick is None:
+        return {"skipped": True, "ok": None,
+                "_note": "no screened state has a level in the gap, so there is nothing to check"}
+    r = runs[pick]
+    c = cands[r["cand"]]
+    ladder, idx = choose["ladder"], choose["index"]
+    sizes = [ladder[i] for i in (idx - 1, idx) if i >= 0 and fits(c, ladder[i]["L"])]
+    atoms = load_cell(p, r["structure"])
+    info = p.out("prerelax")["defects"][r["cand"]]
+    S = start_spin(atoms, r["q"], r["spin"])
+    over = {k: v for k, v in screen_overrides(p).items() if k != "geom_max_iter"}
+    jobs, names = [], {}
+    for cell in sizes:
+        Q = np.array(cell["matrix"])
+        if cell["tag"] == choose["tag"]:
+            a, inf = atoms, info
+        else:
+            a, inf = carry_over(prim, c["comps"], P, atoms, Q, label=f"{r['cand']} ({c['name']})")
+        job = screen_job(p, f"{r['cand']}_{qtag(r['q'])}_{cell['tag']}", a, inf, r["q"], S)
+        job["overrides"].pop("geom_max_iter", None)
+        job.update(kind="sp", kgrid=[2, 2, 2], kpoint_offset="gamma")
+        jobs += [job, {"name": f"host_{cell['tag']}", "atoms": host_supercell(prim, Q),
+                       "kind": "sp", "kgrid": [2, 2, 2], "kpoint_offset": "gamma",
+                       "symmetry": True, "overrides": over}]
+        names[cell["tag"]] = (job["name"], f"host_{cell['tag']}")
+    res = p.batch("C_screen/jobs/dispersion", jobs, "dispersion", p.production_param())
+    if not res["complete"]:
+        return None
+    found, rows = [], []
+    for cell in sizes:
+        dn, hn = names[cell["tag"]]
+        files = [res["calcs"][n].dir / f"{res['calcs'][n].seed}.bands" for n in (dn, hn)]
+        if any(res["jobs"][n]["status"] != "done" for n in (dn, hn)) or \
+                not all(f.exists() for f in files):
+            log(f"WARNING: C2b: the dispersion runs in {cell['tag']} did not finish ("
+                + "; ".join(f"{n}: {res['jobs'][n]['status']}" for n in (dn, hn)) + ")")
+            continue
+        lv = level_dispersion(read_bands(files[0]), read_bands(files[1]), p.s.level_margin)
+        found.append(dict(lv, tag=cell["tag"], L=cell["L"]))
+        rows.append([cell["tag"], cell["L"], len(lv["levels"]), lv["W"],
+                     "yes" if lv["crossing"] else "no", "yes" if lv["overlap"] else "no"])
+    out = {"run": pick, "cand": r["cand"], "q": r["q"], "sizes": found, "xi": None,
+           "d_needed": None, "ok": None, "stop": None}
+    if not found or found[-1]["tag"] != choose["tag"]:
+        log("WARNING: C2b: the dispersion check did not run in the screening cell, so it says "
+            "nothing (see the runs in C_screen/jobs/dispersion)")
+        return dict(out, _note="no result in the screening cell (runs failed)",
+                    _table=format_table(["size", "L/A", "gap levels", "W/eV", "crosses a band",
+                                         "occupations change"], rows))
+    top, tol = found[-1], p.s.dispersion_tol
+    if len(found) == 2 and found[0]["W"] > top["W"] > 0:
+        out["xi"] = round((top["L"] - found[0]["L"]) / math.log(found[0]["W"] / top["W"]), 3)
+        out["d_needed"] = round(top["L"] + out["xi"] * math.log(top["W"] / tol), 2)
+    out["ok"] = top["W"] < tol and not top["crossing"] and not top["overlap"]
+    what = (f"{r['cand']} {c['name']} q {r['q']:+d}: W {top['W']:.3f} eV in the screening cell "
+            f"({top['L']:.2f} A)" + (f", xi {out['xi']:.2f} A: W < {tol:g} eV needs images "
+                                     f"{out['d_needed']:.1f} A apart" if out["xi"] else ""))
+    if not out["ok"]:
+        why = ([f"W above dispersion_tol {tol:g} eV"] if top["W"] >= tol else []) + \
+              (["a gap level crosses into a band at some k-point"] if top["crossing"] else []) + \
+              (["the occupations change across the k-points"] if top["overlap"] else [])
+        msg = (f"C2b: the screening cell may be too small for Gamma-point levels ({what}; "
+               + "; ".join(why) + "). Raise the floor with screen_min_image"
+               + (f" : {out['d_needed']:.1f} ang" if out["d_needed"] else "")
+               + " (or set supercell) and rerun with --redo C")
+        log("WARNING: " + msg)
+        if p.s.dispersion_check == "stop":
+            out["stop"] = msg + ", or set dispersion_check : warn to carry on with this cell"
+    floor = choose.get("floor") or {}
+    table = format_table(["size", "L/A", "gap levels", "W/eV", "crosses a band",
+                          "occupations change"], rows,
+                         f"Gamma-only check: {r['cand']} {c['name']} q {r['q']:+d} ({pick}) on a "
+                         f"Gamma-centred 2x2x2 grid (dispersion_tol {tol:g} eV)") + (
+        f"\nxi measured {out['xi']:.2f} A" + (f", estimated in B3 {floor['xi']:.2f} A"
+                                              if floor.get("xi") else "") + "\n"
+        if out["xi"] else "")
+    return dict(out, _table=table, _note=("ok: " if out["ok"] else "TOO SMALL? ") + what)
 
 
 # --------------------------------------------------------------------------
@@ -2604,11 +3379,14 @@ def duplicates(p, best, groups):
 # (duplicates) are dropped too. With excite : true, native defects (is_native) skip the property
 # filters (C7 passes them on to D whatever their excited states, for E), but not the hull or the
 # duplicates. The results list the survivors, with the charge states to carry on
-# (distort_charges); the table gives every candidate's verdict.
+# (distort_charges); the table gives every candidate's verdict. With dispersion_check : stop, a
+# screening cell C2b found too small stops the workflow here, before anything is filtered.
 #   Called by: main() (step C3)
 #   Calls:     best_states(), duplicates(), format_table(), host_supercell(), internal_pair(),
 #              is_native(), relative_formation(), screen_setup()
 def step_filter(p):
+    if p.out("dispersion").get("stop"):
+        die(p.out("dispersion")["stop"])
     cands, prim, P = screen_setup(p)
     scr = p.out("screen")
     host, runs = scr["host"], scr["runs"]
@@ -2745,7 +3523,7 @@ def neighbours_to_distort(comps, q, ox):
 
 # The final spin of a charge state's best screening run, as a starting spin with the right parity
 # for its electron count.
-#   Called by: step_distort(), step_excite(), step_rank()
+#   Called by: step_dispersion(), step_distort(), step_excite(), step_rank()
 #   Calls:     electron_parity()
 def start_spin(atoms, q, spin):
     par = electron_parity(atoms, q)
@@ -3188,13 +3966,13 @@ SCREEN_KEYS = ("screen_cutoff", "screen_max_steps", "screen_overrides", "level_m
 
 
 # ==========================================================================================
-# PHASE D: PRODUCTION RELAXATIONS (flowchart D1, D2)
+# PHASE D: PRODUCTION CELLS AND RELAXATIONS (flowchart D0-D2)
 # ==========================================================================================
 # The %block ionic_constraints that holds still every atom further than radius (Ang) from all of
 # the defect's components (points: their positions; three constraints per atom: x, y and z).
 # CASTEP numbers the atoms of each species in the order of the .cell, which keeps the order
 # within each species (written_order).
-#   Called by: step_production()
+#   Called by: production_job()
 #   Calls:     sc.get_distances()
 def freeze_block(atoms, points, radius):
     _, dist = sc.get_distances(np.atleast_2d(points), atoms.positions, cell=atoms.cell, pbc=True)
@@ -3213,95 +3991,343 @@ def freeze_block(atoms, points, radius):
             k // 3)
 
 
-# D1: the production relaxations. One job per structure phase C passed on (C7: the structures C6
-# kept, of the defects that passed C7 and of every native defect; all of them without excite): its
-# charge state,
-# starting spin (spin_polarized : true with spin S when S is not 0; a spin-0 state runs without
-# spin polarisation unless %block production_overrides sets spin_polarized), the production .param
-# with %block production_overrides, the production k-points, fixed cell, no symmetry; with
-# freeze_radius, the far atoms fixed (freeze_block). Plus the pristine supercell single point (with
-# symmetry). Runner group 'production' (restarts on; a job that fails is flagged and left out of
-# E). The relaxed structures go to D_production/structures/.
+# A production relaxation of one structure in charge state q, starting with spin S
+# (spin_polarized : true with spin S when S is not 0; a spin-0 state runs without spin
+# polarisation unless %block production_overrides sets spin_polarized, and with SPIN=S on the
+# anchor atom when there is one): the production .param with %block production_overrides, the
+# production k-points, fixed cell, no symmetry; with freeze_radius, the far atoms fixed
+# (freeze_block). info: where the defect is in this structure's cell (build_defect's). Returns
+# (job, how many atoms are fixed).
+#   Called by: step_cells(), step_production()
+#   Calls:     freeze_block()
+def production_job(p, name, atoms, info, q, S):
+    a = atoms.copy()
+    mags = np.zeros(len(a))
+    if S and info.get("anchor_index") is not None:
+        mags[info["anchor_index"]] = S
+    a.set_initial_magnetic_moments(mags)
+    o = dict(p.s.production_overrides, charge=q)
+    if S:
+        o.update(spin_polarized="true", spin=S)
+    else:                                   # (production_overrides can ask for spin_polarized)
+        o.setdefault("spin_polarized", "false")
+        o["spin"] = None
+    job = {"name": name, "atoms": a, "kind": "geom", "symmetry": False, "overrides": o}
+    fixed = 0
+    if p.s.freeze_radius:
+        block, fixed = freeze_block(a, info.get("points") or [info["centre"]], p.s.freeze_radius)
+        if block:
+            job["cell_extra"] = block
+    return job, fixed
+
+
+# What a finished production relaxation gave (from run_batch's results): its energy (None unless
+# it finished with a converged last SCF), final spin, status and why, geometry steps, restarts,
+# how many atoms were fixed, and its final structure, saved as <structdir>/<name>.cell. The
+# structure is also returned (None if there isn't one), for carrying on to another size.
+#   Called by: step_cells(), step_production()
+#   Calls:     save_cell(), sc.final_atoms()
+def production_summary(p, res, name, structdir, frozen=0):
+    r = res["jobs"][name]
+    e = r["energy"] if r["scf_converged"] and r["status"] == "done" else None
+    atoms = sc.final_atoms(res["calcs"][name]) if e is not None else None
+    if e is not None and atoms is None:
+        log(f"WARNING: could not read the relaxed structure of {name}")
+    path = (save_cell(p, structdir / f"{name}.cell", atoms,
+                      f"{name}: relaxed at the production settings") if atoms is not None
+            else None)
+    return {"job": name, "energy": e, "spin_final": r["spin"], "status": r["status"],
+            "reason": r["reason"], "steps": r["geom_steps"], "restarts": r["restarts"],
+            "final": path, "frozen": frozen}, atoms
+
+
+# D0: the production cell of every defect phase C passes on (C7's), converged at the production
+# settings; all the charge states of a defect share it. Each charge state's ground state (the
+# lowest structure C6 kept) is relaxed at the production settings (production_job) in the
+# screening cell and in the size below it (B3's ladder; the structure carried over, carry_over),
+# with the pristine supercell's single point in each (runner group 'production'). A defect is
+# converged at the smaller of two neighbouring sizes when every charge state's E_D - E_host +
+# E_corr (what goes into its formation energy; correction, in each cell's own shape) agrees within
+# series_tol and both relaxed into the same local structure (same_basin); otherwise the next size
+# up is run, carried over from the biggest one relaxed so far, and so on, up to the largest size of
+# the ladder, where a defect that still hasn't converged keeps that size and is flagged. Sizes a
+# pair doesn't fit (fits) are skipped; a charge state whose run failed is left out of the
+# comparison (with a warning). The results give each defect's cell, and every run, which D1 reuses.
+#   Called by: main() (step D0)
+#   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
+#              build_defect(), carry_over(), correction(), fits(), format_table(),
+#              host_supercell(), load_cell(), production_job(), production_summary(), qtag(),
+#              same_basin()
+def step_cells(p):
+    d = p.phase_dir("D")
+    structures = p.out("excite")["structures"]
+    if not structures:
+        die("phase C passed no structures on, so there is nothing to relax")
+    cands, prim = p.out("generate")["candidates"], p.host()
+    choose = p.out("choose")
+    ladder, idx, P0 = choose["ladder"], choose["index"], np.array(choose["matrix"])
+    eps = p.out("dielectric").get("eps0")
+    ground = {}
+    for t in structures:
+        if t["k"] == 0:
+            ground.setdefault(t["cand"], {})[t["q"]] = t
+    plan = {}
+    for cid in ground:
+        fit = [i for i in range(len(ladder)) if fits(cands[cid], ladder[i]["L"])]
+        start = [i for i in fit if i >= idx - 1][:2]
+        plan[cid] = {"sizes": start, "src": {i: None for i in start}, "cell": None,
+                     "converged": False, "why": ""}
+    done, rows, runs, hosts = {}, [], {}, {}
+    while True:
+        jobs, meta, frozen = [], {}, {}
+        used = sorted({i for x in plan.values() for i in x["sizes"]})
+        for i in used:
+            c = ladder[i]
+            jobs.append({"name": f"host_{c['tag']}", "atoms": host_supercell(prim,
+                                                                          np.array(c["matrix"])),
+                         "kind": "sp", "symmetry": True,
+                         "overrides": dict(p.s.production_overrides)})
+        for cid, x in plan.items():
+            comps, label = cands[cid]["comps"], f"{cid} ({cands[cid]['name']})"
+            for i in x["sizes"]:
+                c = ladder[i]
+                Q = np.array(c["matrix"])
+                for q, t in sorted(ground[cid].items()):
+                    name = f"{cid}_{qtag(q)}_{c['tag']}"
+                    s = x["src"][i]                # the size it is carried from (None: C6's)
+                    if i == idx:
+                        atoms, info = load_cell(p, t["structure"]), build_defect(prim, Q, comps,
+                                                                                 label)[1]
+                    elif s is not None and (cid, q, s) in done:
+                        atoms, info = carry_over(prim, comps, np.array(ladder[s]["matrix"]),
+                                                 done[(cid, q, s)], Q, label=label)
+                    else:
+                        atoms, info = carry_over(prim, comps, P0, load_cell(p, t["structure"]), Q,
+                                                 label=label)
+                    job, frozen[name] = production_job(p, name, atoms, info, q, t["spin"])
+                    jobs.append(job)
+                    meta[name] = (cid, q, i)
+        if frozen and any(frozen.values()):
+            log(f"freeze_radius {p.s.freeze_radius:g} A holds {min(frozen.values())}-"
+                f"{max(frozen.values())} atoms fixed in each relaxation (untested idea: check it "
+                "against a full relaxation)")
+        res = p.batch("D_production/jobs/cells", jobs, "cells", p.production_param(),
+                      spacing=p.kspacing())
+        if not res["complete"]:
+            return None
+        for i in used:
+            hr = res["jobs"][f"host_{ladder[i]['tag']}"]
+            if hr["status"] != "done" or hr["energy"] is None:
+                die(f"the pristine {ladder[i]['tag']} single point did not finish ({hr['dir']}): "
+                    "the formation energies need it")
+            hosts[ladder[i]["tag"]] = hr["energy"]
+        for name, (cid, q, i) in meta.items():
+            if name not in runs:
+                runs[name], atoms = production_summary(p, res, name,
+                                                       d / "structures" / "cells", frozen[name])
+                runs[name].update(cand=cid, q=q, cell=ladder[i]["tag"])
+                if atoms is not None:
+                    done[(cid, q, i)] = atoms
+        more = False
+        for cid, x in plan.items():
+            if x["cell"] is not None:
+                continue
+            if len(x["sizes"]) < 2:
+                x.update(cell=ladder[x["sizes"][0]]["tag"], why="only one size of the ladder "
+                         "from the screening cell up fits it: not checked")
+                continue
+            a, b = x["sizes"][-2:]
+            comps, label = cands[cid]["comps"], f"{cid} ({cands[cid]['name']})"
+            diffs, basins, lost = {}, {}, []
+            for q in sorted(ground[cid]):
+                if (cid, q, a) not in done or (cid, q, b) not in done:
+                    lost.append(q)
+                    continue
+                ef = []
+                for i in (a, b):
+                    c = ladder[i]
+                    cell = np.array(c["matrix"]) @ np.asarray(prim.cell)
+                    ef.append(runs[f"{cid}_{qtag(q)}_{c['tag']}"]["energy"] - hosts[c["tag"]]
+                              + correction(q, cell, eps, p.s.charge_correction))
+                diffs[q] = ef[1] - ef[0]
+                basins[q] = same_basin(prim, comps, np.array(ladder[a]["matrix"]),
+                                       done[(cid, q, a)], np.array(ladder[b]["matrix"]),
+                                       done[(cid, q, b)], label)
+                rows.append([cid, f"{q:+d}", f"{ladder[a]['tag']} -> {ladder[b]['tag']}",
+                             f"{ladder[a]['L']:.2f} -> {ladder[b]['L']:.2f}", diffs[q],
+                             basins[q][1]])
+            if lost:
+                log(f"WARNING: D0: {cid} q " + ", ".join(f"{q:+d}" for q in lost)
+                    + f": a run in {ladder[a]['tag']} or {ladder[b]['tag']} failed, so it is "
+                    "left out of the comparison")
+            if not diffs:                    # the biggest size whose runs all worked, if any
+                good = [i for i in x["sizes"] if all((cid, q, i) in done for q in ground[cid])]
+                bad = [ladder[i]["tag"] for i in (a, b) if i not in good]
+                x.update(cell=ladder[max(good) if good else idx]["tag"],
+                         why="NOT CONVERGED: runs in " + " and ".join(bad) + " failed")
+                continue
+            ok = all(abs(v) < p.s.series_tol for v in diffs.values()) and \
+                all(s for s, _ in basins.values())
+            if ok:
+                x.update(cell=ladder[a]["tag"], converged=True,
+                         why=f"agrees with {ladder[b]['tag']} within series_tol")
+            elif b + 1 < len(ladder):
+                x["sizes"].append(b + 1)
+                x["src"][b + 1] = b
+                more = True
+            else:
+                x.update(cell=ladder[b]["tag"], why="NOT CONVERGED: the largest size of the ladder "
+                         f"still differs from {ladder[a]['tag']}"
+                         + (" (a different structure)" if not all(s for s, _ in basins.values())
+                            else ""))
+        if not more:
+            break
+    for cid, x in sorted(plan.items()):
+        log(f"D0: {cid} {cands[cid]['name']}: {x['cell']} ({x['why']})")
+    table = format_table(["id", "q", "sizes", "L/A", "change/eV", "basin/A"], rows,
+                         f"Each defect's E_D - E_host + E_corr from one size to the next "
+                         f"(series_tol {p.s.series_tol:g} eV; basin: the largest difference in "
+                         f"how the atoms near it moved, at most {BASIN_TOL:g} A)") + "\n" + \
+        format_table(["id", "defect", "cell", "L/A", "atoms", "converged", "why"],
+                     [[cid, cands[cid]["name"], x["cell"],
+                       next(c["L"] for c in ladder if c["tag"] == x["cell"]),
+                       next(c["natoms"] for c in ladder if c["tag"] == x["cell"]),
+                       "yes" if x["converged"] else "no", x["why"]]
+                      for cid, x in sorted(plan.items())], "The production cell of each defect")
+    bad = sorted(cid for cid, x in plan.items() if not x["converged"])
+    cells = {c["tag"]: dict(c, host_energy=hosts.get(c["tag"])) for c in ladder}
+    return {"defects": {cid: {"cell": x["cell"], "converged": x["converged"], "why": x["why"],
+                              "sizes": [ladder[i]["tag"] for i in x["sizes"]]}
+                        for cid, x in plan.items()},
+            "cells": cells, "runs": runs, "_table": table,
+            "_note": f"{len(plan) - len(bad)} of {len(plan)} defects converged"
+                     + (f" (not: {', '.join(bad)})" if bad else "")}
+
+
+# D1: the production relaxations, each in its defect's production cell (D0). Every structure phase
+# C passes on (C7's) is relaxed at the production settings: the ground state of each charge state
+# is D0's own relaxation in that cell; any other structure C6 kept (keep_structures > 1) is
+# carried into the cell (carry_over) and relaxed here (production_job), in
+# D_production/jobs/production (named with the cell, so a cell D0 changes its mind about gets new
+# jobs). The pristine energy of each cell is D0's single point. Runner group
+# 'production' (restarts on; a job that fails is flagged and left out of E). The relaxed
+# structures go to D_production/structures/.
 #   Called by: main() (step D1)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
-#              format_table(), freeze_block(), host_supercell(), load_cell(), qtag(),
-#              save_cell(), sc.final_atoms()
+#              build_defect(), carry_over(), format_table(), load_cell(), production_job(),
+#              production_summary(), qtag()
 def step_production(p):
     d = p.phase_dir("D")
     todo = [dict(t) for t in p.out("excite")["structures"]]
-    if not todo:
-        die("phase C passed no structures on, so there is nothing to relax")
-    prim, P = p.host(), np.array(p.out("choose")["matrix"])
-    host = host_supercell(prim, P)
-    defects = p.out("prerelax")["defects"]
-    jobs = [{"name": "host", "atoms": host, "kind": "sp", "symmetry": True,
-             "overrides": dict(p.s.production_overrides)}]
-    frozen = {}
+    cells = p.out("cells")
+    cands, prim = p.out("generate")["candidates"], p.host()
+    P0 = np.array(p.out("choose")["matrix"])
+    jobs, frozen = [], {}
     for t in todo:
+        tag = cells["defects"][t["cand"]]["cell"]
+        t["cell"] = tag
+        if t["k"] == 0:
+            t["job"] = f"{t['cand']}_{qtag(t['q'])}_{tag}"
+            continue
+        comps, label = cands[t["cand"]]["comps"], f"{t['cand']} ({cands[t['cand']]['name']})"
+        Q = np.array(cells["cells"][tag]["matrix"])
         atoms = load_cell(p, t["structure"])
-        info = defects[t["cand"]]
-        S = t["spin"]
-        mags = np.zeros(len(atoms))
-        if S and info.get("anchor_index") is not None:
-            mags[info["anchor_index"]] = S
-        atoms.set_initial_magnetic_moments(mags)
-        o = dict(p.s.production_overrides, charge=t["q"])
-        if S:
-            o.update(spin_polarized="true", spin=S)
-        else:                               # (production_overrides can ask for spin_polarized)
-            o.setdefault("spin_polarized", "false")
-            o["spin"] = None
-        name = f"{t['cand']}_{qtag(t['q'])}_k{t['k']}"
-        job = {"name": name, "atoms": atoms, "kind": "geom", "symmetry": False, "overrides": o}
-        if p.s.freeze_radius:
-            block, n = freeze_block(atoms, info.get("points") or [info["centre"]],
-                                    p.s.freeze_radius)
-            if block:
-                job["cell_extra"] = block
-                frozen[name] = n
+        if np.allclose(Q, P0):
+            info = build_defect(prim, Q, comps, label)[1]
+        else:
+            atoms, info = carry_over(prim, comps, P0, atoms, Q, label=label)
+        name = f"{t['cand']}_{qtag(t['q'])}_{tag}_k{t['k']}"
+        job, frozen[name] = production_job(p, name, atoms, info, t["q"], t["spin"])
         jobs.append(job)
         t["job"] = name
-    if frozen:
-        log(f"D2: freeze_radius {p.s.freeze_radius:g} A holds "
-            f"{min(frozen.values())}-{max(frozen.values())} atoms fixed in each relaxation "
-            "(untested idea: check it against a full relaxation)")
-    res = p.batch("D_production/jobs/production", jobs, "production", p.production_param(),
-                  spacing=p.kspacing())
-    if not res["complete"]:
-        return None
-    hr = res["jobs"]["host"]
-    if hr["status"] != "done" or hr["energy"] is None:
-        die(f"the pristine supercell single point did not finish ({hr['dir']}): the formation "
-            "energies need it")
+    res = None
+    if jobs:
+        res = p.batch("D_production/jobs/production", jobs, "production", p.production_param(),
+                      spacing=p.kspacing())
+        if not res["complete"]:
+            return None
     out, failed = [], []
     for t in todo:
-        r = res["jobs"][t["job"]]
-        e = r["energy"] if r["scf_converged"] else None
-        if r["status"] != "done" or e is None:
+        if t["k"] == 0:
+            r = dict(t, **cells["runs"][t["job"]])
+        else:
+            r = dict(t, **production_summary(p, res, t["job"], d / "structures" / "production",
+                                             frozen[t["job"]])[0])
+        r["host_energy"] = cells["cells"][t["cell"]]["host_energy"]
+        if r["energy"] is None:
             failed.append(f"{t['job']} ({(r['reason'] or 'no converged energy').splitlines()[0]})")
-        path = None
-        if e is not None:
-            atoms = sc.final_atoms(res["calcs"][t["job"]])
-            if atoms is None:
-                log(f"WARNING: could not read the relaxed structure of {t['job']}")
-            else:
-                path = save_cell(p, d / "structures" / f"{t['job']}.cell", atoms,
-                                 f"{t['job']}: relaxed at the production settings (D1)")
-        out.append(dict(t, energy=e if r["status"] == "done" else None, energy_any=e,
-                        spin_final=r["spin"], status=r["status"], reason=r["reason"],
-                        steps=r["geom_steps"], restarts=r["restarts"], final=path,
-                        frozen=frozen.get(t["job"], 0)))
+        out.append(r)
     for f in failed:
         log(f"WARNING: production run {f} - left out of the formation energies; fix it and "
             "rerun with --resubmit-failed")
-    rows = [[o["job"], f"{o['q']:+d}", o["energy"], o["spin_final"], o["steps"], o["restarts"],
-             o["status"] + (f": {o['reason'].splitlines()[0]}" if o["reason"] else "")]
+    rows = [[o["job"], f"{o['q']:+d}", o["cell"], o["energy"], o["spin_final"], o["steps"],
+             o["restarts"], o["status"] + (f": {o['reason'].splitlines()[0]}" if o["reason"]
+                                           else "")]
             for o in out]
-    table = format_table(["run", "q", "E/eV", "final spin", "geometry steps", "restarts",
-                          "status"], rows, f"Pristine supercell: E_host = {hr['energy']:.6f} eV")
-    return {"host_energy": hr["energy"], "runs": out, "_table": table,
+    used = sorted({o["cell"] for o in out})
+    table = format_table(["run", "q", "cell", "E/eV", "final spin", "geometry steps", "restarts",
+                          "status"], rows, "Production relaxations; pristine cells: "
+                         + ", ".join(f"{t} E_host = {cells['cells'][t]['host_energy']:.6f} eV"
+                                     for t in used))
+    return {"host_energy": {t: cells["cells"][t]["host_energy"] for t in used}, "runs": out,
+            "_table": table,
             "_note": f"{len(out) - len(failed)} of {len(out)} relaxations done"
                      + (f", {len(failed)} failed" if failed else "")}
+
+
+# D2 (optional, finetune : true): MACE fine-tuning data for phase F from the production
+# relaxations (D0's and D1's). Every geometry step with energy and forces of each relaxation
+# (read_trajectory, all runs of the job; steps with a force above 2 eV/A left out) goes into
+# D_production/finetune/train.xyz (REF_energy, REF_forces) if the defect is neutral, or
+# charged.xyz (with its total_charge) if not: a MACE model that doesn't take the charge can't use
+# those. finetune.sh runs mace_run_train from mace_model on train.xyz (finetune_args adds
+# options); run it yourself (a GPU helps).
+#   Called by: main() (step D2)
+#   Calls:     Project.model_path(), read_trajectory()
+def step_finetune(p):
+    if not p.s.finetune:
+        return {"skipped": True, "_note": "finetune : false"}
+    import ase.io
+    d = p.phase_dir("D") / "finetune"
+    d.mkdir(parents=True, exist_ok=True)
+    runs = list(p.out("cells")["runs"].values()) + [
+        r for r in p.out("production")["runs"] if r["k"] > 0]
+    found = {"neutral": [], "charged": []}
+    for r in runs:
+        sub = "cells" if r["job"] in p.out("cells")["runs"] else "production"
+        f = p.dir / "D_production" / "jobs" / sub / r["job"] / f"{r['job']}.castep"
+        if not f.exists():
+            continue
+        for a, e, forces in read_trajectory(f.read_text(errors="replace")):
+            if np.abs(forces).max() > 2.0:                 # far from the minimum: leave out
+                continue
+            a.info["REF_energy"] = e
+            a.info["total_charge"] = r["q"]
+            a.arrays["REF_forces"] = forces
+            found["charged" if r["q"] else "neutral"].append(a)
+    for kind, name in (("neutral", "train.xyz"), ("charged", "charged.xyz")):
+        if found[kind]:
+            ase.io.write(str(d / name), found[kind], format="extxyz")
+    if not found["neutral"]:
+        log("WARNING: D2: no geometry steps with forces in the neutral production relaxations; "
+            "nothing to fine-tune on")
+    script = ("#!/bin/bash\n# Fine-tune the MACE model on the production relaxations' CASTEP data "
+              "(written by dwf.py, step D2)\n"
+              f"mace_run_train --name=dwf_finetuned --foundation_model={p.model_path()} "
+              "--multiheads_finetuning=False --train_file=train.xyz --valid_fraction=0.1 "
+              "--energy_key=REF_energy --forces_key=REF_forces --E0s=average --loss=weighted "
+              "--energy_weight=1 --forces_weight=10 --max_num_epochs=50 --batch_size=2 "
+              f"--default_dtype=float64 --device={p.s.mace_device} {p.s.finetune_args}\n"
+              "# charged.xyz has the charged defects' steps (info total_charge), for a model "
+              "that takes the charge\n")
+    (d / "finetune.sh").write_text(script)
+    (d / "finetune.sh").chmod(0o755)
+    n, m = len(found["neutral"]), len(found["charged"])
+    return {"images": n, "charged_images": m,
+            "train": str((d / "train.xyz").relative_to(p.dir)) if n else None,
+            "script": str((d / "finetune.sh").relative_to(p.dir)),
+            "_note": f"{n} neutral structures in train.xyz, {m} charged in charged.xyz: to use "
+                     "them, run finetune.sh (for phase F)"}
 
 
 # ==========================================================================================
@@ -3314,36 +4340,41 @@ SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#62
 
 
 # The production results (D1) of the runs that finished, by candidate and charge state, keeping
-# the lowest energy of each (with the run it came from).
+# the lowest energy of each (the run it came from, with its cell and that cell's pristine energy,
+# host_energy).
 #   Called by: step_corrections(), step_formation()
 def best_production(p):
-    prod = p.out("production")
     best = {}
-    for r in prod["runs"]:
+    for r in p.out("production")["runs"]:
         if r["energy"] is None:
             continue
         cur = best.setdefault(r["cand"], {}).get(r["q"])
         if cur is None or r["energy"] < cur["energy"]:
             best[r["cand"]][r["q"]] = r
-    return prod["host_energy"], best
+    return best
 
 
 # E1: the finite-size correction (charge_correction, with the static dielectric constant from
-# A2.3) for every charge state that reached phase D.
+# A2.3) for every charge state that reached phase D, in its defect's own production cell (D0).
+# Returns {defect: {q: E_corr}}.
 #   Called by: main() (step E1)
-#   Calls:     Project.host(), best_production(), correction(), format_table(), host_supercell()
+#   Calls:     Project.host(), best_production(), correction(), format_table()
 def step_corrections(p):
-    _, best = best_production(p)
-    prim, P = p.host(), np.array(p.out("choose")["matrix"])
-    cell = host_supercell(prim, P).cell
+    best = best_production(p)
+    prim, cells = p.host(), p.out("cells")["cells"]
     eps = p.out("dielectric").get("eps0")
-    qs = sorted({q for st in best.values() for q in st})
-    corr = {str(q): correction(q, cell, eps, p.s.charge_correction) for q in qs}
-    rows = [[q, corr[str(q)]] for q in qs]
-    table = format_table(["q", "E_corr/eV"], rows,
-                         f"{p.s.charge_correction} corrections (epsilon {eps})")
+    corr, rows = {}, []
+    for cid, st in sorted(best.items()):
+        tag = next(iter(st.values()))["cell"]
+        cell = np.array(cells[tag]["matrix"]) @ np.asarray(prim.cell)
+        corr[cid] = {str(q): correction(q, cell, eps, p.s.charge_correction) for q in sorted(st)}
+        rows += [[cid, tag, cells[tag]["L"], f"{q:+d}", corr[cid][str(q)]] for q in sorted(st)]
+    table = format_table(["id", "cell", "L/A", "q", "E_corr/eV"], rows,
+                         f"{p.s.charge_correction} corrections (epsilon {eps}), each in its "
+                         "defect's production cell (D0)")
+    n = sum(1 for st in corr.values() for q in st if int(q))
     return {"corrections": corr, "method": p.s.charge_correction, "eps0": eps, "_table": table,
-            "_note": ", ".join(f"q {q:+d}: {corr[str(q)]:.3f} eV" for q in qs if q)}
+            "_note": f"{n} charged states of {len(corr)} defects"}
 
 
 # The band gap used for the Fermi-level range: gap from the project file (e.g. experimental or
@@ -3478,7 +4509,8 @@ def plot(path, curves, gap, title):
 
 # E2: formation energies, transition levels and (with fermi_temperature) the Fermi level.
 # For each defect that reached phase D, its lowest energy in each charge state gives
-# E_f(q, E_F=0) = E_D - E_host - sum n_i mu_i + q E_VBM + E_corr at every limit, and its
+# E_f(q, E_F=0) = E_D - E_host - sum n_i mu_i + q E_VBM + E_corr at every limit (E_host and E_corr
+# for the defect's own production cell, D0; the table flags a cell D0 could not converge), and its
 # thermodynamic transition levels in the gap (transition_levels; the same at every limit); the
 # plot goes to E_thermo/formation.png. With fermi_temperature, fermi_level finds
 # the self-consistent Fermi level at each limit from these defects and the host's free carriers
@@ -3488,11 +4520,12 @@ def plot(path, curves, gap, title):
 #              mu_limits(), plot(), read_bands(), transition_levels()
 def step_formation(p):
     d = p.phase_dir("E")
-    host_e, best = best_production(p)
+    best = best_production(p)
     if not best:
         die("no production run finished, so there are no formation energies")
-    cands = p.out("generate")["candidates"]
-    corr = {int(q): v for q, v in p.out("corrections")["corrections"].items()}
+    cands, d0 = p.out("generate")["candidates"], p.out("cells")["defects"]
+    corr = {cid: {int(q): v for q, v in c.items()}
+            for cid, c in p.out("corrections")["corrections"].items()}
     vbm, gap = p.out("bands")["vbm"], band_gap(p)
     lims = mu_limits(p)
     table, curves, levels_rows, results = [], {}, [], {}
@@ -3504,7 +4537,7 @@ def step_formation(p):
             if missing:
                 die(f"limit {lim} has no chemical potential for " + ", ".join(missing))
             dmu = sum(n * mu.get(el, 0.0) for el, n in c["delta"].items())
-            ef0 = {q: r["energy"] - host_e - dmu + q * vbm + corr.get(q, 0.0)
+            ef0 = {q: r["energy"] - r["host_energy"] - dmu + q * vbm + corr[cid].get(q, 0.0)
                    for q, r in best[cid].items()}
             lv = transition_levels(ef0, gap)
             curves[lim][f"{cid} {c['name']}"] = (ef0, lv)
@@ -3513,14 +4546,15 @@ def step_formation(p):
                                                                            for q, v in ef0.items()}
             for q in sorted(ef0):
                 table.append([lim, cid, c["name"], f"{q:+d}", ef0[q], ef0[q] + q * gap,
-                              best[cid][q]["job"]])
+                              best[cid][q]["job"], best[cid][q]["cell"]
+                              + ("" if d0[cid]["converged"] else " (not converged)")])
     for cid in sorted(best):
         lv = results[cid]["levels"]
         levels_rows.append([cid, cands[cid]["name"],
                             ", ".join(f"({a:+d}/{b:+d}) {e:.3f}" for a, b, e in lv) or
                             "one charge state across the gap"])
     tables = [format_table(["limit", "id", "defect", "q", "E_f(VBM)/eV", "E_f(CBM)/eV",
-                            "from run"], table,
+                            "from run", "cell (D0)"], table,
                            f"Formation energies (E_VBM {vbm:.4f} eV, gap {gap:.3f} eV)"),
               format_table(["id", "defect", "transition levels (eV above VBM)"], levels_rows,
                            "Thermodynamic transition levels in the gap")]
@@ -3634,36 +4668,35 @@ STEPS = [
                "energy"), needs=("relax",), owns=("A_host/jobs/phases",)),
     Step("limits", "A3.2", "chemical-potential limits", step_limits,
          keys=("chemical_potentials", "dopants"), needs=("phases", "relax")),
-    # B: candidate defects and cell size
+    # B: candidate defects and the screening cell
     Step("generate", "B1", "candidate defects", step_generate,
          keys=("dopants", "defects", "vacancies", "antisites", "interstitials", "pairs",
                "pair_max_distance", "native_pairs", "dopant_pairs"), needs=("relax",)),
-    Step("scan", "B2", "MACE size scan", step_scan,
-         keys=("mace", "scan", "scan_sizes", "scan_tol", "mace_model", "mace_fmax", "mace_steps",
-               "transform", "series_defect", "supercell"), needs=("generate",),
-         owns=("B_candidates/mace",)),
-    Step("series", "B3", "CASTEP size series", step_series,
-         keys=("series_defect", "series_charge", "series_sizes", "series_tol", "series_choice",
-               "supercell", "transform", "mace", "mace_model", "charge_correction", "energy"),
-         needs=("generate", "scan", "relax", "converge", "dielectric"),
-         owns=("B_candidates/series",)),
-    Step("finetune", "B4", "MACE fine-tuning data", step_finetune,
-         keys=("finetune", "finetune_args", "mace_model"), needs=("series",),
-         owns=("B_candidates/finetune",)),
-    Step("choose", "B5", "choose the supercell", step_choose,
-         keys=("supercell", "transform"), needs=("series", "relax")),
+    Step("scan", "B2", "supercell sizes, and the MACE scan of every candidate", step_scan,
+         keys=("mace", "scan", "scan_lengths", "scan_tol", "scan_edge_tol", "mace_model",
+               "mace_fmax", "mace_steps", "transform"), needs=("generate", "relax"),
+         owns=("B_candidates/mace", "B_candidates/jobs/mace_scan", "B_candidates/ladder.json")),
+    Step("choose", "B3", "the screening cell", step_choose,
+         keys=("supercell", "transform", "screen_min_image", "deep_level_margin", "scan_lengths"),
+         needs=("scan", "relax", "bands", "generate")),
     # C: screening and ground states
     Step("prerelax", "C1", "build the candidates and pre-relax them with MACE", step_prerelax,
          keys=("mace", "mace_model", "mace_fmax", "mace_steps", "configuration_margin"),
-         files=("finetuned_model",), needs=("generate", "choose", "relax"),
-         owns=("C_screen/structures/candidates", "C_screen/mace")),
+         needs=("generate", "choose", "relax"),
+         owns=("C_screen/structures/candidates", "C_screen/jobs/mace_prerelax")),
     Step("screen", "C2", "cheap CASTEP screening of every candidate", step_screen,
-         keys=SCREEN_KEYS + ("screen_charges", "screen_spins"), needs=("prerelax", "converge"),
+         keys=SCREEN_KEYS + ("screen_charges", "screen_spins"),
+         needs=("prerelax", "converge", "bands"),
          owns=("C_screen/jobs/screen", "C_screen/structures/screen")),
+    Step("dispersion", "C2b", "the Gamma-only check: level dispersion in two sizes",
+         step_dispersion, keys=SCREEN_KEYS + ("dispersion_check", "dispersion_defect",
+                                              "dispersion_tol"),
+         needs=("screen", "choose", "prerelax", "generate", "relax", "converge"),
+         owns=("C_screen/jobs/dispersion",)),
     Step("filter", "C3", "defect hull and property filters", step_filter,
          keys=("hull_margin", "require_gap_states", "require_spin", "require_bound",
                "distort_charges", "charge_correction", "excite"),
-         needs=("screen", "dielectric", "prerelax")),
+         needs=("screen", "dielectric", "prerelax", "dispersion")),
     Step("distort", "C4", "ShakeNBreak distortions of the survivors", step_distort,
          keys=("distortions", "distort_around", "rattle_stdev", "rattle_dmin",
                "oxidation_states"), needs=("filter", "prerelax"),
@@ -3679,17 +4712,25 @@ STEPS = [
                                          "excite_overrides"),
          needs=("rank", "screen", "generate", "prerelax", "relax"),
          owns=("C_screen/jobs/excite_gs", "C_screen/jobs/excite", "C_screen/structures/excite")),
-    # D: production relaxations
-    Step("production", "D1", "production relaxations", step_production,
+    # D: production cells and relaxations
+    Step("cells", "D0", "converge each defect's production cell", step_cells,
+         keys=("production_overrides", "freeze_radius", "series_tol", "charge_correction",
+               "energy"),
+         needs=("excite", "choose", "converge", "relax", "dielectric", "generate"),
+         owns=("D_production/jobs/cells", "D_production/structures/cells")),
+    Step("production", "D1", "production relaxations, each in its defect's cell", step_production,
          keys=("production_overrides", "freeze_radius", "energy"),
-         needs=("excite", "choose", "converge", "relax"),
-         owns=("D_production/jobs", "D_production/structures")),
+         needs=("cells", "excite", "choose", "converge", "relax", "generate"),
+         owns=("D_production/jobs/production", "D_production/structures/production")),
+    Step("finetune", "D2", "MACE fine-tuning data (for phase F)", step_finetune,
+         keys=("finetune", "finetune_args", "mace_model", "mace_device"),
+         needs=("production", "cells"), owns=("D_production/finetune",)),
     # E: thermodynamics
     Step("corrections", "E1", "finite-size corrections", step_corrections,
-         keys=("charge_correction",), needs=("production", "dielectric", "choose")),
+         keys=("charge_correction",), needs=("production", "dielectric", "cells")),
     Step("formation", "E2", "formation energies, levels, Fermi level", step_formation,
          keys=("gap", "fermi_temperature", "quench_temperature"),
-         needs=("corrections", "production", "bands", "limits", "generate"),
+         needs=("corrections", "production", "bands", "limits", "generate", "cells"),
          owns=("E_thermo/formation.png",)),
     Step("interest", "E3", "which defects go on to the lineshape (F)", step_interest,
          keys=("deep_level_margin",), needs=("formation", "excite")),
@@ -3709,18 +4750,25 @@ host_cell : CaO_prim.cell      # host primitive cell: species_pot, symmetry_gene
 param     : CaO.param          # production settings (functional, cut-off, ...); dwf.py
                                #   sets task, charge and spin, and A1 sets cut_off_energy
 !workdir  : dwf_CaO_Sb         # where everything goes (default dwf_<file name>)
-# Supercell shape: size n uses n x transform x (primitive cell). This one gives cubic cells
-# (8 n^3 atoms) from an FCC primitive cell; leave it out for n x n x n primitive cells.
-%block transform
-  -1  1  1
-   1 -1  1
-   1  1 -1
-%endblock transform
-mace        : true             # MACE for the size scan (B2) and pre-relaxations (B3, C1)
-!mace_model : medium-mpa-0     # a mace_mp foundation model, or a .model file
-!finetuned_model : dwf_CaO_Sb/B_candidates/finetune/dwf_finetuned.model   # C1 only: the
-                               #   model fine-tuned from B4's data (finetune.sh)
-!mace_threads : 8
+# Supercell sizes are lengths (scan_lengths, B2): each is the most compact supercell of the host
+# with every periodic image at least that far away (found by doped). To use n x transform x
+# (primitive cell) instead, the smallest n for each length, give a transform; this one gives
+# cubic cells (8 n^3 atoms) from an FCC primitive cell:
+!%block transform
+!  -1  1  1
+!   1 -1  1
+!   1  1 -1
+!%endblock transform
+mace         : true            # MACE for the size scan (B2) and the pre-relaxations (C1)
+!mace_model  : medium-mpa-0    # a mace_mp foundation model, or your own .model file
+mace_threads : 8               # threads per MACE relaxation
+# The MACE relaxations run where dwf.py runs, unless mace_jobscript is given: then as jobs on
+# compute nodes (not ARCHER2's login nodes), each running mace_pack relaxations side by side
+# (default cores_per_node / mace_threads, 16 here), in at most mace_max_jobs jobs at a time.
+mace_jobscript : archer2_mace.sh   # a Slurm template with a {COMMAND} line
+!mace_max_jobs : 4
+!mace_python   : /work/e89/e89/<you>/venv/bin/python   # the Python the jobs run (default:
+                               #   the one running dwf.py; on ARCHER2 it must be on /work)
 
 # ======================================================================= runner settings
 # How the CASTEP jobs run: any supercell_convergence.py runner keyword (see its --example).
@@ -3740,14 +4788,14 @@ max_restarts : 20              # a relaxation that runs out of time carries on t
 poll      : 300
 delete_check : true            # delete each .check once its calculation has finished
 # ... and for some steps only, in a runner block: runner_host for all of phase A's CASTEP
-# steps (A1 to A3.1) and runner_screen for all of phase C's (C2, C5, C6, C7); for one step:
-# runner_converge (A1), runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3),
-# runner_phases (A3.1), runner_series (B3), runner_drelax (C5), runner_rank (C6),
-# runner_excite (C7), runner_production (D1). A step's own block wins over runner_host or
-# runner_screen, and they win over the settings above, for the keywords they give (a %block
-# partitions in one replaces the whole list). pack : N runs N of a step's jobs side by side on
-# one node, each on 1/N of it: for small jobs, as a node is charged whole however few cores a
-# job uses.
+# steps (A1 to A3.1), runner_screen for all of phase C's (C2, C2b, C5, C6, C7) and
+# runner_production for phase D's (D0, D1); for one step: runner_converge (A1), runner_relax
+# (A2.1), runner_bands (A2.2), runner_dielectric (A2.3), runner_phases (A3.1),
+# runner_dispersion (C2b), runner_drelax (C5), runner_rank (C6), runner_excite (C7),
+# runner_cells (D0). A step's own block wins over its group's, and that wins over the settings
+# above, for the keywords they give (a %block partitions in one replaces the whole list).
+# pack : N runs N of a step's jobs side by side on one node, each on 1/N of it: for small
+# jobs, as a node is charged whole however few cores a job uses.
 # Starting points for CaO:Sb on ARCHER2 - set your own:
 %block runner_host             # A1 to A3.1: the primitive cell and the competing phases
 max_walltime : 4:00:00
@@ -3760,14 +4808,14 @@ pack         : 4               # four at a time on one node, 32 cores each
 standard   2   --qos=short
 %endblock partitions
 %endblock runner_converge
-%block runner_series           # B3: up to the 512-atom cell of size 4
-max_nodes    : 12
-%endblock runner_series
-%block runner_screen           # C2, C5, C6, C7: Gamma-only screening jobs are small
+%block runner_screen           # C2, C2b, C5, C6, C7: Gamma-only screening jobs are small
 max_nodes    : 1
 max_restarts : 0               # (the default for screening: a job that fails is flagged)
 %endblock runner_screen
-%block runner_production       # D1: the production relaxations
+%block runner_dispersion       # C2b: two single points with 8 k-points
+max_nodes    : 2
+%endblock runner_dispersion
+%block runner_production       # D0, D1: the production relaxations, up to the largest size
 max_nodes    : 8
 %endblock runner_production
 
@@ -3780,7 +4828,8 @@ converge_kcutoff    : 400 eV   # ... at this cheap cut-off (default: the lowest 
 converge_cutoffs    : 400 500 600 700 800 900 eV   # then these, on the converged grid
 converge_tol        : 0.001 eV/atom
 !kspacing          : 0.04      # use this k-point spacing instead of converging it
-!bands_kspacing    : 0.02      # A2 band edges (default: half the production spacing)
+!bands_kspacing    : 0.02      # A2.2 band edges (default: half the production spacing),
+                               #   fine enough for B3's effective masses
 # Dielectric constant for the charge corrections: DFPT phonon+efield, or give it yourself.
 # CASTEP's DFPT needs norm-conserving potentials, fixed occupancies and no spin polarisation:
 dielectric_param   : CaO_ncp.param   # its own .param (NCP cut-off, fix_occupancy : true)
@@ -3818,16 +4867,20 @@ pairs         : true           # dopant + native pairs ...
 pair_max_distance : 5.0 ang    # ... up to this far apart
 native_pairs  : false
 dopant_pairs  : false
-scan          : true           # B2: MACE size scan
-scan_sizes    : 2 3 4 5
+# B2: the supercell sizes, as lengths (the shortest distance between periodic images), and
+# the MACE scan of every candidate in each. A candidate is converged at the smallest size whose
+# MACE relaxation energy is within scan_tol of every bigger size's, with the atoms at the cell's
+# edge moved less than scan_edge_tol. The largest length is the most B3 and D0 will use.
+scan          : true
+scan_lengths  : 8 10 12 14 16 18 20 ang
 scan_tol      : 0.02 eV
-!series_defect : Sb_Ca@1 + Vac_O   # B3: the defect for the CASTEP size series (default:
-                               #   the first dopant pair, nearest arrangement)
-!series_charge : 0             # default: 0, or the defect's own q= in %block defects
-series_sizes  : 2 3 4
-series_tol    : 0.05 eV
-!supercell    : 3              # skip B2-B5 and use this size
-!finetune     : true           # B4: export MACE fine-tuning data from the series
+scan_edge_tol : 0.05 ang
+# B3: the screening cell is the smallest size that holds every candidate (B2) and is at least
+# the Gamma-only floor, estimated from the band edges' effective masses (A2.2) for the
+# shallowest deep level (deep_level_margin, below).
+!screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate
+!supercell : 14 ang            # fix the screening cell (a length, or n: n x transform);
+                               #   D0 still converges each defect's production cell
 
 # ======================================================================= C: screening
 screen_charges   : -1 0 1
@@ -3837,6 +4890,11 @@ screen_max_steps : 50          # geometry steps per screening relaxation
 %block screen_overrides        # any other .param keywords for the screening runs
 elec_energy_tol : 1e-5
 %endblock screen_overrides
+# C2b: the Gamma-only check: one defect (by default the one with a level nearest a band edge)
+# on a 2x2x2 k-point grid in the screening cell and the size below
+dispersion_check : warn        # warn | stop (before C3) | off
+dispersion_tol   : 0.05 eV     # the most a gap level may spread across the k-points
+!dispersion_defect : d012      # the defect to check (an id, or id:q)
 !configuration_margin : 1.0 eV # C1: drop arrangements this far above the lowest of their
                                # composition by MACE energy (off unless given)
 hull_margin   : 0.2 eV         # C3: keep arrangements within this of the defect hull
@@ -3868,20 +4926,26 @@ excite_relax   : true          # relax the excited state (the ZPL); false: verti
 !%endblock excite_overrides
 
 # ======================================================================= D: production
+# D0: each defect's production cell: its ground states relaxed one size below the screening
+# cell and in it, then up the sizes of scan_lengths until two neighbouring sizes agree on
+# E_D - E_host + E_corr in every charge state; D1 then relaxes everything in that cell.
+series_tol : 0.05 eV
 %block production_overrides
 geom_energy_tol : 5e-6
 elec_energy_tol : 5e-7
 geom_max_iter   : 100
 %endblock production_overrides
-freeze_radius : 0              # D2 (untested idea): fix the atoms further than this (Ang)
-                               #   from every component of the defect
+freeze_radius : 0              # (untested idea) fix the atoms further than this (Ang) from
+                               #   every component of the defect, in D0 and D1
+!finetune     : true           # D2: MACE fine-tuning data from D0's and D1's relaxations
 
 # ======================================================================= E: thermodynamics
 charge_correction : lz         # lz | mp | none
 !gap : 7.09 eV                 # band gap for the Fermi-level range (default: from A2)
 !fermi_temperature  : 1000 K   # self-consistent Fermi level at this temperature
 !quench_temperature : 300 K    # ... with the defects frozen in, then at this one
-deep_level_margin : 0.5 eV     # E3: a level this far from both band edges is "deep"
+deep_level_margin : 0.5 eV     # E3: a level this far from both band edges is "deep" (B3's
+                               #   Gamma-only floor is for a level this deep)
 """
 
 

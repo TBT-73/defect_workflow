@@ -165,8 +165,7 @@ Batch mode
 ----------
 The same machinery can run any list of CASTEP calculations instead of a size series.
 It runs the structures it is given and builds no supercells of its own. The defect
-workflow (dwf.py) uses it for every CASTEP step except its size series (B3, a normal
-size-series run), and you can use it directly:
+workflow (dwf.py) uses it for every CASTEP step, and you can use it directly:
 
     python3 supercell_convergence.py --batch jobs.batch
 
@@ -2060,8 +2059,8 @@ def prepare_sp(sp, geom, ctx, args):
 
 
 # Submits a jobscript with submit_cmd, from its own directory, and returns the job id. Stops if the
-# submission fails.
-#   Called by: submit(), submit_dryrun_pack(), submit_pack()
+# submission fails. dwf.py submits its MACE jobs with it too.
+#   Called by: submit(), submit_dryrun_pack(), submit_pack(), dwf.py
 def send_job(directory, script, args):
     res = subprocess.run(shlex.split(args.submit_cmd) + [script], cwd=directory,
                          capture_output=True, text=True)
@@ -2286,8 +2285,8 @@ def submit_dryrun_pack(group, ctx, args):
 # Asks the scheduler whether a job is still queued or running.
 # Uses status_cmd, or squeue/qstat. A job that has left the queue, or shows a finished state
 # (END_STATES), is not active; if the scheduler doesn't answer within 2 minutes the job is assumed
-# to be still there.
-#   Called by: wait_for()
+# to be still there. dwf.py checks its MACE jobs with it too.
+#   Called by: wait_for(), dwf.py
 def job_active(jobid, args):
     if args.status_cmd:
         cmd = args.status_cmd
@@ -2437,7 +2436,8 @@ def planning_dryrun(calc, ctx):
 #   more processes;
 # - records how the run ended, measures the memory again (calibrate) and plans the job again
 #   (planning_dryrun + finalize), which may change its layout or partition;
-# - for a relaxation, carries on from the .check (continuation : default) when it can; otherwise
+# - for a relaxation, carries on from the .check (continuation : default, which replaces any reuse,
+#   e.g. of the ground state a ΔSCF excited state started from) when it can; otherwise
 #   puts the .check aside (deletes it with delete_check : true) and writes the structure of the
 #   last geometry step into the .cell (last_geometry + write_cell). After a second unreadable
 #   .check it stops using .check files for that calculation;
@@ -2560,6 +2560,8 @@ def restart(calc, args):
         margin *= 2                                # stop earlier next time
     if geom:
         new = {"continuation": "default" if use_check else None}
+        if use_check:                              # CASTEP takes continuation or reuse, not both
+            new["reuse"] = None
         if smax:
             if per_scf and scf_procs and new_procs:
                 per_scf *= scf_procs / new_procs

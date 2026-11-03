@@ -16,8 +16,8 @@ a neutral defect and an image-charge correction for a charged one (see
 |E_f*(n) - E_f*(previous n)| < `tol`, and prints the full expression for E_f.
 
 The same machinery can also run any list of CASTEP calculations ([Batch mode](#batch-mode)):
-the defect workflow (`dwf.py`) runs all its CASTEP jobs that way except its size series. The
-workflow has its own README, `README.md`.
+the defect workflow (`dwf.py`) runs all its CASTEP jobs that way. The workflow has its own
+README, `README.md`.
 
 ---
 
@@ -307,7 +307,7 @@ A job that doesn't finish is resubmitted automatically:
 
 | What happened | What the script does |
 |---|---|
-| CASTEP stopped at run_time ("Insufficient time for another iteration") | carries on from the `.check` (`continuation : default`) |
+| CASTEP stopped at run_time ("Insufficient time for another iteration") | carries on from the `.check` (`continuation : default`; a `reuse` line, such as the ground-state `.check` a ΔSCF excited state started from, is removed, as CASTEP takes one or the other) |
 | Slurm killed it at the time limit | relaxation: carries on from the `.check` if there is one, and uses a larger run_time margin next time; single point: starts again |
 | CASTEP couldn't read the `.check`, or stopped without finishing writing it | puts the `.check` aside (or deletes it with `delete_check : true`) and restarts the relaxation **from the structure of its last geometry step**, read from the `.castep` (or `-out.cell`) |
 | killed with no `.check` | restarts from its last geometry step rather than from scratch |
@@ -434,10 +434,9 @@ Each deletion is logged with its size.
 The same machinery (dry runs, layouts, partitions, walltimes, restarts, STOP, resuming) can run
 any list of CASTEP calculations instead of a size series. In batch mode the script builds no
 supercells or defects: each job runs the structure it is given. The defect workflow (`dwf.py`)
-runs every CASTEP job this way except its size series (step B3), which is a normal size-series
-run that builds its own cells. It builds its structures with this script's own
-`build_supercell`, `anchor_site` and `translation_copies`, so the cells match. You can also use
-batch mode directly:
+runs every CASTEP job this way, with the structures it builds (with this script's own
+`build_supercell`, `anchor_site` and `translation_copies`); it also submits and checks its MACE
+jobs with this script's `send_job` and `job_active`. You can also use batch mode directly:
 
 ```bash
 python3 supercell_convergence.py --batch jobs.batch
