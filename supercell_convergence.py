@@ -88,6 +88,19 @@ A job that needs more memory per process than a full node gives goes to the next
 partition (e.g. highmem); only if none has enough are fewer processes put on each
 node ({CPUS_PER_TASK} then spreads them out).
 
+Machines that charge by the core (charging : core, e.g. Cirrus)
+---------------------------------------------------------------
+Where nodes are shared and a job is charged only for the cores it asks for, set
+charging : core with cores_per_node, and use {NODES}, {TASKS_PER_NODE} and
+{CPUS_PER_TASK} in the template. Each job gets up to max_cores processes, chosen for
+k-point parallelisation as on core-based machines. A job that fits on one node asks
+for just its cores and shares the node. Memory comes with the cores (the partition's
+GB per core; no --mem), so a job goes on the first partition where each process fits
+in one core's memory; if none has enough, each process gets as many cores as its
+memory needs (--cpus-per-task, on the partition where that takes the fewest cores;
+omp_threads can run threads on them). A job bigger than a node takes whole nodes
+(--exclusive, charged in full, up to max_nodes), laid out as on whole-node machines.
+
 Partitions
 ----------
 With %block partitions, each job goes on the first partition listed whose memory
@@ -981,7 +994,8 @@ def fill(template, subs):
 # Replaces the option wherever it already appears, in either spelling (-p/--partition, -t/--time,
 # ...: SBATCH_SHORT), removing duplicates; otherwise adds it after the last #SBATCH line. A memory
 # request (--mem, --mem-per-cpu, ...) replaces any other memory request.
-#   Called by: dryrun_script(), finalize(), restart(), set_threads()
+#   Called by: dryrun_sbatch(), finalize(), restart(), set_exclusive(), set_threads(),
+#              submit_pack()
 def add_sbatch_option(text, option):
     """Set '#SBATCH <option>' (e.g. '--qos=highmem' or '-C icelake') in a jobscript,
     replacing that option if it is already there in either spelling (-p / --partition;
@@ -1045,6 +1059,18 @@ def set_threads(script, threads, cpus):
         lines[at:at] = add
         script = "\n".join(lines) + "\n"
     return script
+
+
+# With charging : core, makes a jobscript ask for whole nodes (#SBATCH --exclusive) or not: a job
+# bigger than a node must have its nodes to itself (and is charged for all their cores), while a
+# smaller one shares its node, and is charged only for its own cores. Takes out any --exclusive
+# the template has, then adds it back for whole nodes.
+#   Called by: dryrun_script(), finalize()
+#   Calls:     add_sbatch_option()
+def set_exclusive(script, whole):
+    lines = [ln for ln in script.splitlines() if not re.match(r"#SBATCH\s+--exclusive\b", ln)]
+    script = "\n".join(lines) + "\n"
+    return add_sbatch_option(script, "--exclusive") if whole else script
 
 
 # Reads the value of an #SBATCH option from a jobscript, in either spelling.
@@ -1117,11 +1143,28 @@ def dryrun_template_text(job_template, dryrun_template):
     return "\n".join(lines) + "\n"
 
 
+# How many cores each process of a dry-run job asks for: one, but with charging : core enough for
+# the dry run's gb, as there the memory comes with the cores: each brings the GB per core of
+# dryrun_partition if %block partitions lists it, otherwise of the first partition listed (where
+# the dry runs go), or mem_per_core.
+#   Called by: dryrun_subs()
+def dryrun_cpus(ncores, gb, args):
+    if args.charging != "core":
+        return 1
+    parts = args.partitions or []
+    name = args.dryrun_partition or (parts[0]["name"] if parts else None)
+    per = next((q["mem_per_core"] for q in parts if q["name"] == name),
+               args.mem_per_core or min((q["mem_per_core"] for q in parts), default=None))
+    return max(1, math.ceil(gb / (per * ncores))) if per else 1
+
+
 # The placeholders of a dry-run job for ncores processes in all (several in a pack of dry runs).
 #   Called by: dryrun_script(), submit_dryrun_pack()
+#   Calls:     dryrun_cpus()
 def dryrun_subs(seed, jobname, ncores, gb, args):
     return {"{SEED}": seed, "{JOBNAME}": jobname, "{NKPTS}": 0, "{NCORES}": ncores,
-            "{NODES}": 1, "{TASKS_PER_NODE}": ncores, "{CPUS_PER_TASK}": 1,
+            "{NODES}": 1, "{TASKS_PER_NODE}": ncores,
+            "{CPUS_PER_TASK}": dryrun_cpus(ncores, gb, args),
             "{MEM_GB}": math.ceil(gb), "{MEM_MB}": math.ceil(gb * 1024),
             "{MEM_PER_NODE_GB}": math.ceil(gb),
             "{MEM_PER_CORE_GB}": math.ceil(gb / ncores),
@@ -1145,10 +1188,12 @@ def dryrun_sbatch(script, subs, args):
 
 # Writes the text of dryrun.sh, the batch job that runs CASTEP --dryrun.
 # The dry-run template (dryrun_template_text) filled in for dryrun_cores processes, then
-# dryrun_partition, dryrun_time and dryrun_options (dryrun_sbatch). prepare_all writes the file
-# and submits it, or runs it in a pack with other dry runs (dryrun_pack : N, submit_dryrun_pack).
+# dryrun_partition, dryrun_time and dryrun_options (dryrun_sbatch). With charging : core the dry run
+# shares a node, so the template's --exclusive is taken out (set_exclusive). prepare_all writes the
+# file and submits it, or runs it in a pack with other dry runs (dryrun_pack : N,
+# submit_dryrun_pack).
 #   Called by: prepare_all()
-#   Calls:     dryrun_sbatch(), dryrun_subs(), dryrun_template_text(), fill()
+#   Calls:     dryrun_sbatch(), dryrun_subs(), dryrun_template_text(), fill(), set_exclusive()
 def dryrun_script(calc, ctx, args):
     """Dry-run jobscript: dryrun_jobscript if given, otherwise the main template with
     dryrun_cores requested (on one node) and the CASTEP line run as one process with
@@ -1157,7 +1202,8 @@ def dryrun_script(calc, ctx, args):
     subs = dryrun_subs(calc.seed, calc.name + "_dry", args.dryrun_cores, args.dryrun_mem_gb,
                        args)
     template = dryrun_template_text(ctx["job_template"], ctx["dryrun_template"])
-    return dryrun_sbatch(fill(template, subs), subs, args)
+    script = dryrun_sbatch(fill(template, subs), subs, args)
+    return set_exclusive(script, False) if args.charging == "core" else script
 
 
 # The text of a finished dry run, or None if it hasn't finished yet.
@@ -1226,7 +1272,7 @@ def parse_dryrun(text):
 # memory, p = processes and r = mem_replicated (the fraction of S every process keeps a full copy
 # of). choose_resources uses it to decide which layouts and partitions fit. calibrate measures r by
 # solving the same formula backwards (measured_replicated).
-#   Called by: choose_resources()
+#   Called by: choose_resources(), core_resources()
 def mem_per_core_mb(mem, ncores, args):
     """Heuristic per-process memory with the k-points (and G-vectors) shared over ncores.
 
@@ -1495,7 +1541,9 @@ def plan_walltime(calc, script, dr, procs, ctx, args):
     else:
         plan.note = (f" (estimated {est * args.walltime_safety / 3600:.0f} h from {ref.name}"
                      + (", so it will continue in further jobs)" if calc.kind == "geom" else
-                        " - more than the walltime allows: give it more nodes)"))
+                        " - more than the walltime allows: give it more "
+                        + ("nodes)" if args.cores_per_node and args.charging != "core"
+                           else "cores)")))
     return plan
 
 
@@ -1536,7 +1584,7 @@ def set_param(calc, **values):
 # k-point parallelism first: with no more k-points than max_cores, all of them run in parallel and
 # the rest is filled with G-vector parallelism (a multiple of the k-points); otherwise the fewest
 # cores that give the minimum number of k-points per core. 'cores : N' forces N.
-#   Called by: choose_resources()
+#   Called by: choose_resources(), core_resources()
 def choose_cores(nkpts, max_cores, fixed=None):
     """k-point parallelisation first. If there are no more k-points than max_cores, run
     them all in parallel and fill up with G-vector parallelism (a multiple of nkpts).
@@ -1552,7 +1600,7 @@ def choose_cores(nkpts, max_cores, fixed=None):
 # Ranks a whole-node layout (nodes x processes per node); lower is better.
 # Fewest k-points per process, then a process count that divides evenly with the k-points, then
 # more processes, then fewer nodes.
-#   Called by: choose_resources(), node_layouts()
+#   Called by: choose_resources(), core_resources(), node_layouts()
 def layout_key(nk, nodes, tpn):
     """Rank of a whole-node layout (lower is better): the fewest k-points per process, then
     a process count that splits evenly with the k-points, then the most processes, then
@@ -1562,14 +1610,94 @@ def layout_key(nk, nodes, tpn):
 
 
 # Every layout of up to max_nodes nodes x cores_per_node processes, best first.
-# Sorted by layout_key. With 'cores : N', only layouts with exactly N processes.
-#   Called by: choose_resources()
+# Sorted by layout_key. With 'cores : N', only layouts with exactly N processes; with nodes, only
+# those on exactly that many nodes.
+#   Called by: choose_resources(), core_resources()
 #   Calls:     layout_key()
-def node_layouts(nk, cpn, max_nodes, fixed=None):
+def node_layouts(nk, cpn, max_nodes, fixed=None, nodes=None):
     """All (nodes, processes per node) with up to cpn processes per node, best first."""
-    cands = [(nodes, t) for nodes in range(1, max_nodes + 1) for t in range(1, cpn + 1)
-             if not fixed or nodes * t == fixed]
+    cands = [(k, t) for k in range(nodes or 1, (nodes or max_nodes) + 1)
+             for t in range(1, cpn + 1) if not fixed or k * t == fixed]
     return sorted(cands, key=lambda c: layout_key(nk, *c))
+
+
+# Decides how and where a job runs on a machine that shares its nodes and charges by the core
+# (charging : core, e.g. Cirrus), from its dry run. The processes are chosen as on core-based
+# machines (choose_cores: k-points first, up to max_cores or the partition's own limit; or exactly
+# cores : N). Memory comes with the cores (the partition's GB per core), so the job goes on the
+# first partition where each process fits in one core's memory, and asks for just its cores on
+# one node, which it shares with other jobs. If none has enough, the job is planned on every
+# partition in the way that asks for the fewest cores (ties: the better layout, layout_key, then
+# the partition listed first): on one node, each process with as many cores as its memory needs
+# (--cpus-per-task; omp_threads can run threads on them), or on whole nodes. A job with more
+# processes than a node has cores takes whole nodes from the start. Whole nodes (--exclusive,
+# finalize) are charged in full, so they are laid out as on whole-node machines: the best layout
+# (node_layouts) on the fewest nodes that hold the processes, at most max_nodes, with fewer
+# processes per node if the memory needs it. If nothing fits, the layout that comes closest
+# (finalize then logs a warning). Returns the namespace of choose_resources, with exclusive (whole
+# nodes) and charged (the cores the job is charged for); underpop marks a layout that the memory
+# made sparser than planned.
+#   Called by: choose_resources()
+#   Calls:     choose_cores(), layout_key(), mem_per_core_mb(), node_layouts()
+def core_resources(dr, args):
+    nk, cpn = dr["nkpts"], args.cores_per_node
+    skipped, cheaper, over = [], [], []
+
+    # Memory per process (MB) for this job on p processes (mem_per_core_mb).
+    def mpc(n):
+        return mem_per_core_mb(dr["mem"], n, args)
+
+    # Packs a layout (nodes x processes per node, cores per process) into the namespace finalize
+    # uses.
+    def result(nodes, tpn, cpus, p, fits, whole, sparse=False):
+        return SimpleNamespace(nodes=nodes, tpn=tpn, ncores=nodes * tpn, mpc=mpc(nodes * tpn),
+                               part=p, fits=fits, underpop=sparse, cpus=cpus,
+                               skipped=[q for q in skipped if q is not p], packed=False,
+                               share=None, exclusive=whole,
+                               charged=nodes * cpn if whole else tpn * cpus)
+
+    for order, p in enumerate(args.partitions or [None]):
+        core_mb = (p["mem_per_core"] if p else args.mem_per_core) * 1024
+        pmax = (p["max_cores"] if p else None) or math.inf
+        if args.cores and args.cores > pmax:
+            continue
+        n = choose_cores(nk, min(args.max_cores, pmax), args.cores)
+        room = min(cpn, pmax)                     # the most cores one job can have on one node
+        if n <= cpn:                              # one node, shared with other jobs
+            cpus = math.ceil(mpc(n) / core_mb)
+            if cpus <= 1:
+                return result(1, n, 1, p, True, False)
+            if n * cpus <= room:
+                cheaper.append(((n * cpus, layout_key(nk, 1, n), order),
+                                (1, n, cpus, p, True, False, True)))
+            elif room // n:
+                over.append((mpc(n) / (core_mb * (room // n)), (1, n, room // n, p, False, False)))
+        first = math.ceil(n / cpn)                # whole nodes
+        last = min(args.max_nodes, int(pmax // cpn) if pmax < math.inf else args.max_nodes)
+        for k in range(first, last + 1):
+            layouts = node_layouts(nk, cpn, k, args.cores, nodes=k)
+            if not layouts:
+                continue
+            fit = next((lay for lay in layouts if lay[1] * mpc(k * lay[1]) <= core_mb * cpn),
+                       None)
+            if fit is None:
+                if k == last:                     # (the closest this partition comes)
+                    least = min(layouts, key=lambda lay: lay[1] * mpc(k * lay[1]))
+                    over.append((least[1] * mpc(k * least[1]) / (core_mb * cpn),
+                                 (k, least[1], cpn // least[1], p, False, True)))
+                continue
+            if n > cpn and k == first and fit == layouts[0]:      # whole nodes, as planned
+                return result(k, fit[1], cpn // fit[1], p, True, True)
+            cheaper.append(((k * cpn, layout_key(nk, *fit), order),
+                            (k, fit[1], cpn // fit[1], p, True, True, fit != layouts[0])))
+            break
+        skipped.append(p)
+    if cheaper:
+        return result(*min(cheaper, key=lambda c: c[0])[1])
+    if not over:
+        die(f"no partition can run a job with cores : {args.cores}" if args.cores else
+            "no partition can run this job: check max_nodes and the partitions' max_cores")
+    return result(*min(over, key=lambda o: o[0])[1])
 
 
 # Decides how and where a job runs, from its dry run.
@@ -1582,9 +1710,10 @@ def node_layouts(nk, cpn, max_nodes, fixed=None):
 # on its share of a node, cores_per_node // pack cores, on the first partition where the best
 # layout there fits in its share of PACK_MEM of the node's memory; only if none does is it planned
 # as a job of its own. Returns a namespace: nodes, tpn, ncores, mpc, part, fits, underpop, cpus,
-# skipped, and packed and share (its cores) for a packed job.
+# skipped, and packed and share (its cores) for a packed job. With charging : core, the job is
+# planned by core_resources instead.
 #   Called by: finalize()
-#   Calls:     choose_cores(), layout_key(), mem_per_core_mb(), node_layouts()
+#   Calls:     choose_cores(), core_resources(), layout_key(), mem_per_core_mb(), node_layouts()
 def choose_resources(dr, args, pack=1):
     """Processes (and nodes), memory per process (MB) and partition for a calculation,
     from its dry run. Partitions are tried in the order given and the first where the job
@@ -1592,6 +1721,8 @@ def choose_resources(dr, args, pack=1):
     partition fits with full nodes, the job runs with fewer processes per node, on the
     partition where that gives the best layout. With pack > 1 the job is planned on its
     share of a node if it fits there."""
+    if args.charging == "core":
+        return core_resources(dr, args)
     nk, cpn = dr["nkpts"], args.cores_per_node
     skipped, under, over = [], [], []
 
@@ -1917,10 +2048,11 @@ def prepare_all(calcs, ctx, args, show=True):
 # one-line summary of the layout. In batch mode with pack : N the job is planned on its share of a
 # node (choose_resources), 1/N of it or, given pack, 1/pack (pack=1: a job of its own, as for a
 # restart); run_batch then runs it with others in one job (submit_pack), and its own job.sh is
-# only used if it is ever submitted on its own.
+# only used if it is ever submitted on its own. With charging : core, a job on whole nodes gets
+# #SBATCH --exclusive and one on part of a node loses any the template has (set_exclusive).
 #   Called by: prepare_all(), prepare_sp(), restart(), run_batch()
 #   Calls:     add_sbatch_option(), choose_resources(), fill(), parse_dryrun(), plan_walltime(),
-#              run_time_for(), set_param(), set_threads(), thread_count()
+#              run_time_for(), set_exclusive(), set_param(), set_threads(), thread_count()
 def finalize(calc, text, ctx, args, quiet=False, show=True, pack=None):
     """Choose cores, memory and partition from the dry run and write the real jobscript.
     quiet: no warnings; show: log the plan; pack: how many jobs share its node (default: the
@@ -1930,6 +2062,7 @@ def finalize(calc, text, ctx, args, quiet=False, show=True, pack=None):
     npack = (args.pack if pack is None else pack) if ctx.get("batch") else 1
     r = choose_resources(dr, args, npack)
     ncores, mpc, part = r.ncores, r.mpc, r.part
+    core = args.charging == "core"
     if not quiet:
         if dr["mem"]["baseline"] > 2000 and args.baseline_mb is None and not ctx.get("noted"):
             ctx["noted"] = True
@@ -1943,11 +2076,12 @@ def finalize(calc, text, ctx, args, quiet=False, show=True, pack=None):
                 f"processes, more than any partition in %block partitions has. Using "
                 f"{part['name']} ({part['mem_per_core']:g} GB/core), where it may run out of "
                 "memory: check the estimate (baseline_mb, mem_replicated) or add a partition "
-                "with more.")
+                "with more" + (", or raise max_nodes." if core else "."))
         elif not r.fits:
             log(f"WARNING: {calc.name} needs ~{mpc / 1024:.1f} GB per core on {ncores} cores, "
                 f"more than mem_per_core ({args.mem_per_core} GB). It may run out of memory: "
-                "raise max_cores or use high-memory nodes (see %block partitions).")
+                + ("raise max_nodes" if core else "raise max_cores")
+                + " or use high-memory nodes (see %block partitions).")
         if dr["nelec"] and round(dr["nelec"]) % 2 == 1 and not dr["spin_polarized"]:
             log(f"WARNING: {calc.name} has an odd number of electrons ({dr['nelec']:.0f}) but "
                 "is not spin-polarised - consider spin_polarized : true in the .param")
@@ -1961,6 +2095,8 @@ def finalize(calc, text, ctx, args, quiet=False, show=True, pack=None):
     script = fill(ctx["job_template"], subs)
     threads = thread_count(r, args)             # omp_threads: use cores left idle
     script = set_threads(script, threads, r.cpus)
+    if core:                                    # whole nodes, or a share of one
+        script = set_exclusive(script, r.exclusive)
     if part:                                    # partition and its extra #SBATCH options
         script = add_sbatch_option(script, f"--partition={part['name']}")
         for option in part["options"]:
@@ -1984,22 +2120,31 @@ def finalize(calc, text, ctx, args, quiet=False, show=True, pack=None):
                 omp_threads=threads, dryrun_mem=dr["mem"],
                 mem_replicated=round(args.mem_replicated, 4),
                 walltime=wall.time, walltime_max=wall.max, scf_seconds=wall.per_scf,
-                packed=r.packed, share=r.share)
+                packed=r.packed, share=r.share, cpus_per_task=r.cpus,
+                charged_cores=r.charged if core else None, exclusive=r.exclusive if core else None)
     calc.save(info)
     if r.packed:
         size = (f"{r.tpn} processes" + (f" x {threads} threads" if threads > 1 else "")
                 + f" ({npack} jobs to a node, {r.share} cores each)")
         mem = f"~{mpc / 1024:.1f} GB/process"
+    elif core and not r.exclusive:              # part of a shared node
+        size = (f"{r.tpn} processes" + (f" x {r.cpus} cores" if r.cpus > 1 else "")
+                + f" ({r.charged} cores of a shared node)")
+        mem = f"~{mpc / 1024:.1f} GB/process (~{ncores * mpc / 1024:.0f} GB in all)"
     elif args.cores_per_node:
-        size = (f"{r.nodes} node{'s' if r.nodes > 1 else ''} x {r.tpn} processes"
-                + (f" x {threads} threads" if threads > 1 else ""))
+        size = (f"{r.nodes} {'whole ' if core else ''}node{'s' if r.nodes > 1 else ''} x "
+                f"{r.tpn} processes" + (f" x {threads} threads" if threads > 1 else ""))
         mem = f"~{mpc / 1024:.1f} GB/process (~{r.tpn * mpc / 1024:.0f} GB/node)"
     else:
         size = f"{ncores} cores"
         mem = f"~{mpc / 1024:.1f} GB/core (~{ncores * mpc / 1024:.0f} GB total)"
-    notes = ([f"{r.tpn} of {args.cores_per_node} cores per node used, to fit the memory"
-              + (" (the rest run OpenMP threads)" if threads > 1 else "")]
-             if r.underpop else [])
+    if r.underpop and core and not r.exclusive:
+        notes = [f"{r.cpus} cores per process, for the memory"
+                 + (f" ({threads} OpenMP threads each)" if threads > 1 else "")]
+    else:
+        notes = ([f"{r.tpn} of {args.cores_per_node} cores per node used, to fit the memory"
+                  + (" (the rest run OpenMP threads)" if threads > 1 else "")]
+                 if r.underpop else [])
     if r.fits and r.skipped:
         notes.append("too much for " + ", ".join(f"{p['name']} ({p['mem_per_core']:g} GB/core)"
                                                  for p in r.skipped))
@@ -2103,10 +2248,18 @@ def submit(calc, args, script=JOBSCRIPT, key="jobid"):
     record_job(calc, jobid, start, wall, key)
     info = calc.info()
     if key == "jobid":
-        size = (f"{info['nodes']} node{'s' if info['nodes'] > 1 else ''} x "
-                f"{info['tasks_per_node']} processes" if info.get("nodes")
-                else f"{info.get('ncores')} cores")
+        nodes, tpn, cpus = info.get("nodes"), info.get("tasks_per_node"), info.get("cpus_per_task")
         part = f" ({info['partition']})" if info.get("partition") else ""
+        if info.get("charged_cores") and not info.get("exclusive"):     # part of a shared node
+            size = (f"{tpn} processes" + (f" x {cpus} cores" if cpus and cpus > 1 else "")
+                    + f" ({info['charged_cores']} cores of a shared node"
+                    + (f", {info['partition']})" if info.get("partition") else ")"))
+            part = ""
+        elif nodes:
+            size = (f"{nodes} {'whole ' if info.get('exclusive') else ''}"
+                    f"node{'s' if nodes > 1 else ''} x {tpn} processes")
+        else:
+            size = f"{info.get('ncores')} cores"
         log(f"submitted {calc.name}: job {info[key]} on {size}{part}"
             + (f", walltime {wall}" if wall else ""))
     else:
@@ -2499,7 +2652,8 @@ def restart(calc, args):
     progress = unreadable or (geom and (bool(GEOM_STEP.search(seg)) or nscf > 1))
     per_scf, scf_procs = scf_seconds(calc)
     old_procs = (info.get("runs") or [{}])[-1].get("procs") or info.get("ncores")
-    old_layout = [info.get(k) for k in ("nodes", "tasks_per_node", "ncores", "partition")]
+    old_layout = [info.get(k) for k in ("nodes", "tasks_per_node", "ncores", "cpus_per_task",
+                                        "partition")]
     had, longest = (slurm_seconds(info.get(k) or "") for k in ("walltime", "walltime_max"))
     for run in info.get("runs", []):               # runs submitted by an older version
         run.setdefault("procs", info.get("ncores"))
@@ -2573,7 +2727,8 @@ def restart(calc, args):
            f"from the structure of its last geometry step (step {steps})" if steps else
            "from the structure in its .cell file" if geom else "from the start")
     log(f"{what} {why} - resubmitting it {how}" + (f" with walltime {tmax}" if tmax else ""))
-    layout = [info.get(k) for k in ("nodes", "tasks_per_node", "ncores", "partition")]
+    layout = [info.get(k) for k in ("nodes", "tasks_per_node", "ncores", "cpus_per_task",
+                                    "partition")]
     if desc and layout != old_layout:
         log(f"  {calc.name} planned again (mem_replicated {args.mem_replicated:g}): {desc}")
     submit(calc, args)
@@ -3321,6 +3476,13 @@ mem_replicated : auto             # fraction of CASTEP's memory copied on every 
                                   #   idle when it uses fewer processes per node to fit the
                                   #   memory: auto = all of them (up to 4), N = up to N,
                                   #   1 = off (default). Sets OMP_NUM_THREADS in the jobscript
+# Machines that share their nodes and charge by the core (e.g. Cirrus, 288 cores per
+# node): add charging : core, and {CPUS_PER_TASK} in the jobscript. Jobs then get up to
+# max_cores processes (as above) and ask for just the cores they need on one node, which
+# they share. The memory comes with the cores (a partition's GB per core), so a process
+# that needs more memory gets more cores. A job bigger than a node takes whole nodes
+# (--exclusive, charged in full), up to max_nodes (default: as many as max_cores needs).
+!charging       : core            # node (default with cores_per_node) | core
 
 # Partitions in order of preference: each job goes on the first one with enough
 # memory per core, so here himem is only used when 8 GB/core on multicore is too
@@ -3543,6 +3705,7 @@ KEYWORDS = {
     "singlepoint": (_bool, True),
     "max_cores": (_num(cast=int), 32), "cores": (_num(cast=int), None),
     "cores_per_node": (_num(cast=int), None), "max_nodes": (_num(cast=int), 1),
+    "charging": (_choice("node", "core"), "node"),
     "mem_per_core": (_num("GB"), None), "mem_safety": (_num(), 1.05),
     "mem_replicated": (_replicated, "auto"), "baseline_mb": (_num("MB"), None),
     "omp_threads": (_omp_threads, 1),
@@ -3653,7 +3816,9 @@ def convert_settings(items, name):
 
 # Checks the settings that control how jobs run, for both the size series and batch mode.
 # Numbers that must be at least 1, greater than 0 or not negative; cores_per_node with max_nodes
-# (not max_cores) and a cores value that splits evenly over the nodes; %block partitions without
+# (not max_cores, unless charging : core) and a cores value that splits evenly over the nodes;
+# charging : core with cores_per_node, the memory per core, no pack or dryrun_pack, and max_nodes
+# (by default the nodes max_cores or cores need) that holds the job; %block partitions without
 # mem_per_core, and with a partition that can take cores. Starts mem_replicated : auto at R_START.
 #   Called by: batch_args(), read_input()
 def check_runner(args, raw_vals, name):
@@ -3662,6 +3827,24 @@ def check_runner(args, raw_vals, name):
                 "pack", "dryrun_pack"):
         if getattr(args, key) is not None and getattr(args, key) < 1:
             die(f"{name}: {key} must be at least 1")
+    if args.charging == "core":              # nodes shared out, charged by the core
+        if not args.cores_per_node:
+            die(f"{name}: charging : core needs cores_per_node, the cores in a node (a job up "
+                "to that size shares a node; a bigger one takes whole nodes)")
+        if args.partitions is None and args.mem_per_core is None:
+            die(f"{name}: with charging : core the memory comes with the cores, so give how "
+                "much each core brings: mem_per_core, or a %block partitions")
+        for key in ("pack", "dryrun_pack"):
+            if getattr(args, key) > 1:
+                die(f"{name}: {key} shares a whole node out between jobs, but with charging : "
+                    "core jobs share nodes already - remove it")
+        want = args.cores or args.max_cores
+        nodes = math.ceil(want / args.cores_per_node)
+        if "max_nodes" not in raw_vals:
+            args.max_nodes = nodes
+        elif args.max_nodes < nodes:
+            die(f"{name}: {'cores' if args.cores else 'max_cores'} : {want} needs {nodes} nodes "
+                f"of {args.cores_per_node} cores, more than max_nodes : {args.max_nodes}")
     if args.pack > 1:                        # several jobs side by side on one node
         if not args.cores_per_node:
             die(f"{name}: pack shares out whole nodes, so it needs cores_per_node")
@@ -3675,8 +3858,9 @@ def check_runner(args, raw_vals, name):
         die(f"{name}: dryrun_pack : {args.dryrun_pack} is more dry runs than a node has cores "
             f"({args.cores_per_node})")
     if args.cores_per_node:
-        if "max_cores" in raw_vals:
-            die(f"{name}: with cores_per_node the job size is set by max_nodes - remove max_cores")
+        if "max_cores" in raw_vals and args.charging != "core":
+            die(f"{name}: with cores_per_node the job size is set by max_nodes - remove max_cores "
+                "(or set charging : core, on a machine that charges by the core)")
         if args.cores and not any(args.cores % k == 0 and args.cores // k <= args.cores_per_node
                                   for k in range(1, args.max_nodes + 1)):
             die(f"{name}: cores : {args.cores} can't be split evenly over at most "
@@ -3961,8 +4145,10 @@ def report(rows, workdir):
 # Checks the jobscript templates before anything is submitted, and returns them ready to use.
 # Adds a #!/bin/bash first line if a template has none (sbatch needs one), and stops if the main
 # template lacks a placeholder it needs ({SEED} and {NCORES}, or {NODES} and {TASKS_PER_NODE} with
-# cores_per_node), if the dry-run template has no {SEED}, if there is no line that runs CASTEP to
-# turn into a dry run, or if {PARTITION} is used without %block partitions (or dryrun_partition).
+# cores_per_node, and {CPUS_PER_TASK} too with charging : core, where a process may need more
+# than one core for its memory), if the dry-run template has no {SEED}, if there is no line that
+# runs CASTEP to turn into a dry run, or if {PARTITION} is used without %block partitions (or
+# dryrun_partition).
 # Returns (job_template, dryrun_template).
 #   Called by: main(), run_batch()
 def check_templates(args):
@@ -3979,8 +4165,12 @@ def check_templates(args):
             dryrun_template = "#!/bin/bash\n" + dryrun_template
     if args.cores_per_node:
         need = ["{SEED}", "{NODES}"] + ([] if "{NCORES}" in job_template else ["{TASKS_PER_NODE}"])
+        if args.charging == "core":         # the cores per process bring their memory
+            need.append("{CPUS_PER_TASK}")
         example = ("    #SBATCH --nodes={NODES}\n    #SBATCH --ntasks-per-node={TASKS_PER_NODE}\n"
-                   "    srun castep.mpi {SEED}")
+                   + ("    #SBATCH --cpus-per-task={CPUS_PER_TASK}\n"
+                      if args.charging == "core" else "")
+                   + "    srun castep.mpi {SEED}")
     else:
         need = ["{SEED}", "{NCORES}"]
         example = "    #SBATCH -n {NCORES}\n    mpirun -n {NCORES} castep.mpi {SEED}"

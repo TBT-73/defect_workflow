@@ -39,6 +39,7 @@ README, `README.md`.
 13. [Keyword reference](#keyword-reference)
 14. [Troubleshooting](#troubleshooting)
 15. [ARCHER2 example](#archer2-example)
+16. [Cirrus example](#cirrus-example)
 
 ---
 
@@ -48,7 +49,7 @@ README, `README.md`.
 - CASTEP, plus a batch system: Slurm by default. SGE/PBS work through `submit_cmd` and `status_cmd`.
 - **Optional:** `mace-torch` (Python 3.9+) for the MACE pre-relaxation: `pip install mace-torch`.
 
-On ARCHER2 a working environment is:
+On ARCHER2 or Cirrus a working environment is:
 
 ```bash
 module load PrgEnv-gnu cray-python
@@ -186,7 +187,7 @@ Copy the jobscript you normally use for CASTEP and put placeholders in it:
 |---|---|
 | `{SEED}` | the seedname (required) |
 | `{NCORES}` | number of MPI processes |
-| `{NODES}`, `{TASKS_PER_NODE}`, `{CPUS_PER_TASK}` | layout on whole-node machines (with `cores_per_node`) |
+| `{NODES}`, `{TASKS_PER_NODE}`, `{CPUS_PER_TASK}` | the layout with `cores_per_node`: nodes, processes per node, cores per process |
 | `{JOBNAME}` | job name |
 | `{NKPTS}` | number of k-points |
 | `{PARTITION}` | chosen partition |
@@ -196,8 +197,9 @@ Copy the jobscript you normally use for CASTEP and put placeholders in it:
 
 Memory estimates include `mem_safety`. The script also sets `#SBATCH --partition`, the
 partition's extra options and `--time` itself, replacing whatever the template has (in either
-spelling, e.g. `-p` or `--partition`). If the template has no `#!` first line, `#!/bin/bash` is
-added.
+spelling, e.g. `-p` or `--partition`). With `charging : core` it also adds `#SBATCH --exclusive`
+to a job on whole nodes and takes it out of a job on part of a node. If the template has no `#!`
+first line, `#!/bin/bash` is added.
 
 The `#SBATCH --time` in the template is the **longest any job may run**. See
 [Walltimes](#walltimes-and-automatic-restarts).
@@ -223,6 +225,52 @@ script tries every nodes × processes-per-node layout and ranks them by:
 2. a process count that divides evenly with the k-points (e.g. 126 of 128 cores for 14 k-points);
 3. the most processes;
 4. the fewest nodes.
+
+### Machines that charge by the core (`charging : core`, e.g. Cirrus)
+
+Some machines share their nodes between jobs and charge only for the cores a job asks for, with
+the memory tied to the cores: on Cirrus each core brings 2.66 GB (`standard`) or 5.33 GB
+(`highmem`), and `--mem` can't be given. There a job should ask for just what it needs. Set
+
+```
+cores_per_node : 288
+charging       : core
+max_cores      : 64
+%block partitions
+standard   2.66
+highmem    5.33
+%endblock partitions
+```
+
+and use `{NODES}`, `{TASKS_PER_NODE}` and `{CPUS_PER_TASK}` in the template (it must have
+`--cpus-per-task={CPUS_PER_TASK}`). Then, for each job:
+
+1. **Processes** as on core-based machines: up to `max_cores` (or exactly `cores`), k-point
+   parallelisation first.
+2. **Memory.** The job goes on the first partition where one core's memory holds a process, and
+   asks for just its processes' cores on one node (`--nodes=1`, `--ntasks-per-node=` the
+   processes, `--cpus-per-task=1`), sharing the node with other jobs. If no partition has enough,
+   each process gets as many cores as its memory needs (`--cpus-per-task`), on the partition
+   where that asks for the fewest cores in all (ties: the partition listed first). E.g. 32
+   processes of 4.5 GB each ask for 64 cores on `standard`, or 32 on `highmem`, which is taken.
+   With `omp_threads : auto`, the extra cores run OpenMP threads.
+3. **Whole nodes.** A job with more processes than a node has cores, or one that doesn't fit on
+   one node however its cores are spread, takes whole nodes with `#SBATCH --exclusive` (Cirrus
+   requires it for a job on more than one node, and charges for the whole nodes), up to
+   `max_nodes` (by default as many as `max_cores` needs). Those are laid out as on whole-node
+   machines, using all their cores: the best layout on the fewest nodes that hold the processes,
+   with fewer processes per node if the memory needs it.
+4. **Dry runs** (`dryrun_on : compute`) ask for the cores that hold `dryrun_mem_gb` (4 GB: 2
+   cores on `standard`), and never for `--exclusive`.
+
+The log gives what each job asks for, e.g.
+
+```
+submitted big: job 1004 on 32 processes x 2 cores (64 cores of a shared node, highmem), walltime 24:00:00
+```
+
+`pack` and `dryrun_pack`, which share out a whole node between jobs, are not used with
+`charging : core`: the jobs share nodes already. See the [Cirrus example](#cirrus-example).
 
 ### OpenMP threads on underpopulated nodes (`omp_threads`)
 
@@ -252,7 +300,9 @@ highmem    4   --qos=highmem
 Each line is `name GB_per_core [max_cores] [extra #SBATCH options]`. A job goes on the **first**
 partition where it fits in memory with full nodes. Only if none fits are fewer processes put on
 each node, on whichever partition gives the best layout; the log says so ("N of 128 cores per
-node used, to fit the memory").
+node used, to fit the memory"). With `charging : core`, "fits" means one core per process, and
+otherwise the job goes where more cores per process take the fewest cores
+([above](#machines-that-charge-by-the-core-charging--core-eg-cirrus)).
 
 ### Memory model
 
@@ -444,8 +494,8 @@ python3 supercell_convergence.py --batch jobs.batch
 
 A batch file is written like a `.conv` file and holds:
 
-- the runner settings: `jobscript`, `cores_per_node`, `max_nodes`, `%block partitions`,
-  `walltime`, `max_restarts`, `delete_check`, `dryrun_*`, `poll`, ...;
+- the runner settings: `jobscript`, `cores_per_node`, `charging`, `max_nodes` or `max_cores`,
+  `%block partitions`, `walltime`, `max_restarts`, `delete_check`, `dryrun_*`, `poll`, ...;
 - `param` (and `geom_param` for the relaxations): the `.param` every job starts from (the
   script sets `task`);
 - `cell`: the `.cell` every job copies `species_pot` and its other settings from (not its
@@ -487,11 +537,11 @@ table at the end and written to `batch_results.json` in the work directory. From
 `run_batch(workdir, jobs, args, cell_text, param_text, ...)`: its comment in the script lists
 the job options.
 
-**Several small jobs on one node (`pack : N`).** On machines that hand out whole nodes, N jobs
-can share one node in one batch job, each on `cores_per_node`/N cores. Each is planned for its
-share as usual (its k-points, the memory from its dry run); the jobs get `PACK_MEM` (three
-quarters) of the node's memory between them, in proportion to their cores, and one that doesn't
-fit in its share runs on its own. The pack's script, `packs/pack_NNN/job.sh` in the work
+**Several small jobs on one node (`pack : N`).** On machines that hand out whole nodes
+(`charging : node`), N jobs can share one node in one batch job, each on `cores_per_node`/N cores. Each is
+planned for its share as usual (its k-points, the memory from its dry run); the jobs get `PACK_MEM`
+(three quarters) of the node's memory between them, in proportion to their cores, and one that
+doesn't fit in its share runs on its own. The pack's script, `packs/pack_NNN/job.sh` in the work
 directory, is the template's `#SBATCH` lines for one whole node (with `--exclusive`, without
 `--ntasks-per-node` and `--cpus-per-task`) followed by one background line per job - `cd` to its
 directory, then `srun --nodes=1 --ntasks=n --cpus-per-task=c --exact --mem=...M` and the rest of
@@ -542,10 +592,11 @@ Defaults in brackets.
 **Resources**
 
 - `max_cores` [32], `cores`.
-- `cores_per_node`, `max_nodes` [1].
-- `omp_threads` [1]: auto | N, OpenMP threads per process on cores left idle by underpopulated nodes.
+- `cores_per_node`, `max_nodes` [1; with `charging : core`, as many as `max_cores` needs].
+- `charging` [node | core]: with `cores_per_node`, whether the machine charges whole nodes (each job fills its nodes) or shares them and charges by the core (each job asks for just its cores, see [above](#machines-that-charge-by-the-core-charging--core-eg-cirrus)).
+- `omp_threads` [1]: auto | N, OpenMP threads per process on cores left idle by underpopulated nodes (with `charging : core`, on a process's extra cores).
 - `%block partitions`.
-- `mem_per_core`: warning only, without partitions.
+- `mem_per_core`: without partitions, a warning only (with `charging : core`, the memory each core brings: required without partitions).
 - `mem_safety` [1.05].
 - `mem_replicated` [auto].
 - `baseline_mb`.
@@ -588,8 +639,8 @@ Defaults in brackets.
 
 - `max_jobs` [no limit]: the most jobs queued at once.
 - `tolerate_failures` [false]: a job that fails is marked failed and the others carry on.
-- `pack` [1]: run up to N jobs side by side on one node (needs `cores_per_node`).
-- `dryrun_pack` [1]: run up to N dry runs side by side in one job (`dryrun_on : compute`).
+- `pack` [1]: run up to N jobs side by side on one node (needs `cores_per_node`; not with `charging : core`).
+- `dryrun_pack` [1]: run up to N dry runs side by side in one job (`dryrun_on : compute`; not with `charging : core`).
 - `%block jobs`, plus `param`, `geom_param`, `cell`, `kspacing`, `energy`, `workdir`: see [Batch mode](#batch-mode).
 
 **Run control**
@@ -608,7 +659,9 @@ Defaults in brackets.
 | `could not read its .check file` warning | the `.check` was cut short, often because the **disk quota** is full. The relaxation carries on from its last geometry step. Check with `lfs quota -hu $USER /work/<project>` (or SAFE), and consider `delete_check : true` |
 | `did not converge within geom_max_iter` | raise `geom_max_iter` in the `.param` (e.g. 100), add `continuation : default` to that calculation's `.param`, and rerun with `--resubmit-failed` |
 | `the SCF did not converge` | raise `max_scf_cycles` or adjust the mixing, delete that calculation's directory and rerun |
-| `ran out of time before it finished a single geometry step` | give it more nodes (`max_nodes`) or a longer `#SBATCH --time` |
+| `ran out of time before it finished a single geometry step` | give it more nodes (`max_nodes`) or cores (`max_cores`), or a longer `#SBATCH --time` |
+| `charging : core needs cores_per_node` / `... the memory comes with the cores` | with `charging : core`, give `cores_per_node` and the memory per core (`%block partitions` or `mem_per_core`) |
+| `the jobscript template needs {CPUS_PER_TASK}` | with `charging : core` a process may need more than one core for its memory: add `#SBATCH --cpus-per-task={CPUS_PER_TASK}` |
 | `Serial nodes are shared nodes` (ARCHER2) | dry runs went to `serial` with an exclusive template; use `dryrun_partition : standard` |
 | script stopped when you logged out | it was started without `nohup`/`tmux`; rerun the same command |
 
@@ -698,3 +751,71 @@ tail -f out.log
 - **k-points:** the default keeps your bulk k-point density, which is very dense for large insulating supercells. Try `kspacing : 0.04` and compare E_f* for the 2x2x2 at both settings.
 - **Cut-off:** formation energies converge with cut-off faster than total energies, and a fixed-cell relaxation needs no stress convergence.
 - **Geometry tolerances:** `geom_energy_tol` is per atom, so it gets looser in total-energy terms as cells grow. Consider `geom_energy_tol : 5e-6 eV` with `elec_energy_tol : 5e-7 eV`, and `geom_max_iter : 100`.
+
+---
+
+## Cirrus example
+
+Cirrus shares its nodes (288 cores) between jobs and charges by the core, with 2.66 GB per core
+on `standard` and 5.33 GB on `highmem`. The same series as above, with `charging : core`:
+
+```
+cell      : CaO_convent.cell
+param     : CaO.param
+jobscript : cirrus.sh
+
+%block defect
+Sb_Ca
+Vac_O
+%endblock defect
+
+e_bulk      : -721.83 eV
+tol         : 0.05 eV
+sizes       : 2 3 4 5
+bulk_mode   : supercell
+singlepoint : false
+
+cores_per_node : 288
+charging       : core
+max_cores      : 288           # up to a node; more takes whole nodes (--exclusive)
+%block partitions
+standard   2.66
+highmem    5.33
+%endblock partitions
+
+walltime     : auto
+max_restarts : 20
+delete_check : true
+
+dryrun_on   : compute
+dryrun_time : 0:20:00
+poll        : 120
+```
+
+`cirrus.sh` (the QoS `standard` serves both partitions):
+
+```bash
+#!/bin/bash
+#SBATCH --job-name={JOBNAME}
+#SBATCH --time=24:00:00
+#SBATCH --nodes={NODES}
+#SBATCH --ntasks-per-node={TASKS_PER_NODE}
+#SBATCH --cpus-per-task={CPUS_PER_TASK}
+#SBATCH --account=<budget>
+#SBATCH --partition=standard
+#SBATCH --qos=standard
+
+module load castep
+
+export OMP_NUM_THREADS=1
+export OMP_PLACES=cores
+export SRUN_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK
+
+srun --distribution=block:block --hint=nomultithread castep.mpi {SEED}
+```
+
+A size whose k-points and memory fit in, say, 96 processes asks for
+`--nodes=1 --ntasks-per-node=96 --cpus-per-task=1` and is charged for 96 cores; one that needs 3 GB per
+process on 96 processes goes to `highmem` at one core each (96 cores) rather than `standard` at
+two (192). Check the first jobs with
+`sacct -j <job id> --format=JobID,Partition,AllocCPUS,ReqMem,MaxRSS,Elapsed`.
