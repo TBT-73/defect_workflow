@@ -90,7 +90,9 @@ file to start from.
 - CASTEP and Slurm (other schedulers through `submit_cmd` / `status_cmd`).
 
 On Cirrus (as on ARCHER2), put the environment on `/work`: the compute nodes, which run the MACE
-jobs, can't see `/home`. With your project code for `<project>`:
+jobs, can't see `/home`. Reaching it through a link in your home folder is fine: a venv's `activate`
+keeps the path it was made with, but `dwf.py` follows the link and gives the MACE jobs the `/work`
+path. With your project code for `<project>`:
 
 ```bash
 module load PrgEnv-gnu cray-python
@@ -132,18 +134,19 @@ cores or nodes, memory, walltime), submits it, waits and restarts a relaxation t
 time.
 Every step uses its batch mode, which runs the structures `dwf.py` builds.
 
-**The MACE jobs.** With `mace_jobscript`, B2's and C1's MACE relaxations run as Slurm jobs made
-from that template: its `{COMMAND}` line becomes up to `mace_pack` workers side by side (default
+**The MACE jobs.** With `mace_jobscript`, B2's and C1's MACE relaxations run as Slurm jobs made from
+that template: its `{COMMAND}` line becomes up to `mace_pack` workers side by side (default
 `cores_per_node` / `mace_threads`: 36 on Cirrus, 16 on ARCHER2), each running
 `python3 dwf.py --mace-worker tasks_NN.json` with `mace_threads` threads, and the relaxations are
-shared out between at most `mace_max_jobs` jobs, biggest first. A `{NCORES}` in the template
-becomes the cores the job's workers use (workers × `mace_threads`), so on Cirrus a job asks for,
-and is charged for, just those. Each result goes into its own
-cache file as soon as it is done, so a job that runs out of time loses only the relaxations it
-hadn't finished: they go into a new job (three times at most). The jobs wait in the queue, and
-`--no-wait`, `--prepare-only` and the `STOP` file work, as for the CASTEP jobs. A foundation
-model is downloaded where `dwf.py` runs and copied into `<workdir>/mace_models/`, where the
-compute nodes can read it.
+shared out between at most `mace_max_jobs` jobs, biggest first. A `{NCORES}` in the template becomes
+the cores the job's workers use (workers × `mace_threads`), so on Cirrus a job asks for, and is
+charged for, just those. Each result goes into its own cache file as soon as it is done, so a job
+that runs out of time loses only the relaxations it hadn't finished: they go into a new job, three
+times at most. After that the run stops and says how the last of those jobs ended (Slurm's time
+limit, or the last line of a worker's log, e.g. a Python error); once that is fixed,
+`--resubmit-failed` gives them three more jobs. The jobs wait in the queue, and `--no-wait`,
+`--prepare-only` and the `STOP` file work, as for the CASTEP jobs. A foundation model is downloaded
+where `dwf.py` runs and copied into `<workdir>/mace_models/`, where the compute nodes can read it.
 
 **Cores, nodes and walltimes for each step.** The runner settings in the project file
 ([Runner settings](#runner-settings): cores or nodes, walltime, partitions, ...) apply to every
@@ -298,7 +301,7 @@ python3 dwf.py <project>.dwf [STEP ...] [--until STEP] [--redo STEP] [--status] 
 | `--example` | print the annotated project file |
 | `--prepare-only` | write the inputs of the next CASTEP jobs (with their dry runs), submit nothing |
 | `--no-wait` | submit what is needed and exit; run it again later to carry on |
-| `--resubmit-failed` | start failed CASTEP jobs again |
+| `--resubmit-failed` | start failed CASTEP jobs again, and MACE relaxations whose jobs gave up |
 | `--force` | keep the results of jobs whose inputs have changed |
 | `--migrate` | move the folders of a work directory made by an older `dwf.py` (from before phase D was split out of phase C) to this layout; nothing runs again |
 
@@ -917,7 +920,7 @@ MACE has no charge or spin: it only prepares structures (B2, C1) and never ranks
 | `mace_jobscript` | — | — | A Slurm template (a file, or `%block mace_jobscript`) for running the MACE relaxations as jobs on compute nodes. It needs one line with `{COMMAND}`, which becomes the workers; whatever is in front of it on that line (e.g. `srun --exact --ntasks=1 --cpus-per-task=8`) goes in front of each. `{JOBNAME}` is filled in too. Without it, the relaxations run where `dwf.py` runs. See [section 7](#7-the-mace-jobscript-template-mace_jobscript). |
 | `mace_pack` | `cores_per_node` / `mace_threads` | — | Relaxations side by side in one MACE job (36 on Cirrus, 16 on ARCHER2, with 8 threads each). |
 | `mace_max_jobs` | `4` | — | The most MACE jobs a step's relaxations are shared out between. |
-| `mace_python` | the Python running `dwf.py` | — | The Python the MACE jobs run, with mace-torch. On Cirrus and ARCHER2 it must be on `/work`. |
+| `mace_python` | the Python running `dwf.py` | — | The Python the MACE jobs run, with mace-torch. On Cirrus and ARCHER2 it must be on `/work`. A linked folder in its path (e.g. a `~/shared` that links to `/work/...`) is followed, so the jobs get the `/work` path. |
 
 #### A: host
 
@@ -1445,7 +1448,11 @@ cores per process), while a fifth on `standard` ran on its own; each job with it
 and `--mem-per-cpu` (the pack's `SLURM_MEM_PER_CPU` when Slurm sets it, the partition's GB per core
 when not). With `charging : node` (ARCHER2) the runner plans exactly the same jobs as before (576
 made-up dry runs over five sets of settings, `pack` included), and its packs' job scripts are
-unchanged. The whole workflow has not been run against the mock since this split.
+unchanged. The whole workflow has not been run against the mock since this split. The MACE jobs were
+then checked through the mock Slurm on their own: with `dwf.py` run by a venv's Python reached
+through a linked folder, the jobs got its `/work` path; with a Python the job couldn't find, the run
+stopped after three jobs with the end of the worker's log (as did a job stopped at its time limit,
+with Slurm's message), and `--resubmit-failed` gave the relaxations three more.
 
 Not tested: real Cirrus jobs (see 8 below), `phases_from : doped` (no Materials Project access here), a real fine-tuned model
 (`finetune.sh` is written but was not run), real CASTEP ΔSCF (D7), real Slurm for the MACE jobs,

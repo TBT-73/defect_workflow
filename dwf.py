@@ -986,7 +986,8 @@ def main():
     ap.add_argument("--no-wait", action="store_true",
                     help="submit what is needed and exit instead of waiting; rerun later")
     ap.add_argument("--resubmit-failed", action="store_true",
-                    help="start failed CASTEP jobs again")
+                    help="start failed CASTEP jobs again, and MACE relaxations whose jobs "
+                    "gave up")
     ap.add_argument("--force", action="store_true",
                     help="keep the results of jobs whose inputs have changed")
     ap.add_argument("--migrate", action="store_true",
@@ -1756,22 +1757,39 @@ def mace_relaxations(p, step, tasks):
     return out
 
 
-# The MACE relaxations a step still needs (mace_relaxations), run as batch jobs on compute nodes,
-# in <phase>/jobs/mace_<step>/job_NNN/. Each job is the mace_jobscript template with its {COMMAND}
-# line made into mace_pack workers, each running  python3 dwf.py --mace-worker tasks_KK.json  in
-# the background with mace_threads threads (whatever is in front of {COMMAND} on its line, e.g.
-# srun ..., goes in front of each), then wait; a {NCORES} in the template becomes the cores those
-# workers use (workers x mace_threads), so on a machine that charges by the core (charging : core)
-# a job asks for just those. The relaxations are shared out between at most
-# mace_max_jobs jobs, biggest first, onto whichever worker has the fewest atoms so far, so the
-# workers finish together. The jobs go in jobs.json there; waiting polls the queue (status_cmd)
-# every poll seconds, like the CASTEP jobs, and the project's STOP file stops it. A relaxation still
-# missing once its job has ended (e.g. it ran out of time) goes into a new job, at most
-# MACE_ATTEMPTS times. Returns True when every relaxation is done, False while jobs are queued
-# (--no-wait) or after --prepare-only (the job scripts are then in prepared/).
+# The Python the MACE jobs run: mace_python, or else the one running dwf.py, with any linked folder
+# on its path followed to where it really is (e.g. a ~/shared that links to /work/...), as the
+# compute nodes may not see the link's side (on Cirrus and ARCHER2, /home). Only the folders: a
+# venv's bin/python is itself a link to the Python the venv was made from, and following that
+# would leave the venv. A bare command (e.g. python3) is left to the job's PATH.
+#   Called by: mace_jobs()
+def mace_python(p):
+    py = p.s.mace_python or sys.executable
+    if "/" not in py:
+        return py
+    path = Path(py).expanduser()
+    return str(path.parent.resolve() / path.name)
+
+
+# The MACE relaxations a step still needs (mace_relaxations), run as batch jobs on compute nodes, in
+# <phase>/jobs/mace_<step>/job_NNN/. Each job is the mace_jobscript template with its {COMMAND} line
+# made into mace_pack workers, each running  <python> dwf.py --mace-worker tasks_KK.json  (the
+# python from mace_python()) in the background with mace_threads threads (whatever is in front of
+# {COMMAND} on its line, e.g. srun ..., goes in front of each), then wait; a {NCORES} in the
+# template becomes the cores those workers use (workers x mace_threads), so on a machine that
+# charges by the core (charging : core) a job asks for just those. The relaxations are shared out
+# between at most mace_max_jobs jobs, biggest first, onto whichever worker has the fewest atoms so
+# far, so the workers finish together. The jobs go in jobs.json there; waiting polls the queue
+# (status_cmd) every poll seconds, like the CASTEP jobs, and the project's STOP file stops it. A
+# relaxation still missing once its job has ended (e.g. it ran out of time) goes into a new job, at
+# most MACE_ATTEMPTS times; then the run stops, with how the last of its jobs ended (why_ended).
+# --resubmit-failed gives those relaxations another MACE_ATTEMPTS jobs. Returns True when every
+# relaxation is done, False while jobs are queued (--no-wait) or after --prepare-only (the job
+# scripts are then in prepared/).
 #   Called by: mace_relaxations()
 #   Calls:     Project.mace_model_file(), Project.mace_runner(), Project.mace_template(),
-#              atoms_to_dict(), mace_cached(), write_json(), sc.job_active(), sc.send_job()
+#              atoms_to_dict(), mace_cached(), mace_python(), write_json(), sc.job_active(),
+#              sc.send_job()
 def mace_jobs(p, step, todo):
     args = p.mace_runner()
     d = p.phase_dir(STEP_INDEX[step].phase) / "jobs" / f"mace_{step}"
@@ -1783,6 +1801,12 @@ def mace_jobs(p, step, todo):
     pack = p.s.mace_pack or max(1, (args.cores_per_node or p.s.mace_threads) // p.s.mace_threads)
     label, model = STEP_INDEX[step].label, p.mace_model_file()
     announced = False
+    worn = [t for t in todo if state["tries"].get(str(t["cache"]), 0) >= MACE_ATTEMPTS]
+    if worn and getattr(p.cl, "resubmit_failed", False):       # the cause fixed: try again
+        for t in worn:
+            state["tries"][str(t["cache"])] = 0
+        log(f"{label}: --resubmit-failed: {len(worn)} MACE relaxations whose jobs gave up get "
+            "another go")
 
     # Whether a job is over: not in the queue, and either its end mark is there or it was
     # submitted long enough ago that the queue must know it (so a slow queue isn't taken for a
@@ -1791,6 +1815,20 @@ def mace_jobs(p, step, todo):
         if sc.job_active(job["jobid"], args):
             return False
         return (Path(job["dir"]) / "finished").exists() or time.time() - job["time"] > 120
+
+    # How a job that left relaxations undone ended, from its folder: stopped by Slurm at its time
+    # limit (its Slurm output says so), or else the last line of the first of its workers' logs,
+    # then of its Slurm output, with anything in it (e.g. a Python error, or a Python the compute
+    # node couldn't find).
+    def why_ended(jdir):
+        outs = sorted(jdir.glob("slurm-*.out"))
+        if any("DUE TO TIME LIMIT" in f.read_text(errors="replace") for f in outs):
+            return "Slurm stopped it at its time limit (give mace_jobscript a longer --time)"
+        for f in sorted(jdir.glob("worker_*.log")) + outs:
+            lines = [x.strip() for x in f.read_text(errors="replace").splitlines() if x.strip()]
+            if lines:
+                return f"{f.name} ends with: {lines[-1][:300]}"
+        return "its workers' logs and Slurm output are empty"
 
     # Writes the scripts of new jobs for some relaxations into a folder each (its task files, one
     # per worker, and job.sh); returns [(folder, [cache files])].
@@ -1820,7 +1858,7 @@ def mace_jobs(p, step, todo):
             i = next(k for k, line in enumerate(lines)
                      if "{COMMAND}" in line and not line.lstrip().startswith("#"))
             pre, post = lines[i].split("{COMMAND}", 1)
-            py, me = p.s.mace_python or sys.executable, str(Path(__file__).resolve())
+            py, me = mace_python(p), str(Path(__file__).resolve())
             run = [f"{pre}env OMP_NUM_THREADS={p.s.mace_threads} {shlex.quote(py)} "
                    f"{shlex.quote(me)} --mace-worker {shlex.quote(str(f.resolve()))}{post} > "
                    f"{shlex.quote(str((jdir / f'worker_{k + 1:02d}.log').resolve()))} 2>&1 &"
@@ -1847,14 +1885,17 @@ def mace_jobs(p, step, todo):
         busy = {c for j in active for c in j["caches"]}
         new = [t for t in left if str(t["cache"]) not in busy]
         if new:
-            worn = [t["label"] for t in new if state["tries"].get(str(t["cache"]), 0)
-                    >= MACE_ATTEMPTS]
+            worn = [t for t in new if state["tries"].get(str(t["cache"]), 0) >= MACE_ATTEMPTS]
             if worn:
+                names, caches = [t["label"] for t in worn], {str(t["cache"]) for t in worn}
+                last = next((Path(j["dir"]) for j in reversed(state["jobs"])
+                             if caches & set(j["caches"])), None)
                 die(f"{label}: the MACE jobs ended {MACE_ATTEMPTS} times without these "
-                    f"relaxations: {', '.join(worn[:8])}"
-                    + (f" and {len(worn) - 8} more" if len(worn) > 8 else "")
-                    + f". See the workers' logs and slurm output in {d}/job_*/ (e.g. a longer "
-                    "--time in mace_jobscript)")
+                    f"relaxations: {', '.join(names[:8])}"
+                    + (f" and {len(names) - 8} more" if len(names) > 8 else "")
+                    + (f". The last of their jobs, {last.name}: {why_ended(last)}" if last else "")
+                    + f". The workers' logs and Slurm output are in {d}/job_*/; once the cause is "
+                    "fixed, rerun with --resubmit-failed")
             if p.cl.prepare_only:
                 shutil.rmtree(d / "prepared", ignore_errors=True)
                 write_jobs(new, lambda j: d / "prepared" / f"job_{j + 1:03d}")
