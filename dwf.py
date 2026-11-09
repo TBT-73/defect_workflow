@@ -124,6 +124,9 @@ HB2M = 3.80998                                # hbar^2 / (2 m_e), eV Ang^2
 # B2: the atoms at a supercell's edge, whose MACE displacements show whether a defect's strain
 # field fits in it, are those further than this fraction of the shortest image distance from it
 EDGE_FRACTION = 0.35
+# B2 (scan_test : line): how many bigger sizes must lie on the R = R_inf - c/N line with a size for
+# a candidate to count as converged there
+SCAN_CONFIRM = 3
 # B3: the Gamma-only floor is this many decay lengths of the shallowest deep level
 FLOOR_DECAYS = 4.0
 # C2: a Gamma-point gap of the screening cell this much above A2.2's means band edges that don't
@@ -205,6 +208,7 @@ PROJECT_KEYWORDS = {
     "native_pairs": (_b, False), "dopant_pairs": (_b, False),
     "scan": (_b, True), "scan_lengths": (_floats(), [8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0]),
     "scan_tol": (sc._num("eV"), 0.02), "scan_edge_tol": (sc._num("ang", "A"), 0.05),
+    "scan_test": (sc._choice("line", "flat"), "line"),
     "supercell": (_size, None), "screen_min_image": (sc._num("ang", "A"), None),
     # C: screening
     "screen_charges": (sc._ints(), [-1, 0, 1]),
@@ -2894,19 +2898,41 @@ def ladder_table(ladder, title, mark=None):
                          for c in ladder], title)
 
 
+# The line R = R_inf - c/N through some of a candidate's B2 relaxation energies (least squares;
+# N, the atoms of each size's host supercell). They take that form once the cell holds the
+# defect's relaxation and what still changes with size is only the energy of the stress the fixed
+# cell holds, which falls off as 1/volume (as N). Returns (R_inf, c, the largest distance in eV
+# of any of the points from the line).
+#   Called by: step_scan()
+def inverse_n_fit(points):
+    x = np.array([1.0 / q["N"] for q in points])
+    y = np.array([q["E_relax"] for q in points])
+    A = np.vstack([np.ones_like(x), -x]).T
+    (r_inf, c), *_ = np.linalg.lstsq(A, y, rcond=None)
+    return float(r_inf), float(c), float(np.abs(A @ [r_inf, c] - y).max())
+
+
 # B2: the size ladder (size_ladder: the supercell for each of scan_lengths) and, with mace : true
 # and scan : true, the MACE scan of every candidate. Each candidate is built in every size it fits
-# (fits) and relaxed with MACE (positions only, mace_model; mace_relaxations, on compute nodes
-# with mace_jobscript). Its relaxation energy (unrelaxed - relaxed) and the largest displacement
-# of the atoms at the cell's edge (further than EDGE_FRACTION of the shortest image distance from
-# the defect's centre) show whether the cell holds its relaxation: it is converged at the smallest
-# size whose relaxation energy is within scan_tol of that of every bigger size, with its edge
-# displacement below scan_edge_tol. One that never is (or fits only the largest size) is not
-# converged, and B3 counts it as needing the largest size.
+# (fits) and relaxed with MACE (positions only, the host's lattice vectors kept, as in C and E;
+# mace_model; mace_relaxations, on compute nodes with mace_jobscript). Its relaxation energy R
+# (unrelaxed - relaxed) shows whether the cell holds the relaxation. With scan_test : line (the
+# default) a candidate is converged at the smallest size from which R lies on a line
+# R_inf - c/N: that size and every bigger one (at least SCAN_CONFIRM of them) within scan_tol of
+# the line fitted through them (inverse_n_fit). A defect that strains the crystal leaves the
+# fixed cell holding a stress, whose energy, c/N, falls off only as 1/N; once R follows the line,
+# that is all that still changes with size. The table gives R_inf, c, and c/N in the converged
+# size: the stress energy still in that cell, which cancels between arrangements of one
+# composition but not between charge states. With scan_test : flat it is converged at the
+# smallest size whose R is within scan_tol of that of every bigger size, with the atoms at the
+# cell's edge (further than EDGE_FRACTION of the shortest image distance from the defect's centre)
+# moved less than scan_edge_tol; the edge displacement is shown with either test. One that never
+# converges (or, with line, hasn't SCAN_CONFIRM bigger sizes) counts in B3 as needing the largest
+# size. Relaxations that stopped at mace_steps are named in the log.
 #   Called by: main() (step B2)
-#   Calls:     Project.host(), build_defect(), fits(), format_table(), ladder_table(),
-#              mace_cache(), mace_relaxations(), size_ladder(), sc.displacements(),
-#              sc.get_distances()
+#   Calls:     Project.host(), build_defect(), fits(), format_table(), inverse_n_fit(),
+#              ladder_table(), mace_cache(), mace_relaxations(), size_ladder(),
+#              sc.displacements(), sc.get_distances()
 def step_scan(p):
     prim = p.host()
     ladder = size_ladder(p, prim)
@@ -2930,7 +2956,8 @@ def step_scan(p):
     res = mace_relaxations(p, "scan", tasks)
     if res is None:
         return None
-    out, rows = {}, []
+    line = p.s.scan_test == "line"
+    out, rows, capped = {}, [], []
     for cid, c in cands.items():
         seen = []
         for cell in ladder:
@@ -2942,33 +2969,63 @@ def step_scan(p):
             _, r = sc.get_distances(np.array(info["centre"])[None], atoms.positions,
                                     cell=atoms.cell, pbc=True)
             edge = moved[r[0] > EDGE_FRACTION * cell["L"]]
-            seen.append({"tag": cell["tag"], "L": cell["L"], "E_relax": round(e0 - e1, 5),
+            seen.append({"tag": cell["tag"], "L": cell["L"], "N": cell["natoms"],
+                         "E_relax": round(e0 - e1, 5),
                          "edge": round(float(edge.max()) if edge.size else 0.0, 4),
                          "steps": steps})
-        conv = next((x["tag"] for i, x in enumerate(seen[:-1])
-                     if x["edge"] < p.s.scan_edge_tol and
-                     all(abs(y["E_relax"] - x["E_relax"]) < p.s.scan_tol for y in seen[i + 1:])),
-                    None)
-        out[cid] = {"sizes": seen, "converged": conv}
+            if steps >= p.s.mace_steps:
+                capped.append(f"{cid} in {cell['tag']}")
+        conv, fit = None, None
+        if line:                            # the first size on a line with the bigger ones
+            for i in range(len(seen) - SCAN_CONFIRM):
+                r_inf, slope, worst = inverse_n_fit(seen[i:])
+                if worst < p.s.scan_tol:
+                    conv = seen[i]["tag"]
+                    fit = {"R_inf": round(r_inf, 4), "c": round(slope, 3),
+                           "worst": round(worst, 4), "sizes": len(seen) - i}
+                    break
+        else:
+            conv = next((x["tag"] for i, x in enumerate(seen[:-1])
+                         if x["edge"] < p.s.scan_edge_tol and
+                         all(abs(y["E_relax"] - x["E_relax"]) < p.s.scan_tol
+                             for y in seen[i + 1:])), None)
+        out[cid] = dict({"sizes": seen, "converged": conv}, **({"fit": fit} if fit else {}))
         by = {x["tag"]: x for x in seen}
         here = by.get(conv)
-        rows.append([cid, c["name"]]
-                    + [f"{by[t]['E_relax']:.3f}" + ("*" if t == conv else "") if t in by else ""
-                       for t in (cell["tag"] for cell in ladder)]
-                    + [f"{here['L']:.2f}" if here else "not converged",
-                       here["edge"] if here else None])
-    table = format_table(["id", "defect"] + [cell["tag"] for cell in ladder]
-                         + ["converged at L/A", "edge move/A"], rows,
-                         "MACE relaxation energies (eV) of each candidate in each size; * where "
-                         f"it is converged (within scan_tol {p.s.scan_tol:g} eV of every bigger "
-                         f"size, edge atoms moved less than scan_edge_tol {p.s.scan_edge_tol:g} "
-                         "A)")
+        row = ([cid, c["name"]]
+               + [f"{by[t]['E_relax']:.3f}" + ("*" if t == conv else "") if t in by else ""
+                  for t in (cell["tag"] for cell in ladder)]
+               + [f"{here['L']:.2f}" if here else "not converged"])
+        if line:
+            row += ([f"{fit['R_inf']:.3f}", f"{fit['c']:.1f}", f"{fit['c'] / here['N']:.3f}"]
+                    if fit else ["", "", ""])
+        rows.append(row + [here["edge"] if here else None])
+    if line:
+        heads = ["converged at L/A", "R_inf/eV", "c/eV", "c/N there/eV", "edge move/A"]
+        title = ("MACE relaxation energies R (eV) of each candidate in each size, the cell fixed; "
+                 f"* where it has converged: from that size up (it and at least {SCAN_CONFIRM} "
+                 f"bigger sizes) R is within scan_tol {p.s.scan_tol:g} eV of a line R_inf - c/N, "
+                 "N the cell's atoms. c/N there: the energy of the stress the fixed cell still "
+                 "holds in the converged size; the edge move is shown, not tested")
+    else:
+        heads = ["converged at L/A", "edge move/A"]
+        title = ("MACE relaxation energies (eV) of each candidate in each size; * where it is "
+                 f"converged (within scan_tol {p.s.scan_tol:g} eV of every bigger size, edge "
+                 f"atoms moved less than scan_edge_tol {p.s.scan_edge_tol:g} A)")
+    table = format_table(["id", "defect"] + [cell["tag"] for cell in ladder] + heads, rows, title)
+    if capped:
+        log(f"note: B2: {len(capped)} MACE relaxations stopped at mace_steps "
+            f"({p.s.mace_steps}) before their forces were below mace_fmax: "
+            + ", ".join(capped[:8]) + (f" and {len(capped) - 8} more" if len(capped) > 8 else "")
+            + " (raise mace_steps)")
     bad = sorted(cid for cid, x in out.items() if not x["converged"])
     if bad:
         log(f"note: B2: {len(bad)} candidates did not converge within the ladder (up to "
             f"{ladder[-1]['L']:.1f} A): {', '.join(bad)}; B3 counts them as needing the largest "
-            "size")
-    return {"ladder": ladder, "candidates": out, "_table": sizes + "\n" + table,
+            "size" + (f" (the line test needs a size and {SCAN_CONFIRM} bigger ones on the line: "
+                      "longer scan_lengths add sizes)" if line else ""))
+    return {"ladder": ladder, "candidates": out, "test": p.s.scan_test,
+            "_table": sizes + "\n" + table,
             "_note": f"{len(ladder)} sizes, {len(out) - len(bad)} of {len(out)} candidates "
                      "converged" + (f" ({', '.join(bad)} not)" if bad else "")}
 
@@ -4712,8 +4769,8 @@ STEPS = [
          keys=("dopants", "defects", "vacancies", "antisites", "interstitials", "pairs",
                "pair_max_distance", "native_pairs", "dopant_pairs"), needs=("relax",)),
     Step("scan", "B2", "supercell sizes, and the MACE scan of every candidate", step_scan,
-         keys=("mace", "scan", "scan_lengths", "scan_tol", "scan_edge_tol", "mace_model",
-               "mace_fmax", "mace_steps", "transform"), needs=("generate", "relax"),
+         keys=("mace", "scan", "scan_lengths", "scan_tol", "scan_edge_tol", "scan_test",
+               "mace_model", "mace_fmax", "mace_steps", "transform"), needs=("generate", "relax"),
          owns=("B_candidates/mace", "B_candidates/jobs/mace_scan", "B_candidates/ladder.json")),
     Step("choose", "B3", "the screening cell", step_choose,
          keys=("supercell", "transform", "screen_min_image", "deep_level_margin", "scan_lengths"),
@@ -4902,13 +4959,16 @@ pair_max_distance : 5.0 ang    # ... up to this far apart
 native_pairs  : false
 dopant_pairs  : false
 # B2: the supercell sizes, as lengths (the shortest distance between periodic images), and
-# the MACE scan of every candidate in each. A candidate is converged at the smallest size whose
-# MACE relaxation energy is within scan_tol of every bigger size's, with the atoms at the cell's
-# edge moved less than scan_edge_tol. The largest length is the most B3 and E0 will use.
+# the MACE scan of every candidate in each. A candidate is converged at the smallest size from
+# which its MACE relaxation energy R lies on a line R_inf - c/N (N: the cell's atoms): that size
+# and at least 3 bigger ones within scan_tol of it. c/N is the energy of the stress the fixed cell
+# holds. The largest length is the most B3 and E0 will use (and the line test needs 3 sizes above
+# the one it picks).
 scan          : true
 scan_lengths  : 8 10 12 14 16 18 20 ang
 scan_tol      : 0.02 eV
-scan_edge_tol : 0.05 ang
+scan_test     : line           # line | flat: R within scan_tol of every bigger size's, and the
+scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this (flat only)
 # B3: the screening cell is the smallest size that holds every candidate (B2) and is at least
 # the Gamma-only floor, estimated from the band edges' effective masses (A2.2) for the
 # shallowest deep level (deep_level_margin, below).
