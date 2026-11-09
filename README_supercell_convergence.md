@@ -269,8 +269,19 @@ The log gives what each job asks for, e.g.
 submitted big: job 1004 on 32 processes x 2 cores (64 cores of a shared node, highmem), walltime 24:00:00
 ```
 
-`pack` and `dryrun_pack`, which share out a whole node between jobs, are not used with
-`charging : core`: the jobs share nodes already. See the [Cirrus example](#cirrus-example).
+**Fewer waits in the queue (batch mode).** Each job still waits in the queue on its own. With
+`pack : N`, up to N jobs on part of a node go in one job instead: the first in the queue and the
+ones after it on the same partition, as long as their cores fit on one node. The pack asks for all
+their cores (e.g. 4 jobs of 64 cores: `--ntasks-per-node=256 --cpus-per-task=1`, no `--exclusive`),
+and each job runs in it with its own `srun --exact`, its own processes and cores per process, and
+`--mem-per-cpu` for the memory its cores bring (`SLURM_MEM_PER_CPU`, which Slurm sets in the job, so
+that the jobs' memory adds up to the pack's; the partition's GB per core if it isn't set). Each job
+keeps its own plan. `dryrun_pack : N` does the same for the dry runs: N of them in one job, each
+with the cores for `dryrun_mem_gb`, at most a node's worth. A pack holds all its cores until its
+last job ends, and you are charged for them, so pack jobs that take about as long as each other: dry
+runs, A1's single points, a step's screening runs. Cirrus takes no `--mem` options for a job;
+whether it takes `--mem-per-cpu` on the job steps inside one is worth checking on the first pack
+(`slurm-<id>.out` in each job's folder). See the [Cirrus example](#cirrus-example).
 
 ### OpenMP threads on underpopulated nodes (`omp_threads`)
 
@@ -538,7 +549,9 @@ table at the end and written to `batch_results.json` in the work directory. From
 the job options.
 
 **Several small jobs on one node (`pack : N`).** On machines that hand out whole nodes
-(`charging : node`), N jobs can share one node in one batch job, each on `cores_per_node`/N cores. Each is
+(`charging : node`), N jobs can share one node in one batch job, each on `cores_per_node`/N cores
+(with `charging : core`, a pack asks for its jobs' own cores instead:
+[above](#machines-that-charge-by-the-core-charging--core-eg-cirrus)). Each is
 planned for its share as usual (its k-points, the memory from its dry run); the jobs get `PACK_MEM`
 (three quarters) of the node's memory between them, in proportion to their cores, and one that
 doesn't fit in its share runs on its own. The pack's script, `packs/pack_NNN/job.sh` in the work
@@ -550,13 +563,15 @@ in its own directory, and its `job_info.json` records the pack. When fewer than 
 they share the node evenly; a job left on its own is planned for whole nodes. A job that needs a
 restart runs on its own. The template's CASTEP line must use `srun`.
 
-**Dry runs in one job (`dryrun_pack : N`).** With `dryrun_on : compute`, each dry run is otherwise
-a job of its own. `dryrun_pack : N` runs up to N of them side by side in one job
+**Dry runs in one job (`dryrun_pack : N`).** With `dryrun_on : compute`, each dry run is otherwise a
+job of its own. `dryrun_pack : N` runs up to N of them side by side in one job
 (`packs/dryrun_NNN/job.sh`): the dry-run template's `#SBATCH` lines for N processes on one node,
 with `dryrun_partition`, `dryrun_time` and `dryrun_options`, then one background line per dry run
-(`srun --ntasks=1 --exact --mem=<dryrun_mem_gb>`) and `wait`. On a partition whose nodes are
-shared, ask for the memory too, e.g. `dryrun_options : --mem={MEM_GB}G` (`{MEM_GB}` is then N ×
-`dryrun_mem_gb`).
+(`srun --ntasks=1 --exact --mem=<dryrun_mem_gb>`) and `wait`. On a partition whose nodes are shared,
+ask for the memory too, e.g. `dryrun_options : --mem={MEM_GB}G` (`{MEM_GB}` is then N ×
+`dryrun_mem_gb`). With `charging : core` the memory comes with the cores instead: each dry run gets
+the cores that hold `dryrun_mem_gb`, and its `srun` asks for their memory with `--mem-per-cpu` (the
+job's `SLURM_MEM_PER_CPU` for each).
 
 ---
 
@@ -639,8 +654,8 @@ Defaults in brackets.
 
 - `max_jobs` [no limit]: the most jobs queued at once.
 - `tolerate_failures` [false]: a job that fails is marked failed and the others carry on.
-- `pack` [1]: run up to N jobs side by side on one node (needs `cores_per_node`; not with `charging : core`).
-- `dryrun_pack` [1]: run up to N dry runs side by side in one job (`dryrun_on : compute`; not with `charging : core`).
+- `pack` [1]: run up to N jobs side by side on one node, in one job (needs `cores_per_node`; with `charging : core`, jobs on part of a node, as many as one node holds).
+- `dryrun_pack` [1]: run up to N dry runs side by side in one job (`dryrun_on : compute`).
 - `%block jobs`, plus `param`, `geom_param`, `cell`, `kspacing`, `energy`, `workdir`: see [Batch mode](#batch-mode).
 
 **Run control**

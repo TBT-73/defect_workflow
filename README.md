@@ -218,11 +218,36 @@ them). A job with more processes than a node has cores takes whole nodes with `-
 `64 processes x 2 cores (128 cores of a shared node, standard)`. The jobscript needs `{NODES}`,
 `{TASKS_PER_NODE}` and `{CPUS_PER_TASK}` (as in `cirrus.sh`).
 
-**Several small jobs on one node (`pack`).** On a machine that charges for whole nodes, however few
-cores a job uses, and never shares them between jobs (ARCHER2; `charging : node`, the default with
-`cores_per_node`), `pack : N` in a step's block runs N of that step's CASTEP jobs side by side in
-one Slurm job on one node, each on 1/N of its cores: with `pack : 4`, four jobs of 32 cores each.
-It suits steps with many small jobs, such as A1's single points of the primitive cell:
+**Fewer waits in the queue on Cirrus (`pack`, `dryrun_pack`).** Each job, and each dry run,
+otherwise waits in the queue on its own. `pack : N` puts up to N of a step's jobs in one Slurm job,
+which asks for all their cores on one node, as long as they fit (288 cores) and are on the same
+partition: e.g. eight of A1's 16-core single points in one 128-core job. Each job keeps its own plan
+and runs with its own `srun --exact`, asking with `--mem-per-cpu` for its cores' share of the pack's
+memory (`SLURM_MEM_PER_CPU`, which Slurm sets in the job). `dryrun_pack : N` does the same for the
+dry runs (2 cores each, so up to 144 in one job):
+
+```
+dryrun_pack : 16               # every step: 16 dry runs to a job
+%block runner_converge         # A1
+max_cores    : 16
+max_walltime : 0:20:00
+pack         : 8               # eight single points to a job, 128 cores
+%endblock runner_converge
+```
+
+A pack holds all its cores until its last job ends, and you are charged for them, so pack jobs
+that take about as long as each other (dry runs, A1's single points, a step's screening runs)
+rather than relaxations of very different sizes. The pack asks for the longest walltime of its
+jobs; a job that has to be restarted runs on its own. Cirrus takes no `--mem` options for a job:
+check on the first pack that it takes `--mem-per-cpu` on the job steps inside it (each job's
+`slurm-<id>.out`, and `sacct`, below).
+
+**Several small jobs on one node (`pack`, ARCHER2).** On a machine that charges for whole nodes,
+however few cores a job uses, and never shares them between jobs (ARCHER2; `charging : node`, the
+default with `cores_per_node`), `pack : N` in a step's block runs N of that step's CASTEP jobs
+side by side in one Slurm job on one node, each on 1/N of its cores: with `pack : 4`, four jobs
+of 32 cores each. It suits steps with many small jobs, such as A1's single points of the
+primitive cell:
 
 ```
 %block runner_converge
@@ -244,15 +269,15 @@ pack         : 4
 - The pack's job script is `jobs/<step>/packs/pack_NNN/job.sh`. Each job still has its own
   folder, where it writes its output and `slurm-<job id>.out`; its `job_info.json` names the pack.
 - It needs `cores_per_node` and a jobscript whose CASTEP line uses `srun` (each job of a pack is
-  started with its own `srun --exact`). With `charging : core` jobs share nodes anyway, so
-  `pack` and `dryrun_pack` are not used there.
+  started with its own `srun --exact`).
 
 The dry runs can be packed too, which matters with `dryrun_on : compute`, where each dry run is
 otherwise a job of its own that waits in the queue and, on ARCHER2's standard partition, takes a
 whole node. `dryrun_pack : N` (e.g. 32, for every step) runs up to N of a step's dry runs side
 by side in one job, one process each with `dryrun_mem_gb` of memory, in
 `jobs/<step>/packs/dryrun_NNN/job.sh`. With `dryrun_on : login` the dry runs don't go to the queue
-at all, so it doesn't apply.
+at all, so it doesn't apply: where a serial CASTEP runs on the login nodes (`castep.serial` on
+ARCHER2), that is the quickest way of all.
 
 ---
 
@@ -1044,13 +1069,13 @@ and E1, and `%block runner_converge`, `runner_relax`, `runner_bands`, `runner_di
 | `dryrun_jobscript` | the jobscript | A separate template for dry-run jobs. |
 | `dryrun_partition`, `dryrun_time`, `dryrun_options` | — | The partition, time and other `#SBATCH` options of dry-run jobs. |
 | `dryrun_cores`, `dryrun_mem_gb` | `1`, `4` | The processes and memory (GB) of a dry-run job (with `charging : core`, it asks for the cores that hold that memory). |
-| `dryrun_pack` | `1` | With `dryrun_on : compute`: run up to N of a step's dry runs side by side in one job, one process each ([How a run works](#how-a-run-works)). Needs a jobscript (or `dryrun_jobscript`) whose CASTEP line uses `srun`; not with `charging : core`. |
+| `dryrun_pack` | `1` | With `dryrun_on : compute`: run up to N of a step's dry runs side by side in one job, one process each (with `charging : core`, each with the cores for `dryrun_mem_gb`, at most a node's worth) ([How a run works](#how-a-run-works)). Needs a jobscript (or `dryrun_jobscript`) whose CASTEP line uses `srun`. |
 | `submit_cmd` | `sbatch` | The command that submits a job. |
 | `status_cmd` | `squeue` or `qstat` | The command that lists queued and running jobs. |
 | `poll` | `120 s` | Seconds between checks of the queue. |
 | `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once. |
 | `tolerate_failures` | `false` (`true` for C2, C5, D6, D7, E0 and E1) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
-| `pack` | `1` | Run up to N of a step's jobs side by side on one node, in one job, each on `cores_per_node`/N cores and its share of the node's memory ([How a run works](#how-a-run-works)). Needs `cores_per_node` (with `charging : node`) and a jobscript whose CASTEP line uses `srun`. |
+| `pack` | `1` | Run up to N of a step's jobs side by side on one node, in one job: with `charging : node`, each on `cores_per_node`/N cores and its share of the node's memory; with `charging : core`, each with its own cores, the pack asking for them all, as many as one node holds ([How a run works](#how-a-run-works)). Needs `cores_per_node` and a jobscript whose CASTEP line uses `srun`. |
 
 `--prepare-only`, `--no-wait`, `--resubmit-failed` and `--force` are command-line switches
 ([Command line](#command-line)), not project-file keywords.
@@ -1405,18 +1430,22 @@ reasonable, since E0 checks the production cell with CASTEP anyway.
 Last, phase D was split out of phase C, and the runner learned to plan jobs on a machine that
 charges by the core (Cirrus). The split renames steps and folders only (C11 and C12 became D6 and
 D7, D0 to D2 became E0 to E2, E1 to E3 became F1 to F3; rank's and excite's files moved to
-`D_states/`, and the production and thermodynamics folders became `E_production/` and
-`F_thermo/`). Checked: `--status`, choosing steps and phases by label and letter, the example
-project, and `--migrate` on a made-up work directory in the old layout (folders moved, the paths
-in every `results.json` and in `state.json` changed, labels and summaries updated, and a step
-still running refused). With `charging : core`, the plans were checked on made-up dry runs: one
-core per process where the memory allows; where it doesn't, more cores per process or `highmem`,
-whichever takes fewer cores; whole nodes with `--exclusive` beyond one node; the dry runs' cores.
-A batch went through a mock Slurm with `cirrus.sh` (dry runs, plans, job scripts, results), and
-the MACE jobs' scripts were written with `--prepare-only` (`{NCORES}` = workers × 8). With
-`charging : node` (ARCHER2) the runner plans exactly the same jobs as before (576 made-up dry runs
-over five sets of settings, `pack` included). The whole workflow has not been run against the
-mock since this split.
+`D_states/`, and the production and thermodynamics folders became `E_production/` and `F_thermo/`).
+Checked: `--status`, choosing steps and phases by label and letter, the example project, and
+`--migrate` on a made-up work directory in the old layout (folders moved, the paths in every
+`results.json` and in `state.json` changed, labels and summaries updated, and a step still running
+refused). With `charging : core`, the plans were checked on made-up dry runs: one core per process
+where the memory allows; where it doesn't, more cores per process or `highmem`, whichever takes
+fewer cores; whole nodes with `--exclusive` beyond one node; the dry runs' cores. A batch went
+through a mock Slurm with `cirrus.sh` (dry runs, plans, job scripts, results), and the MACE jobs'
+scripts were written with `--prepare-only` (`{NCORES}` = workers × 8). `pack` and `dryrun_pack` with
+`charging : core` went through the mock Slurm too: seven dry runs (2 cores each) in one job; four
+jobs on `standard` in one job of 252 cores and two on `highmem` in one of 192 (one of them with 2
+cores per process), while a fifth on `standard` ran on its own; each job with its own `srun --exact`
+and `--mem-per-cpu` (the pack's `SLURM_MEM_PER_CPU` when Slurm sets it, the partition's GB per core
+when not). With `charging : node` (ARCHER2) the runner plans exactly the same jobs as before (576
+made-up dry runs over five sets of settings, `pack` included), and its packs' job scripts are
+unchanged. The whole workflow has not been run against the mock since this split.
 
 Not tested: real Cirrus jobs (see 8 below), `phases_from : doped` (no Materials Project access here), a real fine-tuned model
 (`finetune.sh` is written but was not run), real CASTEP ΔSCF (D7), real Slurm for the MACE jobs,
@@ -1457,7 +1486,10 @@ On the first real runs, check:
    for. On the first packed step, look at a `jobs/<step>/packs/pack_NNN/job.sh` (or
    `dryrun_NNN`), and check with
    `sacct -j <job id> --format=JobID,JobName,NTasks,AllocCPUS,Start,End,MaxRSS` that its job
-   steps ran side by side, each with its own processes.
+   steps ran side by side, each with its own processes. On Cirrus, also check that the steps were
+   allowed their `--mem-per-cpu` (each core's share of the pack's memory): if Slurm refused it,
+   each job's `slurm-<id>.out` says so, and if the steps ran one after another (their Start
+   times in `sacct`), their memory didn't fit in the pack's at once.
 7. **D7 (`excite`)**, before relying on it: run one defect (e.g. `%block defects` with
    `Sb_Ca + Vac_O  all  q=-1`, and `--until D7`). In `D_states/jobs/excite/`, check that the
    `.castep` shows CASTEP applying the constraints to the two bands named in the `.param`, that

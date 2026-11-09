@@ -100,6 +100,9 @@ in one core's memory; if none has enough, each process gets as many cores as its
 memory needs (--cpus-per-task, on the partition where that takes the fewest cores;
 omp_threads can run threads on them). A job bigger than a node takes whole nodes
 (--exclusive, charged in full, up to max_nodes), laid out as on whole-node machines.
+In batch mode, pack : N puts up to N such jobs (on the same partition, and no more
+cores than a node has) in one job, which asks for their cores in all, so they wait in
+the queue once; dryrun_pack : N does the same for dry runs.
 
 Partitions
 ----------
@@ -197,6 +200,7 @@ while the others carry on; --resubmit-failed starts the failed ones again. With 
 (and cores_per_node), up to N jobs run side by side on one node, in one job of their own
 (packs/pack_NNN/job.sh), each on cores_per_node/N cores with srun --exact and its share of
 the node's memory; a job that doesn't fit in its share, or needs a restart, runs on its own.
+With charging : core, each keeps its own plan instead, and the pack asks for their cores.
 The results are written to batch_results.json in the work directory (batch_<file name> by
 default). From Python: run_batch(workdir, jobs, args, cell_text, param_text, ...) (see its
 comment).
@@ -1065,7 +1069,7 @@ def set_threads(script, threads, cpus):
 # bigger than a node must have its nodes to itself (and is charged for all their cores), while a
 # smaller one shares its node, and is charged only for its own cores. Takes out any --exclusive
 # the template has, then adds it back for whole nodes.
-#   Called by: dryrun_script(), finalize()
+#   Called by: dryrun_script(), finalize(), submit_dryrun_pack(), submit_pack()
 #   Calls:     add_sbatch_option()
 def set_exclusive(script, whole):
     lines = [ln for ln in script.splitlines() if not re.match(r"#SBATCH\s+--exclusive\b", ln)]
@@ -1143,18 +1147,25 @@ def dryrun_template_text(job_template, dryrun_template):
     return "\n".join(lines) + "\n"
 
 
-# How many cores each process of a dry-run job asks for: one, but with charging : core enough for
-# the dry run's gb, as there the memory comes with the cores: each brings the GB per core of
+# The GB of memory each core of a dry-run job brings, with charging : core: that of
 # dryrun_partition if %block partitions lists it, otherwise of the first partition listed (where
-# the dry runs go), or mem_per_core.
-#   Called by: dryrun_subs()
+# the dry runs go), or mem_per_core. None if nothing says.
+#   Called by: dryrun_cpus(), submit_dryrun_pack()
+def dryrun_core_gb(args):
+    parts = args.partitions or []
+    name = args.dryrun_partition or (parts[0]["name"] if parts else None)
+    return next((q["mem_per_core"] for q in parts if q["name"] == name),
+                args.mem_per_core or min((q["mem_per_core"] for q in parts), default=None))
+
+
+# How many cores each process of a dry-run job asks for: one, but with charging : core enough for
+# the dry run's gb, as there the memory comes with the cores (dryrun_core_gb each).
+#   Called by: check_runner(), dryrun_subs()
+#   Calls:     dryrun_core_gb()
 def dryrun_cpus(ncores, gb, args):
     if args.charging != "core":
         return 1
-    parts = args.partitions or []
-    name = args.dryrun_partition or (parts[0]["name"] if parts else None)
-    per = next((q["mem_per_core"] for q in parts if q["name"] == name),
-               args.mem_per_core or min((q["mem_per_core"] for q in parts), default=None))
+    per = dryrun_core_gb(args)
     return max(1, math.ceil(gb / (per * ncores))) if per else 1
 
 
@@ -1636,10 +1647,12 @@ def node_layouts(nk, cpn, max_nodes, fixed=None, nodes=None):
 # processes per node if the memory needs it. If nothing fits, the layout that comes closest
 # (finalize then logs a warning). Returns the namespace of choose_resources, with exclusive (whole
 # nodes) and charged (the cores the job is charged for); underpop marks a layout that the memory
-# made sparser than planned.
+# made sparser than planned. With pack (more than 1, in batch mode: pack : N), packed marks a job
+# on part of a node, which run_batch may put in one job with others (submit_pack); its plan is the
+# same either way.
 #   Called by: choose_resources()
 #   Calls:     choose_cores(), layout_key(), mem_per_core_mb(), node_layouts()
-def core_resources(dr, args):
+def core_resources(dr, args, pack=1):
     nk, cpn = dr["nkpts"], args.cores_per_node
     skipped, cheaper, over = [], [], []
 
@@ -1652,8 +1665,8 @@ def core_resources(dr, args):
     def result(nodes, tpn, cpus, p, fits, whole, sparse=False):
         return SimpleNamespace(nodes=nodes, tpn=tpn, ncores=nodes * tpn, mpc=mpc(nodes * tpn),
                                part=p, fits=fits, underpop=sparse, cpus=cpus,
-                               skipped=[q for q in skipped if q is not p], packed=False,
-                               share=None, exclusive=whole,
+                               skipped=[q for q in skipped if q is not p],
+                               packed=pack > 1 and not whole, share=None, exclusive=whole,
                                charged=nodes * cpn if whole else tpn * cpus)
 
     for order, p in enumerate(args.partitions or [None]):
@@ -1722,7 +1735,7 @@ def choose_resources(dr, args, pack=1):
     partition where that gives the best layout. With pack > 1 the job is planned on its
     share of a node if it fits there."""
     if args.charging == "core":
-        return core_resources(dr, args)
+        return core_resources(dr, args, pack)
     nk, cpn = dr["nkpts"], args.cores_per_node
     skipped, under, over = [], [], []
 
@@ -2037,19 +2050,20 @@ def prepare_all(calcs, ctx, args, show=True):
 
 # Turns a dry run into a job plan and writes job.sh.
 # parse_dryrun gives the k-points, electrons and memory; choose_resources picks the layout, memory
-# per process and partition; the template is filled in (fill), OpenMP threads are set for cores
-# the layout leaves idle (thread_count, set_threads), and the partition, its #SBATCH options,
-# max_walltime (the longest a job may run, replacing the template's and the partition's --time)
-# and the walltime (plan_walltime) are set with add_sbatch_option. For a relaxation,
-# run_time is set in the .param (run_time_for, set_param), so it can stop cleanly and be carried on
-# - except in a batch with max_restarts : 0 and tolerate_failures (screening), where nothing would
-# carry it on: there it may use its whole walltime. The plan is saved in job_info.json and
-# logged (show), with warnings about memory and odd electron counts unless quiet. Returns a
-# one-line summary of the layout. In batch mode with pack : N the job is planned on its share of a
-# node (choose_resources), 1/N of it or, given pack, 1/pack (pack=1: a job of its own, as for a
-# restart); run_batch then runs it with others in one job (submit_pack), and its own job.sh is
-# only used if it is ever submitted on its own. With charging : core, a job on whole nodes gets
-# #SBATCH --exclusive and one on part of a node loses any the template has (set_exclusive).
+# per process and partition; the template is filled in (fill), OpenMP threads are set for cores the
+# layout leaves idle (thread_count, set_threads), and the partition, its #SBATCH options,
+# max_walltime (the longest a job may run, replacing the template's and the partition's --time) and
+# the walltime (plan_walltime) are set with add_sbatch_option. For a relaxation, run_time is set in
+# the .param (run_time_for, set_param), so it can stop cleanly and be carried on - except in a batch
+# with max_restarts : 0 and tolerate_failures (screening), where nothing would carry it on: there it
+# may use its whole walltime. The plan is saved in job_info.json and logged (show), with warnings
+# about memory and odd electron counts unless quiet. Returns a one-line summary of the layout. In
+# batch mode with pack : N the job is planned on its share of a node (choose_resources), 1/N of it
+# or, given pack, 1/pack (pack=1: a job of its own, as for a restart); run_batch then runs it with
+# others in one job (submit_pack), and its own job.sh is only used if it is ever submitted on its
+# own. With charging : core, a job on whole nodes gets #SBATCH --exclusive and one on part of a node
+# loses any the template has (set_exclusive); with pack : N too, its plan doesn't change, but one on
+# part of a node is marked as one that can go in a pack.
 #   Called by: prepare_all(), prepare_sp(), restart(), run_batch()
 #   Calls:     add_sbatch_option(), choose_resources(), fill(), parse_dryrun(), plan_walltime(),
 #              run_time_for(), set_exclusive(), set_param(), set_threads(), thread_count()
@@ -2123,7 +2137,7 @@ def finalize(calc, text, ctx, args, quiet=False, show=True, pack=None):
                 packed=r.packed, share=r.share, cpus_per_task=r.cpus,
                 charged_cores=r.charged if core else None, exclusive=r.exclusive if core else None)
     calc.save(info)
-    if r.packed:
+    if r.packed and not core:
         size = (f"{r.tpn} processes" + (f" x {threads} threads" if threads > 1 else "")
                 + f" ({npack} jobs to a node, {r.share} cores each)")
         mem = f"~{mpc / 1024:.1f} GB/process"
@@ -2334,46 +2348,62 @@ def even_groups(items, size):
 # pack's walltime. The job is submitted from the pack's directory (send_job) and recorded for each
 # calculation (record_job), so waiting, timings and restarts work as for a job of its own (a
 # restart runs on its own: restart plans it with finalize(..., pack=1)).
+# With charging : core the pack asks for the cores of its jobs on one node, which it shares with
+# other jobs (no --exclusive): the template's --ntasks-per-node (or --ntasks) is their sum, with one
+# CPU per task. Each job's srun asks for its own processes and cores per process, with
+# --mem-per-cpu for the memory each core brings: SLURM_MEM_PER_CPU, which Slurm sets in the job,
+# so that the jobs' memory adds up to the pack's (or, if it isn't set, the partition's GB per
+# core). Cirrus takes no --mem for a job, and a job step that asks for no memory may be given all
+# of the job's, which would hold the others back.
 #   Called by: run_batch()
 #   Calls:     add_sbatch_option(), fill(), new_pack_dir(), pack_castep_line(), pack_line(),
-#              record_job(), run_time_for(), send_job(), set_param(), slurm_seconds(),
-#              slurm_time()
+#              record_job(), run_time_for(), send_job(), set_exclusive(), set_param(),
+#              slurm_seconds(), slurm_time()
 def submit_pack(group, ctx, args, workdir):
     cpn, infos = args.cores_per_node, [c.info() for c in group]
+    core = args.charging == "core"
     part = next((p for p in args.partitions or [] if p["name"] == infos[0].get("partition")), None)
     gb = part["mem_per_core"] if part else args.mem_per_core
-    mems = [math.ceil(i["share"] * gb * 1024 * PACK_MEM) if gb else
-            math.ceil(i["ncores"] * i["mem_per_core_gb"] * 1024 * 1.25) for i in infos]
+    if core:                                    # the cores of its jobs, and the memory they bring
+        mems = [math.ceil(i["charged_cores"] * gb * 1024) for i in infos]
+        ncores = sum(i["charged_cores"] for i in infos)
+    else:
+        mems = [math.ceil(i["share"] * gb * 1024 * PACK_MEM) if gb else
+                math.ceil(i["ncores"] * i["mem_per_core_gb"] * 1024 * 1.25) for i in infos]
+        ncores = cpn
     walls = [slurm_seconds(i["walltime"]) for i in infos if i.get("walltime")]
     wall = slurm_time(max(walls)) if walls else None
     pdir = new_pack_dir(workdir, "pack")
     total = sum(mems)
-    subs = {"{NCORES}": cpn, "{NODES}": 1, "{TASKS_PER_NODE}": cpn, "{CPUS_PER_TASK}": 1,
+    subs = {"{NCORES}": ncores, "{NODES}": 1, "{TASKS_PER_NODE}": ncores, "{CPUS_PER_TASK}": 1,
             "{SEED}": pdir.name, "{JOBNAME}": f"{group[0].name}+{len(group) - 1}",
             "{NKPTS}": max(i["nkpts"] for i in infos), "{MEM_MB}": total,
             "{MEM_GB}": math.ceil(total / 1024), "{MEM_PER_NODE_GB}": math.ceil(total / 1024),
-            "{MEM_PER_CORE_MB}": math.ceil(total / cpn),
-            "{MEM_PER_CORE_GB}": math.ceil(total / cpn / 1024),
+            "{MEM_PER_CORE_MB}": math.ceil(total / ncores),
+            "{MEM_PER_CORE_GB}": math.ceil(total / ncores / 1024),
             "{PARTITION}": part["name"] if part else ""}
     template = ctx["job_template"]
     run = pack_castep_line(template)
     lines = []
     for line in template.splitlines():
-        if re.match(r"#SBATCH\s+((--ntasks-per-node|--ntasks|--cpus-per-task)(=|\s)|-[nc](\s|\d))",
-                    line.strip()):
+        if not core and re.match(r"#SBATCH\s+((--ntasks-per-node|--ntasks|--cpus-per-task)(=|\s)"
+                                 r"|-[nc](\s|\d))", line.strip()):
             continue                            # each job of the pack sets these for itself
         if line != run:
             lines.append(line)
             continue
         for c, i, mb in zip(group, infos, mems):
             n, threads = i["ncores"], i.get("omp_threads") or 1
-            cpus = max(1, i["share"] // n)
+            cpus = (i.get("cpus_per_task") or 1) if core else max(1, i["share"] // n)
             env = (f"OMP_NUM_THREADS={threads} SRUN_CPUS_PER_TASK={cpus} "
                    + ("OMP_PLACES=cores " if threads > 1 else ""))
+            memory = (f"--mem-per-cpu=${{SLURM_MEM_PER_CPU:-{math.floor(gb * 1024)}}}M" if core
+                      else f"--mem={mb}M")
             lines.append(pack_line(run, CASTEP_RUN, c, f"--nodes=1 --ntasks={n} --ntasks-per-node="
-                                   f"{n} --cpus-per-task={cpus} --exact --mem={mb}M", env))
+                                   f"{n} --cpus-per-task={cpus} --exact {memory}", env))
         lines.append("wait")
-    script = add_sbatch_option(fill("\n".join(lines) + "\n", subs), "--exclusive")
+    script = fill("\n".join(lines) + "\n", subs)
+    script = set_exclusive(script, False) if core else add_sbatch_option(script, "--exclusive")
     if part:                                    # the partition and its extra #SBATCH options
         script = add_sbatch_option(script, f"--partition={part['name']}")
         for option in part["options"]:
@@ -2392,7 +2422,8 @@ def submit_pack(group, ctx, args, workdir):
     rel = str(pdir.relative_to(workdir))
     for c, start in zip(group, starts):
         record_job(c, jobid, start, wall, pack=rel)
-    log(f"submitted {rel}: job {jobid} on 1 node" + (f" ({part['name']})" if part else "")
+    where = f"{ncores} cores of a shared node" if core else "1 node"
+    log(f"submitted {rel}: job {jobid} on {where}" + (f" ({part['name']})" if part else "")
         + (f", walltime {wall}" if wall else "") + ": "
         + ", ".join(f"{c.name} ({i['ncores']} processes)" for c, i in zip(group, infos)))
 
@@ -2404,12 +2435,15 @@ def submit_pack(group, ctx, args, workdir):
 # its dry run, in its own directory, in the background, on one process (srun --ntasks=1 --exact
 # --mem=dryrun_mem_gb), then wait. Each calculation gets the job id as its dryrun_jobid
 # (record_job), so wait_for and handle_failure treat it as its own dry-run job; each also keeps
-# its own dryrun.sh, which --resubmit-failed uses.
+# its own dryrun.sh, which --resubmit-failed uses. With charging : core each dry run has the cores
+# that hold dryrun_mem_gb (dryrun_cpus), asks for their memory with --mem-per-cpu (the job's
+# SLURM_MEM_PER_CPU, or else dryrun_core_gb), and the job shares its node (no --exclusive).
 #   Called by: prepare_all()
-#   Calls:     dryrun_sbatch(), dryrun_subs(), dryrun_template_text(), fill(), new_pack_dir(),
-#              pack_castep_line(), pack_line(), record_job(), send_job()
+#   Calls:     dryrun_core_gb(), dryrun_sbatch(), dryrun_subs(), dryrun_template_text(), fill(),
+#              new_pack_dir(), pack_castep_line(), pack_line(), record_job(), send_job(),
+#              set_exclusive()
 def submit_dryrun_pack(group, ctx, args):
-    workdir, n = group[0].dir.parent, len(group)
+    workdir, n, core = group[0].dir.parent, len(group), args.charging == "core"
     pdir = new_pack_dir(workdir, "dryrun")
     subs = dryrun_subs(pdir.name, f"{group[0].name}_dry+{n - 1}", n, n * args.dryrun_mem_gb,
                        args)
@@ -2420,12 +2454,18 @@ def submit_dryrun_pack(group, ctx, args):
         if line != run:
             lines.append(line)
             continue
-        own = (f"--nodes=1 --ntasks=1 --ntasks-per-node=1 --cpus-per-task=1 --exact "
-               f"--mem={math.ceil(args.dryrun_mem_gb * 1024)}M")
-        lines += [pack_line(run, DRYRUN_RUN, c, own, "OMP_NUM_THREADS=1 SRUN_CPUS_PER_TASK=1 ")
-                  for c in group]
+        cpus, per = subs["{CPUS_PER_TASK}"], dryrun_core_gb(args)
+        mb = math.floor(per * 1024) if core and per else math.ceil(args.dryrun_mem_gb * 1024)
+        memory = (f"--mem-per-cpu=${{SLURM_MEM_PER_CPU:-{mb}}}M" if core and per else
+                  f"--mem={mb}M")
+        own = (f"--nodes=1 --ntasks=1 --ntasks-per-node=1 --cpus-per-task={cpus} --exact "
+               + memory)
+        lines += [pack_line(run, DRYRUN_RUN, c, own,
+                            f"OMP_NUM_THREADS=1 SRUN_CPUS_PER_TASK={cpus} ") for c in group]
         lines.append("wait")
     script = dryrun_sbatch(fill("\n".join(lines) + "\n", subs), subs, args)
+    if core:
+        script = set_exclusive(script, False)
     (pdir / JOBSCRIPT).write_text(script)
     (pdir / JOBSCRIPT).chmod(0o755)
     jobid = send_job(pdir, JOBSCRIPT, args)
@@ -3086,16 +3126,18 @@ def job_spec(job, base):
 # It works as the size series does: inputs, dry runs and plans first (prepare_all, at most max_jobs
 # dry-run jobs queued at once; with dryrun_pack : N, N dry runs to a job), then the jobs, submitted
 # at most max_jobs at a time, each planned again just before it goes (so it uses the timings and
-# memory measured so far), waited for (wait_for), restarted as usual. With pack : N, jobs planned
-# on a share of a node go N at a time (or fewer, as evenly as the jobs left allow, each then
-# getting more of the node) in one job (submit_pack); one left on its own is planned again for
-# whole nodes. With tolerate_failures, a job that fails is marked failed (mark_failed) and the
-# others carry on; --resubmit-failed starts failed jobs again from the beginning. A job whose
-# inputs changed since it was set up (job_spec) is set up again if it never ran; one that has run
-# stops the script, unless --force (which keeps its results). Rerunning picks up where it left off.
-# Returns {'complete': True/False, 'jobs': {name: job_result}, 'calcs': {name: Calc}}, and writes
-# the results to <workdir>/batch_results.json; 'complete' is False after --prepare-only, or with
-# --no-wait while jobs are still queued.
+# memory measured so far), waited for (wait_for), restarted as usual. With pack : N, jobs planned on
+# a share of a node go N at a time (or fewer, as evenly as the jobs left allow, each then getting
+# more of the node) in one job (submit_pack); one left on its own is planned again for whole nodes.
+# With charging : core, up to N jobs on part of a node go in one job, the first in the queue and
+# those after it on the same partition, as long as one node holds their cores. With
+# tolerate_failures, a job that fails is marked failed (mark_failed) and the others carry on;
+# --resubmit-failed starts failed jobs again from the beginning. A job whose inputs changed since it
+# was set up (job_spec) is set up again if it never ran; one that has run stops the script, unless
+# --force (which keeps its results). Rerunning picks up where it left off. Returns {'complete':
+# True/False, 'jobs': {name: job_result}, 'calcs': {name: Calc}}, and writes the results to
+# <workdir>/batch_results.json; 'complete' is False after --prepare-only, or with --no-wait while
+# jobs are still queued.
 #   Called by: batch_main(), dwf.py
 #   Calls:     Calc(), Calc.done(), Calc.err_files(), calibrate(), check_templates(), finalize(),
 #              job_result(), job_spec(), measure_times(), pack_castep_line(), parse_castep_input(),
@@ -3222,7 +3264,17 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
         while queue and (not args.max_jobs or len(running) < args.max_jobs):
             c = queue.pop(0)
             group = [c]
-            if plan(c):                            # pack : N - others to share its node, as
+            if plan(c) and args.charging == "core":    # pack : N - others beside it, in its
+                cores = c.info()["charged_cores"]          # job, as long as one node holds them
+                for d in list(queue):
+                    if len(group) == args.pack:
+                        break
+                    if (plan(d) and d.info()["partition"] == c.info()["partition"]
+                            and cores + d.info()["charged_cores"] <= args.cores_per_node):
+                        group.append(d)
+                        queue.remove(d)
+                        cores += d.info()["charged_cores"]
+            elif c.info().get("packed"):           # pack : N - others to share its node, as
                 left = 1 + len(queue)              # many in each of the packs still to come
                 size = min(args.pack, math.ceil(left / math.ceil(left / args.pack)))
                 for d in list(queue):
@@ -3817,9 +3869,10 @@ def convert_settings(items, name):
 # Checks the settings that control how jobs run, for both the size series and batch mode.
 # Numbers that must be at least 1, greater than 0 or not negative; cores_per_node with max_nodes
 # (not max_cores, unless charging : core) and a cores value that splits evenly over the nodes;
-# charging : core with cores_per_node, the memory per core, no pack or dryrun_pack, and max_nodes
-# (by default the nodes max_cores or cores need) that holds the job; %block partitions without
-# mem_per_core, and with a partition that can take cores. Starts mem_replicated : auto at R_START.
+# charging : core with cores_per_node, the memory per core, a dryrun_pack whose dry runs fit on a
+# node, and max_nodes (by default the nodes max_cores or cores need) that holds the job; %block
+# partitions without mem_per_core, and with a partition that can take cores. Starts
+# mem_replicated : auto at R_START.
 #   Called by: batch_args(), read_input()
 def check_runner(args, raw_vals, name):
     for key in ("max_cores", "cores", "dryrun_cores", "poll", "dryrun_timeout",
@@ -3834,10 +3887,11 @@ def check_runner(args, raw_vals, name):
         if args.partitions is None and args.mem_per_core is None:
             die(f"{name}: with charging : core the memory comes with the cores, so give how "
                 "much each core brings: mem_per_core, or a %block partitions")
-        for key in ("pack", "dryrun_pack"):
-            if getattr(args, key) > 1:
-                die(f"{name}: {key} shares a whole node out between jobs, but with charging : "
-                    "core jobs share nodes already - remove it")
+        cpus = dryrun_cpus(1, args.dryrun_mem_gb, args)       # each dry run's cores
+        if args.dryrun_pack * cpus > args.cores_per_node:
+            die(f"{name}: dryrun_pack : {args.dryrun_pack} dry runs of {cpus} cores each (for "
+                f"dryrun_mem_gb : {args.dryrun_mem_gb:g}) are more than a node's "
+                f"{args.cores_per_node} cores")
         want = args.cores or args.max_cores
         nodes = math.ceil(want / args.cores_per_node)
         if "max_nodes" not in raw_vals:
@@ -3851,7 +3905,8 @@ def check_runner(args, raw_vals, name):
         if args.pack > args.cores_per_node:
             die(f"{name}: pack : {args.pack} is more jobs than a node has cores "
                 f"({args.cores_per_node})")
-        if args.cores and args.cores > args.cores_per_node // args.pack:
+        if (args.cores and args.charging != "core"
+                and args.cores > args.cores_per_node // args.pack):
             die(f"{name}: with pack : {args.pack} each job has {args.cores_per_node // args.pack} "
                 f"cores, so cores : {args.cores} is too many")
     if args.cores_per_node and args.dryrun_pack > args.cores_per_node:
