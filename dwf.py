@@ -136,8 +136,6 @@ EDGE_FRACTION = 0.35
 # B2 (scan_test : line): how many bigger sizes must lie on the R = R_inf - c/N line with a size for
 # a candidate to count as converged there
 SCAN_CONFIRM = 3
-# B3: the Gamma-only floor is this many decay lengths of the shallowest deep level
-FLOOR_DECAYS = 4.0
 # C2: a Gamma-point gap of the screening cell this much above A2.2's means band edges that don't
 # fold onto Gamma (eV)
 FOLD_GAP_TOL = 0.05
@@ -270,6 +268,7 @@ PROJECT_KEYWORDS = {
     "scan_test": (sc._choice("line", "flat"), "line"),
     "supercell": (_size, None), "screen_min_image": (sc._num("ang", "A"), None),
     "electronic_cell": (_cellsize, None), "electronic_depth": (sc._num("eV"), 0.25),
+    "decay_length_multiple": (sc._num(), 4.0),
     # C: screening
     "screen_charges": (sc._ints(), [-1, 0, 1]),
     "screen_spins": (sc._choice("triplet", "low", "both"), "triplet"),
@@ -534,7 +533,7 @@ def read_project(path):
     for key in ("pair_max_distance", "scan_tol", "scan_edge_tol", "band_spread_tol",
                 "configuration_margin", "converge_tol", "mace_fmax", "excite_min",
                 "validate_tol", "lineshape_sigma", "lineshape_gamma", "lineshape_amplitude",
-                "lineshape_delta"):
+                "lineshape_delta", "decay_length_multiple"):
         if getattr(s, key) is not None and getattr(s, key) <= 0:
             die(f"{name}: {key} must be greater than 0")
     for key in ("mace_threads", "mace_steps", "mace_pack", "mace_max_jobs", "validate_sizes",
@@ -3462,13 +3461,16 @@ def folds_to_gamma(k, P):
     return bool(np.allclose(f, np.rint(f), atol=1e-4))
 
 
-# The Gamma-only floor (B3): the shortest image distance a supercell needs for Gamma-point
-# screening to see a defect's levels as an isolated defect has them. A level E_b inside the gap
+# The Gamma-only floor (B3, B4): the shortest image distance a supercell needs for Gamma-point
+# runs to see a defect's levels as an isolated defect has them. A level E_b inside the gap
 # decays away from the defect as exp(-r/xi), with 1/xi^2 = (2 m*/hbar^2) E_b (1 - E_b/E_g) in a
 # two-band (Kane) model; neighbouring images overlap, and the level spreads into a band, unless
-# they are several xi apart. The floor is FLOOR_DECAYS xi of the shallowest level that counts as
-# deep (E_b = deep_level_margin), for the lighter of the hole and electron masses (band_masses)
-# and A2.2's gap. screen_min_image instead, if given (0: no floor). Returns {'L', 'source', ...}
+# they are several xi apart. The floor is decay_length_multiple xi (default 4) of the shallowest
+# level that counts as deep (E_b = deep_level_margin), for the lighter of the hole and electron
+# masses (band_masses) and A2.2's gap. At Gamma the overlap makes a level that deep look deeper
+# than it is: by about 10% at 4 xi, 19% at 3.5 and 33% at 3 (an s-like level with no core, 12
+# nearest images; more for a level with a broad core, less for a compact one), and deeper levels
+# by much less. screen_min_image instead, if given (0: no floor). Returns {'L', 'source', ...}
 # or None (no floor, or the masses couldn't be found: a warning says to set screen_min_image).
 # depth: the level's depth E_b instead (B4's electronic_depth; screen_min_image is then ignored).
 #   Called by: step_choose(), step_electronic()
@@ -3486,9 +3488,9 @@ def gamma_floor(p, masses, depth=None):
         if m:
             xi = 1 / math.sqrt(m * eb * (1 - eb / eg) / HB2M)
             if best is None or xi > best["xi"]:
-                best = {"L": round(FLOOR_DECAYS * xi, 2), "xi": round(xi, 3), "mass": m,
-                        "edge": edge, "carrier": what, "E_b": eb, "gap": round(eg, 4),
-                        "source": "band masses"}
+                best = {"L": round(p.s.decay_length_multiple * xi, 2), "xi": round(xi, 3),
+                        "mass": m, "edge": edge, "carrier": what, "E_b": eb,
+                        "gap": round(eg, 4), "source": "band masses"}
     if best is None:
         log("WARNING: the effective masses could not be found from A2.2's band edges (its "
             "k-point grid may be too coarse), so there is no Gamma-only floor: set "
@@ -3560,9 +3562,9 @@ def step_choose(p):
              + "\n" + format_table(["edge", "k (fractional)", "E/eV", "m*/m_e", "folds to Gamma"],
                                    rows, "Band edges (A2.2) and their effective masses")
              + (f"\nGamma-only floor: {floor['L']:.2f} A ("
-                + (f"{FLOOR_DECAYS:g} x the decay length {floor['xi']:.2f} A of a level "
-                   f"{floor['E_b']:g} eV from the band edge of the {floor['carrier']}, m* "
-                   f"{floor['mass']:.3g} m_e, gap {floor['gap']:.2f} eV)"
+                + (f"decay_length_multiple {p.s.decay_length_multiple:g} x the decay length "
+                   f"{floor['xi']:.2f} A of a level {floor['E_b']:g} eV from the band edge of the "
+                   f"{floor['carrier']}, m* {floor['mass']:.3g} m_e, gap {floor['gap']:.2f} eV)"
                    if floor["source"] == "band masses" else "screen_min_image)") + "\n"
                 if floor else "\nGamma-only floor: none\n"))
     idx = ladder.index(cell)
@@ -3592,11 +3594,12 @@ def edge_folding(masses, P):
 # screening cell up, that (1) folds EVERY symmetry-equivalent k-point of both band edges onto Gamma
 # (edge_folding: each valley of an edge away from Gamma, e.g. the three X points of a rock-salt
 # conduction band, so a shallow state can mix all of them), and (2) meets the Gamma-only floor for
-# a level electronic_depth deep (gamma_floor). If no size of the ladder does, the most compact
-# cells for longer lengths (ELECTRONIC_STEP at a time) are tried. electronic_cell : screening uses
-# the screening cell; electronic_cell : n or a length (e.g. 20 ang) gives the cell (with a warning
-# if it doesn't fold every k-point). The table gives each cell's folding ("1 of 3" means only one
-# valley of that edge is seen at Gamma).
+# a level electronic_depth deep (gamma_floor: decay_length_multiple times its decay length, as in
+# B3). If no size of the ladder does, the most compact cells for longer lengths (ELECTRONIC_STEP
+# at a time) are tried. electronic_cell : screening uses the screening cell; electronic_cell : n
+# or a length (e.g. 20 ang) gives the cell (with a warning if it doesn't fold every k-point). The
+# table gives each cell's folding ("1 of 3" means only one valley of that edge is seen at Gamma)
+# and the floor.
 #   Called by: main() (step B4)
 #   Calls:     Project.host(), add_cell(), cell_record(), edge_folding(), format_table(),
 #              gamma_floor(), size_matrix()
@@ -3650,6 +3653,11 @@ def step_electronic(p):
                           "CBM points at Gamma"], rows,
                          f"The electronic cell: {cell['tag']} ({why}); each band edge's "
                          "symmetry-equivalent k-points that fold onto Gamma")
+    if floor:
+        table += (f"\nGamma-only floor: {floor['L']:.2f} A (decay_length_multiple "
+                  f"{p.s.decay_length_multiple:g} x the decay length {floor['xi']:.2f} A of a "
+                  f"level {floor['E_b']:g} eV from the band edge of the {floor['carrier']}, m* "
+                  f"{floor['mass']:.3g} m_e, gap {floor['gap']:.2f} eV)\n")
     return {"matrix": cell["matrix"], "natoms": cell["natoms"], "L": cell["L"],
             "tag": cell["tag"], "fold": fold, "fold_screening": fold_s, "floor": floor,
             "why": why, "same": cell["matrix"] == ladder[idx]["matrix"], "_table": table,
@@ -7396,10 +7404,12 @@ STEPS = [
                "mace_model", "mace_fmax", "mace_steps", "transform"), needs=("generate", "relax"),
          owns=("B_candidates/mace", "B_candidates/jobs/mace_scan", "B_candidates/ladder.json")),
     Step("choose", "B3", "the screening cell", step_choose,
-         keys=("supercell", "transform", "screen_min_image", "deep_level_margin", "scan_lengths"),
+         keys=("supercell", "transform", "screen_min_image", "deep_level_margin", "scan_lengths",
+               "decay_length_multiple"),
          needs=("scan", "relax", "bands", "generate")),
     Step("electronic", "B4", "the electronic cell (every band-edge valley at Gamma)",
-         step_electronic, keys=("electronic_cell", "electronic_depth", "transform"),
+         step_electronic, keys=("electronic_cell", "electronic_depth", "transform",
+                                "decay_length_multiple"),
          needs=("choose", "bands", "relax")),
     # C: screening
     Step("prerelax", "C1", "build the candidates and pre-relax them with MACE", step_prerelax,
@@ -7668,16 +7678,21 @@ scan_tol      : 0.02 eV
 scan_test     : line           # line | flat: R within scan_tol of every bigger size's, and the
 scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this (flat only)
 # B3: the screening cell is the smallest size that holds every candidate (B2) and is at least
-# the Gamma-only floor, estimated from the band edges' effective masses (A2.2) for the
-# shallowest deep level (deep_level_margin, below).
+# the Gamma-only floor: decay_length_multiple (below) times the decay length of the shallowest
+# deep level (deep_level_margin, below), from the band edges' effective masses (A2.2).
 !screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate
 !supercell : 14 ang            # fix the screening cell (a length, or n: n x transform)
-# B4: the electronic cell, where the survivors go from C4 on (C4-C5, D5, D7, E, F, G): the
-# smallest size at least as big as the screening cell that folds every band-edge k-point (each
-# valley's symmetry-equivalent copies too) onto Gamma, so a Gamma-point run sees the real gap,
-# and is above the Gamma-only floor for a level electronic_depth from a band edge.
+# B4: the electronic cell, where everything after C3 runs (but D8's test of the screening cell):
+# the smallest size at least as big as the screening cell that folds every band-edge k-point
+# (each valley's symmetry-equivalent copies too) onto Gamma, so a Gamma-point run sees the real
+# gap, and is above the Gamma-only floor for a level electronic_depth from a band edge.
 electronic_depth : 0.25 eV
 !electronic_cell : 20 ang      # fix it: a length, n (n x transform) or screening
+# B3, B4: the Gamma-only floor is this many decay lengths of the level it is for. At Gamma the
+# images make a level that deep look deeper than it is: by about 10% at 4, 19% at 3.5 and 33%
+# at 3 (more if the level's core is broad, less if it is compact), and deeper levels by much
+# less. The cells' atoms go as its cube: 3 needs under half those of 4 (CaO's B4: n320, not n728).
+decay_length_multiple : 4
 
 # ======================================================================= C: screening
 screen_charges   : -1 0 1

@@ -599,15 +599,19 @@ the ladder that is at least as big as
 - every candidate's converged size (B2): the worst case sets it, and `summary.txt` names the
   candidate that did, and
 - the **Γ-only floor**: the image distance a cell needs for Γ-point screening to see a defect's
-  levels as an isolated defect has them. A level E_b inside the gap decays away from the defect
-  as exp(−r/ξ), with 1/ξ² = (2m*/ħ²) E_b (1 − E_b/E_g) in a two-band (Kane) model, and
-  neighbouring images' levels overlap and spread into a band unless they are several ξ apart. The
-  floor is 4ξ for the shallowest level that counts as deep (E_b = `deep_level_margin`, F3's), with
-  the lighter of the hole and electron effective masses, which B3 fits to A2.2's `.bands` around
-  the VBM and CBM (each k-point next to the edge gives a mass, the lightest is taken; the
-  irreducible k-points are unfolded with the host's symmetry), and A2.2's gap. For CaO-like
-  masses (0.4 to 1 m_e), E_b = 0.5 eV and a PBE gap of 3.6 eV it is 12 to 19 Å.
-  `screen_min_image` gives the floor yourself (0: none).
+  levels as an isolated defect has them. A level E_b inside the gap decays away from the defect as
+  exp(−r/ξ), with 1/ξ² = (2m*/ħ²) E_b (1 − E_b/E_g) in a two-band (Kane) model, and neighbouring
+  images' levels overlap and spread into a band unless they are several ξ apart. The floor is
+  `decay_length_multiple` times ξ (4ξ by default) for the shallowest level that counts as deep
+  (E_b = `deep_level_margin`, F3's), with the lighter of the hole and electron effective masses,
+  which B3 fits to A2.2's `.bands` around the VBM and CBM (each k-point next to the edge gives a
+  mass, the lightest is taken; the irreducible k-points are unfolded with the host's symmetry), and
+  A2.2's gap. For CaO-like masses (0.4 to 1 m_e), E_b = 0.5 eV and a PBE gap of 3.6 eV, 4ξ is 12 to
+  19 Å. At Γ the overlap makes an s-like level that deep look deeper than it is, by about 10 % at
+  4ξ, 19 % at 3.5ξ and 33 % at 3ξ (no core, 12 nearest images; more for a level with a broad core,
+  less for a compact one), and deeper levels by much less, as they decay faster. A cell's atoms go
+  as the cube of the multiple, so 3 needs under half the atoms of 4. `screen_min_image` gives the
+  floor yourself (0: none).
 
 A floor beyond the ladder gets a cell of its own. `supercell` fixes the screening cell instead (a
 length, `supercell : 14 ang`, or n × transform, `supercell : 3`). B3 also checks whether A2.2's
@@ -633,15 +637,17 @@ cell up, that
 
 - folds every valley of both band edges onto Γ (the table gives each size's folding, e.g.
   `cbm 1/3`), and
-- meets the Γ-only floor (B3's estimate, from the band masses) for a level `electronic_depth`
-  (0.25 eV) from a band edge.
+- meets the Γ-only floor (B3's estimate, from the band masses: `decay_length_multiple` times
+  the decay length) for a level `electronic_depth` (0.25 eV) from a band edge.
 
-If no size of the ladder does, B4 tries the most compact cells for longer lengths, 0.5 Å at a
-time. For CaO, whose conduction-band minimum is at X in PBE, the FCC-shaped cells of 320 and 432
-atoms fold all three X points (and the 240- and 384-atom ones don't); with a cubic `transform`
-every size folds them. `electronic_cell` fixes the cell instead (a length, n × `transform`, or
-`screening` for the screening cell): B4 warns if it doesn't fold every valley. In a cell that
-folds the band edges, a localised defect level is flat across the k-points, which E2's
+If no size of the ladder does, B4 tries the most compact cells for longer lengths, 0.5 Å at a time.
+For CaO, whose conduction-band minimum is at X in PBE, the FCC-shaped cells of 320 and 432 atoms
+fold all three X points (and the 240- and 384-atom ones don't); with a cubic `transform` every size
+folds them. With PBE's masses and gap, CaO's floor for a level 0.25 eV deep is 23.0 Å at the
+default 4ξ, beyond the ladder, and B4 goes to a 728-atom cell; `decay_length_multiple : 3.5` gives
+the 432-atom cell and `3` the 320-atom one. `electronic_cell` fixes the cell instead (a length, n ×
+`transform`, or `screening` for the screening cell): B4 warns if it doesn't fold every valley. In a
+cell that folds the band edges, a localised defect level is flat across the k-points, which E2's
 band-number check relies on.
 
 ### Phase C: screening
@@ -1209,7 +1215,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **A**: [`antisites`](#b-candidates-the-screening-and-electronic-cells) (B)
 - **B**: [`band_spread_tol`](#e-production) (E) · [`bands_kspacing`](#a-host) (A) · [`baseline_mb`](#runner-settings) (runner)
 - **C**: [`ccd_points`](#g-lineshapes) (G) · [`charge_correction`](#f-thermodynamics) (F) · [`charging`](#runner-settings) (runner) · [`%block chemical_potentials`](#a-host) (A) · [`configuration_margin`](#c-screening) (C) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kgrid_max`](#a-host) (A) · [`converge_kgrid_min`](#a-host) (A) · [`converge_kgrid_step`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
-- **D**: [`deep_level_margin`](#f-thermodynamics) (F) · [`%block defects`](#b-candidates-the-screening-and-electronic-cells) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_cell`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#d-ground-and-excited-states) (D) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`dopants`](#b-candidates-the-screening-and-electronic-cells) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_pack`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
+- **D**: [`decay_length_multiple`](#b-candidates-the-screening-and-electronic-cells) (B) · [`deep_level_margin`](#f-thermodynamics) (F) · [`%block defects`](#b-candidates-the-screening-and-electronic-cells) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_cell`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#d-ground-and-excited-states) (D) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`dopants`](#b-candidates-the-screening-and-electronic-cells) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_pack`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
 - **E**: [`%block elastic_constants`](#d-ground-and-excited-states) (D) · [`electronic_cell`](#b-candidates-the-screening-and-electronic-cells) (B) · [`electronic_depth`](#b-candidates-the-screening-and-electronic-cells) (B) · [`energy`](#general) (general) · [`excite`](#d-ground-and-excited-states) (D) · [`excite_min`](#d-ground-and-excited-states) (D) · [`excite_min_dw`](#d-ground-and-excited-states) (D) · [`%block excite_overrides`](#d-ground-and-excited-states) (D) · [`excite_reach`](#d-ground-and-excited-states) (D) · [`excite_relax`](#d-ground-and-excited-states) (D) · [`excite_spin`](#d-ground-and-excited-states) (D) · [`excite_window`](#d-ground-and-excited-states) (D)
 - **F**: [`fermi_temperature`](#f-thermodynamics) (F) · [`freeze_radius`](#e-production) (E)
 - **G**: [`gap`](#f-thermodynamics) (F)
@@ -1310,10 +1316,11 @@ Details: [Phase B](#phase-b-candidate-defects-the-screening-and-electronic-cells
 | `scan_tol` | `0.02 eV` | B2 | With `scan_test : line`, the most any size's MACE relaxation energy may be off the line R∞ − c/N through it and the bigger sizes. With `flat`, a candidate's relaxation energy must be within this of that of every bigger size ... |
 | `scan_edge_tol` | `0.05 ang` | B2 | (`scan_test : flat` only) ... and the atoms at the cell's edge (further than 35 % of the image distance from the defect) moved less than this, for it to be converged in that size. |
 | `scan_test` | `line` | B2 | How B2 decides a candidate has converged. `line`: the smallest size from which its relaxation energy follows R∞ − c/N (N, the cell's atoms): it and at least three bigger sizes within `scan_tol` of the line through them; the table gives R∞, c and c/N there. `flat`: the smallest size whose relaxation energy is within `scan_tol` of every bigger size's, with the edge atoms moved less than `scan_edge_tol`. |
-| `screen_min_image` | from the band masses | B3 | The Γ-only floor (Å) yourself: the screening cell's images are at least this far apart. `0`: no floor. Without it, B3 estimates the floor from A2.2's effective masses and `deep_level_margin`. |
+| `screen_min_image` | from the band masses | B3 | The Γ-only floor (Å) yourself: the screening cell's images are at least this far apart. `0`: no floor. Without it, B3 estimates the floor from A2.2's effective masses, `deep_level_margin` and `decay_length_multiple`. |
 | `supercell` | — | B3 | Fix the screening cell: a length (`supercell : 14 ang`, the most compact cell for it) or n (`supercell : 3`, n × `transform`). B2's scan is then only reported. |
 | `electronic_cell` | from B4's search | B4 | Fix the electronic cell: a length (`20 ang`), n (n × `transform`), or `screening` (the screening cell). B4 warns if it doesn't fold every valley of the band edges onto Γ. |
-| `electronic_depth` | `0.25 eV` | B4 | The electronic cell must meet the Γ-only floor (B3's estimate, from the band masses) for a level this far from a band edge. |
+| `electronic_depth` | `0.25 eV` | B4 | The electronic cell must meet the Γ-only floor (B3's estimate, from the band masses: `decay_length_multiple` decay lengths) for a level this far from a band edge. |
+| `decay_length_multiple` | `4` | B3, B4 | The Γ-only floor is this many decay lengths ξ of the level it is for: B3's of a level `deep_level_margin` deep (unless `screen_min_image` gives the floor), B4's of one `electronic_depth` deep. At Γ the images make a level that deep look deeper than it is, by about 10 % at 4, 19 % at 3.5 and 33 % at 3 (an s-like level with no core and 12 nearest images; more for a broad core, less for a compact one), and deeper levels by much less. A cell's atoms go as the cube of the multiple. Must be greater than 0. |
 
 #### C: screening
 
@@ -1945,6 +1952,14 @@ with `excite : false` the lowest of each went on; D1 took C5's n216 steps (not C
 n216 cells, D2's hybrid single points and D4's relaxations and single points ran in n216, and D5
 started from the lowest C5 structure there. With `distort_cell : screening`, or when the two cells
 are the same, C4–C5, D1–D4 and D6 work in the screening cell as before.
+
+Then `decay_length_multiple`, which was fixed at 4 before. Tested on CaO-like masses and gap: the
+keyword is read (4 when it isn't given, 0 and −2 refused); the floors of B3 and B4 are that many of
+the same decay lengths at 3, 3.5, 4 and 5, and `screen_min_image` still sets B3's; at 3, B3 and B4
+pick smaller cells of the test ladder (n144 and n512, against n512 and n1000 at 4) and their tables
+name the multiple; changing it runs B3 and B4 again. At the default, the floor's record and B4's
+reason are what they were, so a work directory made before runs B3 and B4 again (no jobs) and
+nothing after them.
 
 Not tested: real Cirrus jobs (see 9 below), `phases_from : doped` (no Materials Project access
 here), real `mace_run_train` trainings with two heads and the charge embedding (D3, D4, G2: the
