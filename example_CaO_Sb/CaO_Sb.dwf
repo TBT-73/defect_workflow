@@ -50,12 +50,15 @@ max_restarts : 20              # a relaxation that runs out of time carries on t
 poll      : 300
 delete_check : true            # delete each .check once its calculation has finished
 # ... and for some steps only, in a runner block: runner_host for all of phase A's CASTEP
-# steps (A1 to A3.1), runner_screen for all of phase C's and D's (C2, C5, D6, D7) and
-# runner_production for phase E's (E0, E1); for one step: runner_converge (A1), runner_relax
-# (A2.1), runner_bands (A2.2), runner_dielectric (A2.3), runner_phases (A3.1),
-# runner_drelax (C5), runner_rank (D6), runner_excite (D7), runner_cells (E0). A step's own
-# block wins over its group's, and that wins over the settings above, for the keywords they give
-# (a %block partitions in one replaces the whole list).
+# steps (A1 to A3.1), runner_screen for those at the screening settings (C2, C5, D1's pristine
+# cells, D6, D7), runner_hybrid for the hybrid single points (D2, D4) and runner_production for
+# those at the production settings (D8, E1, E2, G1, G2's single points); for one step:
+# runner_converge (A1), runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3),
+# runner_phases (A3.1), runner_drelax (C5), runner_dataset (D1), runner_check (D4), runner_rank
+# (D6), runner_excite (D7), runner_validate (D8), runner_relaxations (E1), runner_zpl (E2),
+# runner_ccd (G1), runner_lineshape (G2). A step's own block wins over its group's, and that
+# wins over the settings above, for the keywords they give (a %block partitions in one replaces
+# the whole list).
 # Starting points for CaO:Sb on Cirrus - set your own:
 %block runner_host             # A1 to A3.1: the primitive cell and the competing phases
 max_cores    : 32
@@ -65,10 +68,18 @@ max_walltime : 4:00:00
 max_cores    : 16
 max_walltime : 0:20:00
 %endblock runner_converge
-%block runner_screen           # C2, C5, D6, D7: Gamma-only screening jobs
+%block runner_screen           # C2, C5, D1, D6, D7: Gamma-only screening jobs
 max_restarts : 0               # (the default for screening: a job that fails is flagged)
 %endblock runner_screen
-%block runner_production       # E0, E1: the production relaxations, up to the largest size
+%block runner_drelax           # C5: relaxations in the electronic cell, phase C's biggest
+max_cores    : 288
+max_walltime : 24:00:00
+%endblock runner_drelax
+%block runner_hybrid           # D2, D4: HSE06 single points at Gamma in the electronic cell,
+max_cores    : 576             #   by far the dearest jobs of the workflow
+max_walltime : 24:00:00
+%endblock runner_hybrid
+%block runner_production       # D8, E1, E2, G1, G2: the production settings, electronic cell
 max_cores    : 288             # up to a node (more: whole nodes, e.g. 576 for two)
 %endblock runner_production
 # On a machine that charges whole nodes, such as ARCHER2: jobscript : archer2.sh,
@@ -126,19 +137,27 @@ pair_max_distance : 5.0 ang    # ... up to this far apart
 native_pairs  : false
 dopant_pairs  : false
 # B2: the supercell sizes, as lengths (the shortest distance between periodic images), and
-# the MACE scan of every candidate in each. A candidate is converged at the smallest size whose
-# MACE relaxation energy is within scan_tol of every bigger size's, with the atoms at the cell's
-# edge moved less than scan_edge_tol. The largest length is the most B3 and E0 will use.
+# the MACE scan of every candidate in each. A candidate is converged at the smallest size from
+# which its MACE relaxation energy R lies on a line R_inf - c/N (N: the cell's atoms): that size
+# and at least 3 bigger ones within scan_tol of it. c/N is the energy of the stress the fixed cell
+# holds. The largest length is the most B3 will use (and the line test needs 3 sizes above the
+# one it picks); B4 goes beyond it if it must.
 scan          : true
 scan_lengths  : 8 10 12 14 16 18 20 ang
 scan_tol      : 0.02 eV
-scan_edge_tol : 0.05 ang
+scan_test     : line           # line | flat: R within scan_tol of every bigger size's, and the
+scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this (flat only)
 # B3: the screening cell is the smallest size that holds every candidate (B2) and is at least
 # the Gamma-only floor, estimated from the band edges' effective masses (A2.2) for the
 # shallowest deep level (deep_level_margin, below).
 !screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate
-!supercell : 14 ang            # fix the screening cell (a length, or n: n x transform);
-                               #   E0 still converges each defect's production cell
+!supercell : 14 ang            # fix the screening cell (a length, or n: n x transform)
+# B4: the electronic cell, where the survivors go from C4 on (C4-C5, D5, D7, E, F, G): the
+# smallest size at least as big as the screening cell that folds every band-edge k-point (each
+# valley's symmetry-equivalent copies too) onto Gamma, so a Gamma-point run sees the real gap,
+# and is above the Gamma-only floor for a level electronic_depth from a band edge.
+electronic_depth : 0.25 eV
+!electronic_cell : 20 ang      # fix it: a length, n (n x transform) or screening
 
 # ======================================================================= C: screening
 screen_charges   : -1 0 1
@@ -155,11 +174,18 @@ hull_margin   : 0.2 eV         # C3: keep arrangements within this of the defect
 require_gap_states : none      # none | occupied | empty | both (filled and empty levels)
 !require_spin : 2              # e.g. 2 = triplet ground state
 require_bound : false          # bound against its isolated components
-level_margin  : 0.1 eV
+level_margin  : 0.1 eV         # gap levels lie further inside the band edges than this;
+                               #   anything nearer or past them is in a band, and a run that
+                               #   leaves an electron or hole there isn't judged in C3
 distortions   : -0.6 -0.5 -0.4 -0.3 -0.2 -0.1 0.1 0.2 0.3 0.4 0.5 0.6
-distort_charges : stable       # stable (in the gap for that arrangement) | screened
-distort_around  : anchor       # anchor (the first component, e.g. the dopant) | vacancy
-                               # (the vacant site, for defects that have one)
+distort_charges : screened     # screened (every charge state) | stable (in the gap for that
+                               #   arrangement, plus any in a band)
+distort_around  : auto         # auto: a single defect's site, a nearest-neighbour complex's
+                               #   centre, else each component in turn | centre | each |
+                               #   anchor (the first component, e.g. the dopant) | vacancy
+distort_cell    : electronic   # where everything after C3 works: electronic (B4's cell;
+                               #   C1-C3 screen every candidate in the smaller screening
+                               #   cell) | screening (C4-C5 and D1-D4 stay there)
 !%block oxidation_states       # for the number of neighbours to distort
 !Ca +2
 !O  -2
@@ -167,40 +193,122 @@ distort_around  : anchor       # anchor (the first component, e.g. the dopant) |
 !%endblock oxidation_states
 
 # ================================================================ D: ground and excited states
-# D1 to D5, a MACE model trained for each defect on C5's runs that searches for its ground
-# states, are planned, not scripted: until they are, D6 ranks C5's relaxations.
+# D1-D5 (model : true): a MACE model of each defect C3 keeps (after Wang, Mosquera-Lois and
+# Walsh, arXiv:2603.05238): a 'pbe' head trained on its C5 runs (D1, with model_rattles rattled
+# pristine cells) and an 'hse' head on hybrid single points of about model_hybrid_fraction of
+# them (D2), the total charge embedded so that one model covers every charge state (D3). D4
+# checks it: its test errors, and the hybrid's forces at the model's minima (at most
+# model_force_tol, else those points join the data and it is trained again, up to model_rounds
+# times). D5 searches with it: ShakeNBreak distortions (search_distortions) and rattles of every
+# charge state, and each distinct minimum of one charge state tried in the others. All of it in
+# the electronic cell, like everything after C3. With model : false, D6 ranks C5's relaxations
+# instead.
+model           : true
+model_hybrid    : true         # false: the 'pbe' head only, no hybrid single points
+hybrid_param    : CaO_hse.param    # D2, D4: xc_functional : HSE06 (single points at Gamma)
+hybrid_cell     : CaO_ncp.cell     # its species_pot: CASTEP's hybrids need norm-conserving
+model_jobscript : cirrus_gpu.sh    # the trainings (and G2's phonons) as GPU jobs; without
+model_device    : cuda             #   it, they run where dwf.py runs
+!model_hybrid_fraction : 0.1
+!model_rattles  : 10
+!model_epochs   : 300
+!model_channels : 64           # the model's size (with model_r_max 5 ang, model_max_L 1,
+                               #   model_batch 4)
+!model_train_args : --swa      # anything else for mace_run_train
+!model_force_tol : 0.1 eV/ang
+!model_rounds   : 2
+!search_distortions : -0.7 -0.6 -0.5 -0.4 -0.3 -0.2 -0.1 0.1 0.2 0.3 0.4 0.5 0.6 0.7
+!search_rattles : 2            # rattled copies of each distortion
+!search_keep    : 10           # distinct minima per charge state for D6
+# D6: the ground states: D5's minima ranked by the model (model : true), or C5's relaxations,
+# a winning distortion tried in the other charge states (model : false).
 distortion_min_gain : 0.05 eV  # a distortion counts if it beats the unperturbed by this
-share_rounds    : 2            # D6: try a winning distortion in the other charge states
-keep_structures : 1            # per charge state, on to E
-# D7: the excited state of each defect's ground state (CASTEP's ΔSCF, at the screening
-# settings). Only the defects that pass, and every native defect, go on to E. Test it on one
-# defect first: CASTEP's ΔSCF must work on your build (Sb_Ca-V_O, q -1: ZPL about 0.53 eV).
-!excite        : true          # D7 on (default off: everything D6 kept goes on)
-!excite_window : 0.3 3.5 eV    # pass if the ZPL is in this window (default: any converged one)
-excite_min     : 0.4 eV        # the smallest Kohn-Sham step taken as an excitation
+share_rounds    : 2            # (model : false) rounds of sharing distortions
+keep_structures : 1            # per charge state, on to D7
+# D7: in the electronic cell, at the screening settings. Each charge state's ground state is
+# relaxed: a triplet (spin within spin_tol of excite_spin) goes on, a band state is left
+# 'pending' (PBE can't place it), any other only to F. Its defect levels are the bands localised
+# on the defect (participation number at most local_fraction of the atoms), in the gap or up to
+# excite_reach inside a band; in each spin channel the highest occupied one to the lowest empty
+# one is excited (CASTEP's ΔSCF) and relaxed. It passes if its ZPL is at least excite_min (and
+# inside excite_window), the promoted electron stays on the defect and the 1D Debye-Waller
+# estimate is at least excite_min_dw. Defects that pass go on to E with all their charge states,
+# and so does every native defect (for F). Test CASTEP's ΔSCF on one defect first.
+excite         : true          # false: everything D6 kept goes on to E as it is
+excite_spin    : 2             # CASTEP's spin: 2 = triplet; any: every spin state
+!spin_tol      : 0.3
+!local_fraction : 0.2
+!excite_reach  : 1.0 eV
+excite_min     : 0.4 eV
+!excite_window : 0.3 3.5 eV    # pass only if the ZPL is in this window
+!excite_min_dw : 0.05          # pass only if the 1D Debye-Waller estimate is at least this
 excite_relax   : true          # relax the excited state (the ZPL); false: vertical energy
 !%block excite_overrides       # any other .param keywords for D7's runs
 !deltascf_smearing : 0.01
 !%endblock excite_overrides
+# D8 (optional): a test of the screening cell's finite-size error, which C3's hull rests on.
+# Each defect named here is relaxed in each charge state D6 kept (its lowest structure; band
+# states left out) at the production settings (production_overrides, with the stress on) in the
+# screening cell and in the next validate_sizes sizes up. The line E_inf + b/N through the bigger
+# sizes is the reference for three estimates from the screening cell: its E as it is, less
+# MACE's c/N (B2), and less the energy of its own stress (needs elastic_constants). With
+# validate_gamma, Gamma-point single points of the same structures show the Gamma-only error.
+# Costly: the ladder's biggest cells, so name two or three defects.
+!validate : true
+!validate_defects : d001 d002  # B1's ids (default: every defect D6 kept)
+!validate_sizes   : 3          # how many sizes above the screening cell
+!validate_tol     : 0.05 eV    # how close each estimate must come (levels too)
+!validate_gamma   : true
+!%block elastic_constants      # the host's, GPa: C11 C12 C44 (cubic) or six lines of six;
+!226.2 62.4 80.6               #   CaO at 298 K (Drago & Spain 1977); your functional's own
+!%endblock elastic_constants   #   (e.g. PBE's) are better, as the stress comes from it
 
 # ======================================================================= E: production
-# E0: each defect's production cell: its ground states relaxed one size below the screening
-# cell and in it, then up the sizes of scan_lengths until two neighbouring sizes agree on
-# E_D - E_host + E_corr in every charge state; E1 then relaxes everything in that cell.
-series_tol : 0.05 eV
+# E1: every charge state of each defect D7 passes (and of every native defect) relaxed at the
+# production settings (A1's cut-off and k-points), in the electronic cell, with the pristine
+# cell's single point. E2: the production ΔSCF of D7's excitations. A single point with the
+# bands' weights first checks that each constrained band keeps its number at every k-point
+# (inside the gap, spread less than band_spread_tol); where it doesn't, the ΔSCF runs at Gamma.
 %block production_overrides
 geom_energy_tol : 5e-6
 elec_energy_tol : 5e-7
 geom_max_iter   : 100
 %endblock production_overrides
+!band_spread_tol : 0.05 eV
 freeze_radius : 0              # (untested idea) fix the atoms further than this (Ang) from
-                               #   every component of the defect, in E0 and E1
-!finetune     : true           # E2: MACE fine-tuning data from E0's and E1's relaxations
+                               #   every component of the defect, in E1
 
 # ======================================================================= F: thermodynamics
 charge_correction : lz         # lz | mp | none
-!gap : 7.09 eV                 # band gap for the Fermi-level range (default: from A2)
+!gap : 7.09 eV                 # band gap for the Fermi-level range of C3, F2 and F3 (default:
+                               #   the screening cell's in C3, A2.2's in F)
 !fermi_temperature  : 1000 K   # self-consistent Fermi level at this temperature
 !quench_temperature : 300 K    # ... with the defects frozen in, then at this one
 deep_level_margin : 0.5 eV     # F3: a level this far from both band edges is "deep" (B3's
                                #   Gamma-only floor is for a level this deep)
+# F2 finds the Fermi level of each set of dopants on its own (the native defects alone, with
+# each dopant, and with each mix that one defect brings), and F3 sends on to G each excitation
+# that passed E2 whose charge state is the lowest for some Fermi level in the gap.
+
+# ======================================================================= G: lineshapes
+# G1: the 1D configuration-coordinate diagram of each excitation F3 sends on: ground-state and
+# ΔSCF single points along the line from the relaxed ground state (0) to the relaxed excited
+# state (1), at E2's settings; parabolas give each state's phonon energy and Huang-Rhys factor,
+# and the 1D luminescence lineshape.
+!ccd_points : -0.4 -0.2 0 0.2 0.4 0.6 0.8 1 1.2 1.4
+lineshape_temperature : 10 K   # the temperature of both lineshapes
+!lineshape_sigma : 0.006 eV    # Gaussian width of each phonon line
+!lineshape_gamma : 0.002 eV    # Lorentzian half-width of the ZPL
+# G2 (optional): the multi-mode lineshape. A PBE model of each defect (one head, the charge
+# embedded), trained on lineshape_displacements displaced copies of its ground state (normal,
+# lineshape_amplitude a component), its E1 relaxations and lineshape_host rattled pristine
+# cells, all at the production settings; its phonons in a cell lineshape_length across (finite
+# differences, lineshape_delta), projected onto the excited state's forces at the ground
+# state's structure (lineshape_method forces) or onto the displacement between the relaxed
+# states (displacements). The trainings and phonons run with model_jobscript.
+!lineshape : true
+!lineshape_displacements : 30
+!lineshape_amplitude : 0.02 ang
+!lineshape_host   : 5
+!lineshape_length : 30 ang     # CaO: about 1900 atoms, 11,500 model force evaluations
+!lineshape_method : forces     # forces | displacements

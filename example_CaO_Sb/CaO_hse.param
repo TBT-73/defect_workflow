@@ -1,0 +1,9 @@
+# Settings for the hybrid single points of the ground-state models' 'hse' head (D2, and D4's
+# checks at the models' minima). Every job is a single point at Gamma; dwf.py sets task, charge,
+# spin and spin_polarized. CASTEP's hybrid functionals need norm-conserving potentials
+# (hybrid_cell : CaO_ncp.cell), hence the higher cut-off: converge it as you would any other.
+# Time one single point of the screening cell first: it costs far more than a PBE one.
+xc_functional   : HSE06
+cut_off_energy  : 900 eV
+elec_energy_tol : 1e-6 eV
+max_scf_cycles  : 200
