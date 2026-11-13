@@ -42,14 +42,16 @@ With `DWF` the directory that holds `dwf.py` and `supercell_convergence.py`:
 cd example_CaO_Sb
 python3 $DWF/dwf.py CaO_Sb.dwf --prepare-only     # write the first jobs' inputs, submit nothing
 nohup python3 $DWF/dwf.py CaO_Sb.dwf > run.log 2>&1 &
-python3 $DWF/dwf.py CaO_Sb.dwf --status           # which steps have finished
+python3 $DWF/dwf.py CaO_Sb.dwf --status           # which steps have finished (and results.dwf)
 ```
 
 The run goes through every step, A1 to G2, and waits for its CASTEP jobs, so run it with
 `nohup` (or in `tmux`/`screen`). If it stops for any reason, the same command carries on where
-it stopped. Each phase's `summary.txt` shows its results as it goes: `F_thermo/summary.txt` has
-the formation energies, transition levels and Fermi levels, and `G_lineshape/summary.txt` the
-lineshapes of the excitations that made it through.
+it stopped. `dwf_CaO_Sb/results.dwf` has everything in one file, as a `.castep` does for a CASTEP
+job: every step's status, the keywords your project file gives, and each phase's results, A to G,
+written again as each step finishes. Each phase's `summary.txt` has its part:
+`F_thermo/summary.txt` the formation energies, transition levels and Fermi levels, and
+`G_lineshape/summary.txt` the lineshapes of the excitations that made it through.
 
 The first time, stop after phase B (`--until B`) and read `B_candidates/summary.txt` before the
 screening: the candidate list (each candidate costs about (number of `screen_charges`)
@@ -324,7 +326,7 @@ python3 dwf.py <project>.dwf [STEP ...] [--until STEP] [--redo STEP] [--status] 
 | `STEP ...` | run only these steps: names (`relax`), labels (`A2.1`) or phase letters (`C`); default all |
 | `--until STEP` | stop after this step or phase (`--until B`) |
 | `--redo STEP` | start this step again from scratch (can be repeated) |
-| `--status` | list every step: finished (when, and its one-line result), still running, or not run |
+| `--status` | list every step: finished (when, and its one-line result), still running, or not run; and write `results.dwf` again (nothing runs) |
 | `--example` | print the annotated project file |
 | `--prepare-only` | write the inputs of the next CASTEP jobs (with their dry runs), submit nothing |
 | `--no-wait` | submit what is needed and exit; run it again later to carry on |
@@ -380,6 +382,8 @@ changes it):
 
 ```
 dwf_CaO_Sb/
+  results.dwf             everything in one file: every step's status, your settings and
+                          each phase's summary (rewritten as the steps finish)
   state.json              which steps have finished, and with what inputs
   STOP                    touch it to stop a running dwf.py
   A_host/                 results.json, summary.txt,
@@ -409,6 +413,14 @@ dwf_CaO_Sb/
   mace_models/            the foundation model, for the MACE jobs
 ```
 
+`results.dwf` is the file to read: like a `.castep`, it has the whole run in one place. At the top,
+every step with its status (as `--status` prints it: when it finished and its one-line result,
+`running`, or `-` for not yet), then the keywords your project file gives, as you wrote them
+(blocks on one line), then each phase that has run, A to G, with every step's table. It is written
+again whenever a step finishes or stops, at the end of every run, and by `--status` (which runs
+nothing, so it brings the file up to date for a work directory made before it existed). No step
+reads it.
+
 Each phase has one folder with the same layout:
 
 - **`results.json`**: everything the later steps use from this phase, under the name of the
@@ -416,7 +428,8 @@ Each phase has one folder with the same layout:
   files named in them (the relaxed host, `production.param`, structures).
 - **`summary.txt`**: the same results for you to read: for each step, when it finished, its
   one-line result and its table (the convergence test, the candidates, the filter verdicts, the
-  ranking, the formation energies, ...). No step reads it, so editing it changes nothing.
+  ranking, the formation energies, ...); `results.dwf` has every phase's together. No step reads
+  it, so editing it changes nothing.
 - **`structures/`**: the structures the phase made, as CASTEP `.cell` files (lattice, positions,
   `SPIN=` where a starting spin is set): look at one with `ase gui`, or turn it into another
   format with `ase convert` (e.g. to `.cif`).
@@ -2005,6 +2018,12 @@ lower structure 0.03 eV down is not a new minimum, a failed run comes last with 
 converged step (its later, unconverged step left out), a run with an unconverged step says so, and
 with `distort_cell : screening` the start is C2's screened run. The cell-split test runs C5 end to
 end in both cells with it.
+
+Then `results.dwf`. Tested on a made-up state: every step's status, the project file's keywords,
+the phases that have run in order (none for one that hasn't), each step's table once, the file
+written again rather than added to when a step finishes, and `--status` bringing it up to date; and
+with `--status` on the example project, from the project file as read (its runner blocks on one
+line each).
 
 Not tested: real Cirrus jobs (see 9 below), `phases_from : doped` (no Materials Project access
 here), real `mace_run_train` trainings with two heads and the charge embedding (D3, D4, G2: the

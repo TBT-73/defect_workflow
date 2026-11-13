@@ -28,6 +28,8 @@ or --until STEP to stop after a step or phase.
                      multi-mode, a PBE model's phonons in a big cell)
 
 Files. Everything goes in the work directory, dwf_<name>/ next to the project file:
+  results.dwf        everything in one file, as a .castep is for a CASTEP job: every step's
+                     status, the keywords the project file gives and every phase's summary
   state.json         which steps have finished, and with what inputs (the checkpoints)
   A_host/ ... G_lineshape/  one folder per phase, each with
     results.json     everything the later steps use from this phase
@@ -116,6 +118,9 @@ log, die = sc.log, sc.die
 
 HARTREE = 27.211386245988                     # eV
 STATE, RESULTS, SUMMARY = "state.json", "results.json", "summary.txt"
+# the work directory's file of everything (every step's status, the project file's keywords and
+# every phase's summary), rewritten as the steps finish: the workflow's .castep
+OVERVIEW = "results.dwf"
 PHASE_DIRS = {"A": "A_host", "B": "B_candidates", "C": "C_screen", "D": "D_states",
               "E": "E_production", "F": "F_thermo", "G": "G_lineshape"}
 PHASE_TITLES = {"A": "host", "B": "candidate defects, the screening and electronic cells",
@@ -396,7 +401,7 @@ def kgrid_list(name, lo, hi, step):
 
 
 # The keyword, or the block's name, of an item of a CASTEP-style file (sc.parse_castep_input).
-#   Called by: Project.runner(), Project.runner_items(), read_project()
+#   Called by: Project.runner(), Project.runner_items(), read_project(), write_results()
 def item_key(x):
     return x["name"] if x["type"] == "block" else x["key"]
 
@@ -995,12 +1000,12 @@ def outputs_hash(p, outputs):
                                   default=str).encode()).hexdigest()
 
 
-# Writes a phase's summary.txt: for each of its steps that has run, a heading, when it finished
-# and its one-line note, then its table (main() keeps the notes and tables in state.json).
-#   Called by: main(), migrate_workdir(), reset_step()
-def write_summary(p, phase):
-    lines = [f"Project {p.name}, phase {phase}: {PHASE_TITLES[phase]}",
-             f"(written by dwf.py; the numbers the later steps use are in {RESULTS})", ""]
+# A phase's summary, as lines: for each of its steps that has run, a heading, when it finished
+# and its one-line note, then its table (main() keeps the notes and tables in state.json); [] if
+# none has run.
+#   Called by: write_results(), write_summary()
+def phase_text(p, phase):
+    lines = []
     for s in STEPS:
         rec = p.state["steps"].get(s.name)
         if s.phase != phase or not rec:
@@ -1015,23 +1020,87 @@ def write_summary(p, phase):
         else:
             lines.append(f"not finished yet ({rec.get('time', '')}): run dwf.py again to carry on")
         lines.append("")
-    (p.phase_dir(phase) / SUMMARY).write_text("\n".join(lines))
+    return lines
 
 
-# Prints every step, in order, with its status: when it finished and its note, still running
-# (jobs queued), or not run yet ('-').
-#   Called by: main()
-def print_status(p):
-    print(f"\nProject {p.name}: {p.path} -> {p.dir}/")
-    phase = None
+# Writes a phase's summary.txt (phase_text), and results.dwf with it.
+#   Called by: main(), migrate_workdir(), reset_step()
+#   Calls:     phase_text(), write_results()
+def write_summary(p, phase):
+    lines = [f"Project {p.name}, phase {phase}: {PHASE_TITLES[phase]}",
+             f"(written by dwf.py; the numbers the later steps use are in {RESULTS})", ""]
+    (p.phase_dir(phase) / SUMMARY).write_text("\n".join(lines + phase_text(p, phase)))
+    write_results(p)
+
+
+# Writes results.dwf in the work directory: everything in one file, as a .castep is for a CASTEP
+# job. It is written again whenever a phase's summary.txt is (each step that finishes or stops),
+# at the end of every run and by --status: the project, every step's status (status_lines), the
+# keywords the project file gives (as written; the rest are at their defaults), then the summary
+# of each phase that has run (phase_text), A to G. No step reads it.
+#   Called by: main(), print_status(), write_summary()
+#   Calls:     item_key(), phase_text(), sc.block_rows(), status_lines()
+def write_results(p):
+    title = f"dwf.py results: project {p.name}"
+    lines = [title, "=" * len(title), "",
+             f"project file    {p.path.resolve()}",
+             f"work directory  {p.dir.resolve()}/",
+             f"written         {time.strftime('%Y-%m-%d %H:%M')}, "
+             "and again whenever a step finishes",
+             f"phase folders   each one's {SUMMARY} has its part of this, "
+             f"its {RESULTS} the numbers", "",
+             "Steps", "-----"] + status_lines(p)
+
+    # A keyword's value as the project file gives it: a block of settings as its lines (without
+    # their comments) joined with ' / ', a job-script template written in a block as its length.
+    def given(k, v):
+        if v != "(%block)":
+            return v
+        blocks = getattr(p, "runner_blocks", {})
+        if k.startswith("runner_") and k[len("runner_"):] in blocks:
+            return " / ".join(f"{item_key(x)} : {x.get('value', '')}"
+                              for x in blocks[k[len("runner_"):]])
+        it = next((x for x in getattr(p, "runner_project", []) if item_key(x) == k
+                   and x["type"] == "block"), None)
+        if it is None or "jobscript" in k:
+            return v if it is None else f"(%block, {len(it['body'])} lines)"
+        return " / ".join(" ".join(r) for r in sc.block_rows(it))
+
+    head = "Settings: the keywords the project file gives (the rest are at their defaults)"
+    width = max((len(k) for k in p.raw), default=0)
+    lines += ["", head, "-" * len(head)] + [f"  {k:<{width}} : {given(k, v)}"
+                                            for k, v in p.raw.items()]
+    for phase in PHASE_DIRS:
+        body = phase_text(p, phase)
+        if body:
+            head = f"Phase {phase}: {PHASE_TITLES[phase]} ({PHASE_DIRS[phase]}/)"
+            lines += ["", "=" * 100, head, "=" * 100, ""] + body
+    (p.dir / OVERVIEW).write_text("\n".join(lines).rstrip() + "\n")
+
+
+# Every step, in order under its phase, with its status: when it finished and its note, still
+# running (jobs queued), or not run yet ('-').
+#   Called by: print_status(), write_results()
+def status_lines(p):
+    lines, phase = [], None
     for s in STEPS:
         if s.phase != phase:
             phase = s.phase
-            print(f"\n  {phase}: {PHASE_TITLES[phase]}  ({PHASE_DIRS[phase]}/)")
+            lines.append(f"  {phase}: {PHASE_TITLES[phase]}  ({PHASE_DIRS[phase]}/)")
         rec = p.state["steps"].get(s.name, {})
-        print(f"    {s.label:<5} {s.name:<12} {rec.get('status', '-'):<8} "
-              f"{rec.get('time', ''):<16}  {rec.get('note', '')}".rstrip())
-    print()
+        lines.append(f"    {s.label:<5} {s.name:<12} {rec.get('status', '-'):<8} "
+                     f"{rec.get('time', ''):<16}  {rec.get('note', '')}".rstrip())
+    return lines
+
+
+# Prints every step's status (status_lines), and brings results.dwf up to date.
+#   Called by: main()
+#   Calls:     status_lines(), write_results()
+def print_status(p):
+    print(f"\nProject {p.name}: {p.path} -> {p.dir}/\n")
+    print("\n".join(status_lines(p)) + "\n")
+    write_results(p)
+    print(f"(results.dwf: {p.dir / OVERVIEW})\n")
 
 
 # Moves a step's files aside (<path>.old-<time>) and forgets that it ran, and its results: --redo.
@@ -1141,7 +1210,7 @@ def migrate_workdir(p):
 #   Called by: the main block
 #   Calls:     Project.__init__(), Project.finished(), Project.save_results(), Project.save_state(),
 #              inputs_hash(), mace_worker(), migrate_workdir(), outputs_hash(), phonon_worker(),
-#              print_status(), reset_step(), write_summary()
+#              print_status(), reset_step(), write_results(), write_summary()
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1151,7 +1220,8 @@ def main():
     ap.add_argument("--until", metavar="STEP", help="stop after this step or phase (e.g. B)")
     ap.add_argument("--redo", action="append", default=[], metavar="STEP",
                     help="start this step again from scratch (can be given more than once)")
-    ap.add_argument("--status", action="store_true", help="show which steps have finished")
+    ap.add_argument("--status", action="store_true",
+                    help="show which steps have finished (and bring results.dwf up to date)")
     ap.add_argument("--example", action="store_true", help="print an annotated project file")
     ap.add_argument("--prepare-only", action="store_true",
                     help="write the inputs of the next CASTEP jobs, submit nothing")
@@ -1261,10 +1331,11 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted. Submitted jobs keep running - rerun the same command to carry on.")
         return
+    write_results(p)
     if all(p.finished(s.name) for s in todo):
         log((f"step {todo[0].label}" if len(todo) == 1 else
              f"steps {todo[0].label} to {todo[-1].label}")
-            + f" done: each phase's summary.txt has the results ({p.dir}/)")
+            + f" done: {p.dir / OVERVIEW} has the results (each phase's summary.txt its part)")
 
 
 # --------------------------------------------------------------------------
