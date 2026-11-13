@@ -151,6 +151,9 @@ CENTRE_ATOM_TOL = 0.5
 # same basin if no atom near the defect is displaced from its site by more than this differently
 # (Ang)
 BASIN_TOL = 0.2
+# C5's ranking: two relaxations are compared for being the same structure only when their energies
+# are within this (eV); further apart, they are different minima
+RANK_E_TOL = 0.05
 # D1: the structures left out of a model's training data (more than MODEL_E_WINDOW eV above the
 # lowest of their charge state, atoms closer than MODEL_MIN_DIST Ang, a force above MODEL_MAX_FORCE
 # eV/Ang), the share kept for testing, the random seed; the total charge's embedding (classes from
@@ -158,6 +161,11 @@ BASIN_TOL = 0.2
 MODEL_E_WINDOW, MODEL_MIN_DIST, MODEL_MAX_FORCE = 3.0, 1.5, 10.0
 MODEL_TEST_FRACTION, MODEL_SEED = 0.2, 7
 CHARGE_OFFSET, CHARGE_CLASSES = 10, 21
+# D3: the 'hse' head's training structures are repeated until they are about this share of the
+# 'pbe' head's (as the hybrid data were in the paper), so a few hybrid single points still weigh in
+# the training; a head with fewer than MODEL_HOLDOUT_MIN structures (or repeated ones) is validated
+# on its own structures instead of holding some back
+MODEL_HSE_SHARE, MODEL_HOLDOUT_MIN = 0.1, 20
 # The settings a MACE relaxation task may carry for the ground-state model (D4, D5), in this order
 # (mace_key's, mace_relax's)
 EXTRA_TASK_KEYS = ("model", "head", "charge", "fmax", "steps")
@@ -287,7 +295,7 @@ PROJECT_KEYWORDS = {
     "oxidation_states": ("lines", None),
     # D: ground and excited states
     "model": (_b, False), "model_hybrid": (_b, True), "hybrid_cell": (_t, None),
-    "hybrid_param": (_t, None), "model_hybrid_fraction": (sc._num(), 0.1),
+    "hybrid_param": (_t, None), "model_hybrid_points": (sc._num(cast=int), 6),
     "model_rattles": (sc._num(cast=int), 10), "model_rattle_stdev": (sc._num("ang", "A"), 0.05),
     "model_jobscript": ("template", None), "model_command": (_t, "mace_run_train"),
     "model_device": (_t, None), "model_epochs": (sc._num(cast=int), 300),
@@ -431,7 +439,10 @@ RETIRED = {"series_tol": _NO_E0, "runner_cells": _NO_E0, "finetune": _NO_E2,
            "size_check_defects": _NO_C2C, "size_check_cell": _NO_C2C, "runner_sizecheck": _NO_C2C,
            "band_state_cell": "has been replaced by distort_cell: C4 and C5 work in the electronic "
                               "cell for every charge state of every survivor (distort_cell : "
-                              "electronic, the default), band states included"}
+                              "electronic, the default), band states included",
+           "model_hybrid_fraction": "has been replaced by model_hybrid_points: the number of "
+                                    "each defect's D1 structures D2 recomputes with the hybrid "
+                                    "(default 6, shared out over its charge states)"}
 
 
 # Reads the project file into a namespace of settings.
@@ -538,7 +549,7 @@ def read_project(path):
             die(f"{name}: {key} must be greater than 0")
     for key in ("mace_threads", "mace_steps", "mace_pack", "mace_max_jobs", "validate_sizes",
                 "model_epochs", "model_channels", "model_batch", "model_rounds", "search_steps",
-                "search_keep"):
+                "search_keep", "model_hybrid_points"):
         if getattr(s, key) is not None and getattr(s, key) < 1:
             die(f"{name}: {key} must be at least 1")
     if min(s.scan_lengths) <= 0:
@@ -1300,10 +1311,10 @@ def save_cell(p, path, atoms, title):
 
 # Reads a structure saved by save_cell (rel: relative to the work directory), as ASE Atoms with
 # the starting spins as initial magnetic moments.
-#   Called by: Project.host(), distinct_states(), duplicates(), into_cell(), lineshape_vector(),
-#              run_screen_jobs(), step_ccd(), step_check(), step_distort(), step_excite(),
-#              step_lineshape(), step_rank(), step_screen(), step_search(), step_validate(),
-#              step_zpl(), validate_gamma()
+#   Called by: Project.host(), distinct_states(), drelax_ranking(), duplicates(), into_cell(),
+#              lineshape_vector(), run_screen_jobs(), step_ccd(), step_check(), step_distort(),
+#              step_excite(), step_lineshape(), step_rank(), step_screen(), step_search(),
+#              step_validate(), step_zpl(), validate_gamma()
 #   Calls:     sc.read_structure()
 def load_cell(p, rel):
     return sc.read_structure(p.dir / rel)
@@ -2359,8 +2370,8 @@ def write_json(path, data):
 # A text table for summary.txt and the log: a title, a header row, a rule and the rows, in columns
 # as wide as needed (numbers to the right, text to the left). Floats are shown with 4 decimals,
 # None as blank.
-#   Called by: ladder_table(), problem_table(), rank_model(), step_ccd(), step_check(),
-#              step_choose(), step_converge(), step_corrections(), step_dataset(),
+#   Called by: drelax_ranking(), ladder_table(), problem_table(), rank_model(), step_ccd(),
+#              step_check(), step_choose(), step_converge(), step_corrections(), step_dataset(),
 #              step_electronic(), step_excite(), step_filter(), step_formation(), step_generate(),
 #              step_hybrid(), step_interest(), step_limits(), step_lineshape(), step_phases(),
 #              step_prerelax(), step_rank(), step_relaxations(), step_scan(), step_search(),
@@ -4340,19 +4351,152 @@ def run_screen_jobs(p, step, subdir, todo, structdir, edges=None):
     return out, {tag: list(known[tag]) for tag in cells}
 
 
+# The energy of every SCF of a .castep and whether it converged: [(energy, converged)] in order,
+# the energy of the kind the workflow reads (which, the energy keyword; auto: the est. 0K one where
+# CASTEP prints it, with smearing, else the final one), as the runs' own energies are. An SCF did
+# not converge when CASTEP's warning (sc.SCF_FAILED) comes between the previous energy and this
+# one's forces; CASTEP still prints its energy and forces, and a relaxation carries on from it.
+#   Called by: drelax_ranking()
+#   Calls:     first_energy()
+def step_energies(text, which="auto"):
+    ends = list(re.finditer(sc.ENERGY_PATTERNS["final"], text))
+    out = []
+    for k, m in enumerate(ends):
+        stop = ends[k + 1].start() if k + 1 < len(ends) else len(text)
+        tail = text[m.end():stop]
+        fm = re.search(r"\*+ [\w ]*Forces \*+", tail)
+        scf = text[ends[k - 1].end() if k else 0:m.end() + (fm.start() if fm else 0)]
+        e = float(m.group(1)) if which == "final" else first_energy(m.group(0) + tail, which)
+        out.append((float(m.group(1)) if e is None else e,
+                    not any(s in scf for s in sc.SCF_FAILED)))
+    return out
+
+
+# C5's ranking, for summary.txt, so that what the distortions found can be looked at before the
+# model is trained: every relaxation of each survivor's charge states, lowest energy first, in the
+# cell C4 worked in, against the start they had to beat (the screened structure relaxed there, C4's
+# undistorted job; with distort_cell : screening, C2's screened run). Runs that relaxed into the
+# same structure (same_structures, tried only for energies within RANK_E_TOL) share a letter, A the
+# lowest. A charge state has a new minimum when its lowest structure is not the start's and is
+# lower by at least distortion_min_gain (D6's test). Runs without a usable energy come last, with
+# the lowest of their steps whose SCF converged (step_energies); a run with steps whose SCF did
+# not converge says how many (D1 trains on every step). Returns (the tables, the charge states
+# with a new minimum, all charge states).
+#   Called by: step_drelax()
+#   Calls:     format_table(), load_cell(), same_structures(), step_energies()
+def drelax_ranking(p, runs):
+    survivors = p.out("filter")["survivors"]
+    cands = p.out("generate")["candidates"]
+    c4 = p.out("distort")
+    cell = c4["cell"]["tag"] if c4.get("electronic") else None
+    gmin = p.s.distortion_min_gain
+    jobs = p.phase_dir("C") / "jobs" / "drelax"
+
+    # A run's name in the tables: start, its distortion factor (with the point it was distorted
+    # around, when there are several) or rattled.
+    def label(r):
+        f = r.get("factor")
+        if f is None:
+            return "start" + ("" if cell else " (C2)")
+        if f == "rattled":
+            return "rattled"
+        return f"{f:+.2f}" + (f" around {r['around']}"
+                              if str(r.get("source", "")).startswith("distortion around") else "")
+
+    summary, rows, new = [], [], 0
+    for s in survivors:
+        cid = s["cand"]
+        for q in s["charges"]:
+            ok, failed = [], []
+            if cell is None:                    # (the start is C2's screened run)
+                b = s["best"].get(str(q))
+                if b and b.get("energy") is not None and b.get("structure"):
+                    ok.append(dict(b, factor=None, steps=None, geom_converged=None, bad=0))
+            for name, r in sorted(runs.items()):
+                if r["cand"] != cid or r["q"] != q:
+                    continue
+                f = jobs / name / f"{name}.castep"
+                es = (step_energies(f.read_text(errors="replace"), p.s.energy) if f.exists()
+                      else [])
+                r = dict(r, name=name, bad=sum(not c for _, c in es),
+                         best=min((e for e, c in es if c), default=None))
+                (ok if r["energy"] is not None and r["structure"] else failed).append(r)
+            ok.sort(key=lambda e: e["energy"])
+            start = next((e for e in ok if e.get("factor") is None), None)
+            e0 = start["energy"] if start else (ok[0]["energy"] if ok else None)
+            letters, reps = [], []              # (each structure's first run, its letter)
+            for e in ok:
+                atoms = load_cell(p, e["structure"])
+                hit = next((k for k, (r0, a0) in enumerate(reps)
+                            if abs(r0["energy"] - e["energy"]) < RANK_E_TOL
+                            and len(same_structures([a0, atoms])) == 1), None)
+                if hit is None:
+                    reps.append((e, atoms))
+                    hit = len(reps) - 1
+                letters.append(chr(ord("A") + hit) if hit < 26 else f"#{hit + 1}")
+            for e, letter in zip(ok, letters):
+                rows.append([cid, f"{q:+d}", label(e), e["energy"] - e0, e["energy"], e["spin"],
+                             e["steps"], {True: "yes", False: "no"}.get(e["geom_converged"]),
+                             letter, (f"SCF unconverged at {e['bad']} step"
+                                      + ("s" if e["bad"] > 1 else "")) if e["bad"] else ""])
+            for r in failed:
+                why = (r["reason"] or "its last SCF did not converge").splitlines()[0]
+                rows.append([cid, f"{q:+d}", label(r), None, None, r["spin"], r["steps"],
+                             {True: "yes", False: "no"}.get(r["geom_converged"]), "",
+                             f"no energy ({why}); " + (
+                                 "no step's SCF converged" if r["best"] is None else
+                                 f"lowest converged step {r['best']:.4f} eV" if e0 is None else
+                                 f"lowest converged step {r['best'] - e0:+.4f} eV")])
+            if not ok:
+                verdict = "no run has an energy"
+            elif start is None:
+                verdict = "the start has no energy (dE against the lowest)"
+            elif letters[0] == letters[ok.index(start)]:
+                verdict = "the start is the lowest"
+            elif e0 - ok[0]["energy"] >= gmin:
+                verdict, new = "NEW MINIMUM", new + 1
+            else:
+                verdict = f"lower by less than {gmin:g} eV"
+            summary.append([cid, cands[cid]["name"], f"{q:+d}", start["energy"] if start else None,
+                            ok[0]["energy"] if ok else None,
+                            e0 - ok[0]["energy"] if start and ok else None,
+                            label(ok[0]) if ok else "", len(reps), len(failed), verdict])
+    where = (f"the electronic cell ({cell})" if cell else
+             f"the screening cell ({p.out('choose')['tag']})")
+    table = (format_table(["id", "defect", "q", "start E/eV", "lowest E/eV", "gain/eV", "lowest",
+                           "distinct", "failed", "verdict"], summary,
+                          f"The distortions' search in {where}, by charge state (energies at the "
+                          "screening settings; start: the screened structure"
+                          + (", relaxed there" if cell else " (C2)") + "; a new minimum: a "
+                          f"structure other than the start's, lower by distortion_min_gain "
+                          f"({gmin:g} eV) or more)")
+             + "\n" + format_table(["id", "q", "run", "dE/eV", "E/eV", "spin", "steps", "relaxed",
+                                    "same", "note"], rows,
+                                   "Every relaxation, lowest first in each charge state (dE: "
+                                   "against the start; same letter: relaxed into the same "
+                                   "structure, A the lowest; runs without a usable energy last)"))
+    return table, new, len(summary)
+
+
 # C5: relaxes every structure C4 made with the screening settings (C2's, Gamma point, no
 # restarts), in the cell C4 made it in, against that cell's band edges (run_screen_jobs). Each
-# run's .castep keeps every geometry step (energies and forces): D1's training data.
+# run's .castep keeps every geometry step (energies and forces): D1's training data. Its summary
+# ranks every relaxation of each charge state against its start (drelax_ranking), so whether a
+# distortion found a new minimum can be looked at before phase D (--until C5).
 #   Called by: main() (step C5)
-#   Calls:     problem_table(), run_screen_jobs()
+#   Calls:     drelax_ranking(), problem_table(), run_screen_jobs()
 def step_drelax(p):
     out, edges = run_screen_jobs(p, "drelax", "drelax", p.out("distort")["jobs"], "drelax")
     if out is None:
         return None
     bad = sum(r["energy"] is None for r in out.values())
-    return {"runs": out, "edges": edges, "_table": problem_table(out),
+    ranking, new, states = drelax_ranking(p, out)
+    problems = problem_table(out)
+    return {"runs": out, "edges": edges,
+            "_table": ranking + ("\n" + problems if problems else ""),
             "_note": f"{len(out)} relaxations" + (f", {bad} without a usable energy" if bad
-                                                  else "")}
+                                                  else "")
+                     + f"; a new minimum in {new} of {states} charge states"}
 
 
 # Groups structures that are the same (pymatgen's StructureMatcher, which also finds a distortion
@@ -4360,7 +4504,7 @@ def step_drelax(p):
 # atom (all come from the same cell with the same atom order). The tolerances are tight (stol 0.05,
 # i.e. about 0.1 A for a typical oxide): defect ground states can differ by a few tenths of an
 # Angstrom around the defect, which pymatgen's defaults would merge.
-#   Called by: distinct_states(), duplicates(), step_rank(), step_search()
+#   Called by: distinct_states(), drelax_ranking(), duplicates(), step_rank(), step_search()
 #   Calls:     sc.displacements()
 def same_structures(atoms_list):
     try:
@@ -4574,34 +4718,75 @@ def step_dataset(p):
                      f"in {tag}"}
 
 
-# The structures D2 recomputes with the hybrid: about fraction of them, as in the paper: the first
-# and last step of each relaxation, then an even sample of the rest. Returns their indices.
+# The root-mean-square displacement (Ang) between two structures of the same atoms in the same
+# cell, each atom to the nearest image of its partner.
+#   Called by: hybrid_picks()
+def rms_displacement(a, b):
+    d = np.asarray(b.positions) - np.asarray(a.positions)
+    cell = np.asarray(a.cell)
+    f = np.linalg.solve(cell.T, d.T).T
+    d = (f - np.round(f)) @ cell
+    return float(np.sqrt(np.mean(np.sum(d * d, axis=1))))
+
+
+# The structures D2 recomputes with the hybrid: budget of a defect's D1 structures
+# (model_hybrid_points), shared out over its charge states as evenly as they allow (at least one
+# each, so a charge state is never left without hybrid data). In each charge state the pool is the
+# first and last step of each relaxation (the structures the paper always took): its lowest
+# structure first (the minimum the search starts near), then farthest-point sampling, each next
+# pick the pool structure furthest from those already picked (rms_displacement: atoms far from the
+# defect barely move, so this measures the distortion), so a few single points span the distortions
+# and minima the relaxations reached; a charge state with more picks than its pool takes the rest
+# of its steps the same way. The rattled pristine cells (runs host_*) are left out (D2 adds one).
+# Returns the indices of the picks.
 #   Called by: step_hybrid()
-def hybrid_picks(frames, fraction):
-    runs = {}
+#   Calls:     rms_displacement()
+def hybrid_picks(frames, budget):
+    groups = {}
     for i, a in enumerate(frames):
-        runs.setdefault(a.info.get("run", ""), []).append(i)
-    pick = set()
-    for idx in runs.values():
-        idx = sorted(idx, key=lambda i: frames[i].info.get("step", 0))
-        pick.update({idx[0], idx[-1]})
-    want = max(len(pick), int(round(fraction * len(frames))))
-    rest = [i for i in range(len(frames)) if i not in pick]
-    if want > len(pick) and rest:
-        n = min(len(rest), want - len(pick))
-        pick.update(rest[int(x)] for x in np.linspace(0, len(rest) - 1, n))
-    return sorted(pick)
+        if not str(a.info.get("run", "")).startswith("host_"):
+            groups.setdefault((int(a.info["total_charge"]), len(a)), []).append(i)
+    if not groups:
+        return []
+    keys = sorted(groups)
+    share = {k: max(1, budget // len(keys)) for k in keys}
+    spare = max(0, budget - sum(share.values()))          # to the charge states with most steps
+    for k in sorted(keys, key=lambda k: (-len(groups[k]), k))[:spare]:
+        share[k] += 1
+    picks = []
+    for k in keys:
+        runs = {}
+        for i in groups[k]:
+            runs.setdefault(frames[i].info.get("run", ""), []).append(i)
+        pool = set()
+        for idx in runs.values():
+            idx = sorted(idx, key=lambda i: frames[i].info.get("step", 0))
+            pool.update({idx[0], idx[-1]})
+        chosen = [min(sorted(pool), key=lambda i: frames[i].info["REF_energy"])]
+        for cands in (sorted(pool), [i for i in groups[k] if i not in pool]):
+            dmin = {i: min(rms_displacement(frames[i], frames[c]) for c in chosen)
+                    for i in cands if i not in chosen}
+            while len(chosen) < share[k] and dmin:
+                j = max(dmin, key=lambda i: (dmin[i], -i))
+                chosen.append(j)
+                del dmin[j]
+                for i in dmin:
+                    dmin[i] = min(dmin[i], rms_displacement(frames[i], frames[j]))
+        picks += chosen
+    return sorted(picks)
 
 
 # D2 (model_hybrid : true): hybrid single points (hybrid_param, e.g. xc_functional : HSE06, and
 # hybrid_cell, its species_pot with norm-conserving potentials, which CASTEP's non-local exchange
-# needs) of about model_hybrid_fraction of each defect's D1 structures and rattled pristine cells
-# (hybrid_picks), at Gamma, in their charge state with their run's spin to start, in the cell they
-# are in: the one the survivors work in after C3 (work_cell; the electronic cell by default, where
-# a hybrid costs many times what it does in the screening cell). They run in D_states/jobs/hybrid
-# (runner group 'hybrid'): the 'hse' head's data, split as D1 split them, in
-# D_states/model/hybrid/<defect>/hse_train.xyz and hse_test.xyz. With model_hybrid : false the
-# model has the 'pbe' head only, and D5 searches with it.
+# needs) of model_hybrid_points of each defect's D1 structures (hybrid_picks: shared out over its
+# charge states, the lowest first, then the most different) and of one rattled pristine cell
+# (shared by every defect: one job), at Gamma, in their charge state with their run's spin to
+# start, in the cell they are in: the one the survivors work in after C3 (work_cell; the
+# electronic cell by default, where a hybrid costs many times what it does in the screening cell).
+# They run in D_states/jobs/hybrid (runner group 'hybrid'). They are too few to hold any back for
+# testing: all are the 'hse' head's training data, in D_states/model/hybrid/<defect>/hse_train.xyz
+# (D4's hybrid single points at the model's minima test it). With model_hybrid : false the model
+# has the 'pbe' head only, and D5 searches with it.
 #   Called by: main() (step D2)
 #   Calls:     Project.batch(), Project.file(), castep_frames(), format_table(), hybrid_picks(),
 #              model_dir(), qtag(), start_spin(), work_cell()
@@ -4612,66 +4797,92 @@ def step_hybrid(p):
     data = p.out("dataset")["defects"]
     param, cell = p.file("hybrid_param").read_text(), p.file("hybrid_cell").read_text()
     _, tag, end = work_cell(p)
-    jobs, meta = [], {}
+    jobs, meta, picked = [], {}, {}
+
+    # A hybrid single point of the structure a, as the job name, for the defect cid (a job that is
+    # already there, the shared pristine cell, is given to cid as well).
+    def add(name, a, cid):
+        if name in meta:
+            meta[name][0].append(cid)
+            return
+        q = int(a.info["total_charge"])
+        atoms = Atoms(a.get_chemical_symbols(), positions=a.positions, cell=a.cell, pbc=True)
+        S = start_spin(atoms, q, a.info.get("spin"))
+        jobs.append({"name": name, "atoms": atoms, "kind": "sp", "kgrid": [1, 1, 1],
+                     "symmetry": False,
+                     "overrides": {"charge": q, "spin": S, "spin_polarized": "true"}})
+        meta[name] = ([cid], q, a.info.get("run", ""), S)
+
     for cid, x in sorted(data.items()):
         frames = []
         for split in ("train", "test"):
             if split in x["files"]:
                 frames += ase.io.read(str(p.dir / x["files"][split]), ":")
-        for n, i in enumerate(hybrid_picks(frames, p.s.model_hybrid_fraction)):
-            a = frames[i]
-            q = int(a.info["total_charge"])
-            name = f"{cid}_{qtag(q)}_h{n + 1:04d}{end}"
-            atoms = Atoms(a.get_chemical_symbols(), positions=a.positions, cell=a.cell, pbc=True)
-            S = start_spin(atoms, q, a.info.get("spin"))
-            jobs.append({"name": name, "atoms": atoms, "kind": "sp", "kgrid": [1, 1, 1],
-                         "symmetry": False,
-                         "overrides": {"charge": q, "spin": S, "spin_polarized": "true"}})
-            meta[name] = (cid, q, a.info.get("split", "train"), a.info.get("run", ""), S)
+        picks = hybrid_picks(frames, p.s.model_hybrid_points)
+        if len(picks) > p.s.model_hybrid_points:
+            log(f"note: D2: {cid} has more charge states than model_hybrid_points "
+                f"({p.s.model_hybrid_points}): one hybrid single point in each")
+        counts = {}
+        for n, i in enumerate(picks):
+            q = int(frames[i].info["total_charge"])
+            counts[q] = counts.get(q, 0) + 1
+            add(f"{cid}_{qtag(q)}_h{n + 1:04d}{end}", frames[i], cid)
+        hosts = sorted((a for a in frames if str(a.info.get("run", "")).startswith("host_")),
+                       key=lambda a: (len(a.info["run"]), a.info["run"]))
+        if hosts:
+            add(f"hse_{hosts[0].info['run']}", hosts[0], cid)
+        picked[cid] = (", ".join(f"{q:+d}: {n}" for q, n in sorted(counts.items()))
+                       + (", host: 1" if hosts else ""))
     res = p.batch(f"{PHASE_DIRS['D']}/jobs/hybrid", jobs, "hybrid", param, cell_text=cell)
     if not res["complete"]:
         return None
-    got, rows = {}, []
-    for name, (cid, q, split, run, S) in meta.items():
+    got, rows, ndone = {}, [], 0
+    for name, (cids, q, run, S) in meta.items():
         r = res["jobs"][name]
         if r["energy"] is None or not r["scf_converged"]:
             continue
+        ndone += 1
         for a in castep_frames(res["calcs"][name].castep, q, S, run):
-            a.info["split"] = split
-            got.setdefault(cid, []).append(a)
+            a.info["split"] = "train"
+            for cid in cids:
+                got.setdefault(cid, []).append(a)
     out = {}
     for cid in sorted(data):
         frames = got.get(cid, [])
         d = model_dir(p, "hybrid", cid)
         files = {}
-        for split in ("train", "test"):
-            sel = [a for a in frames if a.info["split"] == split]
-            if sel:
-                ase.io.write(str(d / f"hse_{split}.xyz"), sel, format="extxyz")
-                files[split] = str((d / f"hse_{split}.xyz").relative_to(p.dir))
-        asked = sum(1 for m in meta.values() if m[0] == cid)
+        if frames:
+            ase.io.write(str(d / "hse_train.xyz"), frames, format="extxyz")
+            files["train"] = str((d / "hse_train.xyz").relative_to(p.dir))
+        if (d / "hse_test.xyz").exists():          # (left by an older dwf.py, which held some back)
+            (d / "hse_test.xyz").unlink()
+        asked = sum(1 for m in meta.values() if cid in m[0])
         out[cid] = {"asked": asked, "done": len(frames), "files": files}
-        rows.append([cid, asked, len(frames), sum(a.info["split"] == "train" for a in frames)])
+        rows.append([cid, picked.get(cid, ""), asked, len(frames)])
         if not frames:
             log(f"WARNING: D2: no hybrid single point of {cid} finished (or printed forces): its "
                 "model will have no 'hse' head data")
-    table = format_table(["id", "asked", "finished", "train"], rows,
-                         f"Hybrid single points for the 'hse' head, in {tag}")
+    table = format_table(["id", "picks (per charge state)", "asked", "finished"], rows,
+                         f"Hybrid single points for the 'hse' head, in {tag} "
+                         f"(model_hybrid_points {p.s.model_hybrid_points} per defect)")
     return {"defects": out, "_table": table,
-            "_note": f"{sum(x['done'] for x in out.values())} hybrid single points"}
+            "_note": f"{ndone} of {len(meta)} hybrid single points finished"}
 
 
 # The mace_run_train command of a defect's model, run in its folder (the training files copied
 # there): heads 'pbe' (and 'hse' when there is hybrid data), each with its train and test file,
-# 10 % of the training set for validation and E0s fitted to the data (average); the total charge
-# as a categorical embedding (CHARGE_CLASSES classes from -CHARGE_OFFSET); trained from scratch
-# (multiheads_finetuning off); model_r_max, model_channels, model_max_L, model_batch,
-# model_epochs, model_device (default mace_device) and model_train_args added at the end.
+# validated on 10 % of its training set, or on its own training structures ({head}_valid.xyz) when
+# it has too few to hold some back (heads: [(head, has a test file, validated on its own)]), and
+# E0s fitted to the data (average); the total charge as a categorical embedding (CHARGE_CLASSES
+# classes from -CHARGE_OFFSET); trained from scratch (multiheads_finetuning off); model_r_max,
+# model_channels, model_max_L, model_batch, model_epochs, model_device (default mace_device) and
+# model_train_args added at the end.
 #   Called by: step_lineshape(), train_tasks()
 def train_command(p, heads):
-    hd = {h: {"train_file": f"{h}_train.xyz", "valid_fraction": 0.1, "E0s": "average",
-              **({"test_file": f"{h}_test.xyz"} if has_test else {})}
-          for h, has_test in heads}
+    hd = {h: {"train_file": f"{h}_train.xyz",
+              **({"valid_file": f"{h}_valid.xyz"} if own else {"valid_fraction": 0.1}),
+              "E0s": "average", **({"test_file": f"{h}_test.xyz"} if has_test else {})}
+          for h, has_test, own in heads}
     emb = {"total_charge": {"type": "categorical", "per": "graph", "num_classes": CHARGE_CLASSES,
                             "offset": CHARGE_OFFSET, "emb_dim": 32}}
     return (f"{p.s.model_command} --name=model --work_dir=. --model=MACE "
@@ -4687,8 +4898,13 @@ def train_command(p, heads):
 
 # The training of some defects' models: for each, a folder (part/<defect>) with its data (the
 # D1 and D2 files, and extra structures added by D4: extra {defect: {head: [Atoms]}}) and
-# train.sh (a changed training set clears the folder's old model: check_training). Returns
-# [{'cid', 'dir', 'command', 'heads'}].
+# train.sh (a changed training set clears the folder's old model: check_training). The 'hse'
+# head's structures are repeated until they are about MODEL_HSE_SHARE of the 'pbe' head's, as the
+# hybrid data were in the paper: D2 recomputes only a few structures (model_hybrid_points), and
+# otherwise the training would hardly see them. A head with fewer than MODEL_HOLDOUT_MIN
+# structures, or repeated ones, is validated on its own structures ({head}_valid.xyz, each once),
+# so none is held back (D4's single points at the model's minima test the 'hse' head).
+# Returns [{'cid', 'dir', 'command', 'heads'}].
 #   Called by: step_check(), step_train()
 #   Calls:     check_training(), model_dir(), train_command()
 def train_tasks(p, part, cids, extra=None, base=None):
@@ -4696,26 +4912,38 @@ def train_tasks(p, part, cids, extra=None, base=None):
     tasks = []
     for cid in cids:
         d = model_dir(p, part, cid)
-        heads = []
+        heads, npbe = [], 0
         for head, step in (("pbe", "dataset"), ("hse", "hybrid")):
             files = ((p.out(step).get("defects") or {}).get(cid) or {}).get("files") or {}
             frames = {s: (ase.io.read(str(p.dir / files[s]), ":") if s in files else [])
                       for s in ("train", "test")}
-            if base:                               # the previous round's training sets
-                prev = base / cid / f"{head}_train.xyz"
-                frames["train"] = ase.io.read(str(prev), ":") if prev.exists() else []
+            if base:                               # the previous round's training sets, each once
+                prev = next((f for f in (base / cid / f"{head}_valid.xyz",
+                                         base / cid / f"{head}_train.xyz") if f.exists()), None)
+                frames["train"] = ase.io.read(str(prev), ":") if prev else []
             frames["train"] += (extra or {}).get(cid, {}).get(head, [])
             if not frames["train"]:
                 continue
-            for s, sel in frames.items():
+            unique = frames["train"]
+            reps = 1
+            if head == "pbe":
+                npbe = len(unique)
+            else:
+                reps = max(1, math.ceil(MODEL_HSE_SHARE * npbe / len(unique)))
+                frames["train"] = unique * reps
+            own = reps > 1 or len(unique) < MODEL_HOLDOUT_MIN
+            for s, sel in dict(frames, valid=unique if own else []).items():
+                f = d / f"{head}_{s}.xyz"
                 if sel:
-                    ase.io.write(str(d / f"{head}_{s}.xyz"), sel, format="extxyz")
-            heads.append((head, bool(frames["test"])))
+                    ase.io.write(str(f), sel, format="extxyz")
+                elif f.exists():                   # (a set this round doesn't have)
+                    f.unlink()
+            heads.append((head, bool(frames["test"]), own))
         cmd = train_command(p, heads)
         (d / "train.sh").write_text("#!/bin/bash\n# The ground-state model of "
                                     f"{cid} (dwf.py)\n{cmd}\n")
         check_training(d, cmd)
-        tasks.append({"cid": cid, "dir": d, "command": cmd, "heads": [h for h, _ in heads]})
+        tasks.append({"cid": cid, "dir": d, "command": cmd, "heads": [h[0] for h in heads]})
     return tasks
 
 
@@ -5397,7 +5625,7 @@ def delta_q(a, b):
 # The first energy of a .castep, of the kind the workflow reads (energy; auto: the 0 K estimate
 # when printed, else the final energy): for a ΔSCF relaxation, the excited state at the ground
 # state's structure, so (less the ground state's energy) the vertical absorption energy.
-#   Called by: dscf_result()
+#   Called by: dscf_result(), step_energies()
 def first_energy(text, which):
     for kind in (["0K", "final"] if which == "auto" else [which]):
         m = re.search(sc.ENERGY_PATTERNS[kind], text)
@@ -7180,7 +7408,7 @@ def step_lineshape(p):
                 (folder / f"pbe_{s}.xyz").unlink()
         if not split["train"]:
             die(f"G2: no training data for the model of {cid} (did its single points finish?)")
-        cmd = train_command(p, [("pbe", bool(split["test"]))])
+        cmd = train_command(p, [("pbe", bool(split["test"]), False)])
         (folder / "train.sh").write_text(f"#!/bin/bash\n# The PBE model of {cid} for its "
                                          f"phonons (dwf.py G2)\n{cmd}\n")
         check_training(folder, cmd)
@@ -7431,9 +7659,9 @@ STEPS = [
          owns=("C_screen/structures/distortions",),
          version=2),                         # 2: in the electronic cell (distort_cell)
     Step("drelax", "C5", "Gamma-point CASTEP relaxations of the distortions", step_drelax,
-         keys=SCREEN_KEYS, needs=("distort",),
+         keys=SCREEN_KEYS + ("distortion_min_gain",), needs=("distort", "filter", "generate"),
          owns=("C_screen/jobs/drelax", "C_screen/structures/drelax"),
-         version=1),                         # 1: in C4's cell, against its band edges
+         version=2),                         # 2: the ranking in summary.txt (the same results)
     # D: ground and excited states
     Step("dataset", "D1", "training data for the ground-state model (C2/C5 steps, rattled host)",
          step_dataset, keys=SCREEN_KEYS + ("model", "model_rattles", "model_rattle_stdev"),
@@ -7442,10 +7670,10 @@ STEPS = [
          owns=("D_states/jobs/dataset", "D_states/model/data"),
          version=1),                         # 1: in the cell the survivors work in
     Step("hybrid", "D2", "hybrid single points for the model's 'hse' head", step_hybrid,
-         keys=("model", "model_hybrid", "model_hybrid_fraction"),
+         keys=("model", "model_hybrid", "model_hybrid_points"),
          files=("hybrid_cell", "hybrid_param"), needs=("dataset", "distort", "choose"),
          owns=("D_states/jobs/hybrid", "D_states/model/hybrid"),
-         version=2),                         # 2: in the cell the survivors work in
+         version=3),                         # 3: a fixed number per defect, all for training
     Step("train", "D3", "train each defect's model (MACE: pbe/hse heads, charge embedding)",
          step_train, keys=MODEL_KEYS, needs=("dataset", "hybrid"),
          owns=("D_states/model/train",)),
@@ -7730,9 +7958,11 @@ distort_cell    : electronic   # where everything after C3 works: electronic (B4
 # ================================================================ D: ground and excited states
 # D1-D5 (model : true): a MACE model of each defect C3 keeps (after Wang, Mosquera-Lois and
 # Walsh, arXiv:2603.05238): a 'pbe' head trained on its C5 runs (D1, with model_rattles rattled
-# pristine cells) and an 'hse' head on hybrid single points of about model_hybrid_fraction of
-# them (D2), the total charge embedded so that one model covers every charge state (D3). D4
-# checks it: its test errors, and the hybrid's forces at the model's minima (at most
+# pristine cells) and an 'hse' head on hybrid single points of model_hybrid_points of them (D2:
+# shared out over the charge states, each one's lowest structure first, then those most unlike the
+# ones picked; and one rattled pristine cell), weighted in the training like a tenth of the PBE
+# data, as in the paper; the total charge embedded so that one model covers every charge state
+# (D3). D4 checks it: its test errors, and the hybrid's forces at the model's minima (at most
 # model_force_tol, else those points join the data and it is trained again, up to model_rounds
 # times). D5 searches with it: ShakeNBreak distortions (search_distortions) and rattles of every
 # charge state, and each distinct minimum of one charge state tried in the others. All of it in
@@ -7744,7 +7974,8 @@ hybrid_param    : CaO_hse.param    # D2, D4: xc_functional : HSE06 (single point
 hybrid_cell     : CaO_ncp.cell     # its species_pot: CASTEP's hybrids need norm-conserving
 model_jobscript : cirrus_gpu.sh    # the trainings (and G2's phonons) as GPU jobs; without
 model_device    : cuda             #   it, they run where dwf.py runs
-!model_hybrid_fraction : 0.1
+!model_hybrid_points : 6       # D2's hybrid single points per defect (the paper took about 40
+                               #   for one charge state); D4 adds more where the model is off
 !model_rattles  : 10
 !model_epochs   : 300
 !model_channels : 64           # the model's size (with model_r_max 5 ang, model_max_L 1,

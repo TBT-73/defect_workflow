@@ -664,7 +664,7 @@ move into the electronic cell (B4) for C4 and C5, and stay there.
 | C2 | `screen` | one cheap Γ-point CASTEP relaxation per candidate and charge state, from a triplet (a doublet for an odd electron count) | — (warns if the band edges don't fold onto Γ) |
 | C3 | `filter` | defect hull, duplicates, property filters | within `hull_margin` of the hull; the `require_*` filters |
 | C4 | `distort` | each survivor's screened structures carried into the electronic cell, and ShakeNBreak's distortions of them there | which charge states (`distort_charges`), around which points (`distort_around`), in which cell (`distort_cell`) |
-| C5 | `drelax` | Γ-point relaxations of the carried-over structures and their distortions, against the electronic cell's band edges, every geometry step kept | — |
+| C5 | `drelax` | Γ-point relaxations of the carried-over structures and their distortions, against the electronic cell's band edges, every geometry step kept; `summary.txt` ranks them | — (it says where a distortion beat the start by `distortion_min_gain`) |
 
 The CASTEP jobs of C2 and C5 run with the runner settings of `%block runner_screen` (and of
 `runner_drelax` for C5 alone, whose jobs, in the electronic cell, are the biggest of phase C), as
@@ -771,6 +771,19 @@ single point of the pristine electronic cell (`host_n432`) in the same batch: th
 band carriers are measured against that cell's band edges. Each run's `.castep` keeps every
 geometry step, energies and forces: D1's training data.
 
+C5's part of `C_screen/summary.txt` ranks them, so that what the distortions found can be looked at
+before the model is trained (stop there with `--until C5`). The first table has a line per survivor
+and charge state: the start's energy, the lowest, the gain, which run gave it, how many distinct
+structures and failed runs there were, and a verdict: `NEW MINIMUM` when the lowest structure is
+not the start's and beats it by `distortion_min_gain` (D6's test), else `the start is the lowest`
+or `lower by less than ...`. The second lists every relaxation of each charge state, lowest first:
+dE against the start, the energy, final spin, steps, whether it relaxed, and a letter shared by
+runs that relaxed into the same structure (A the lowest; compared only within 0.05 eV of each
+other). Runs without a usable energy come last, with why and the lowest of their steps whose SCF
+converged, which shows whether a failed run was heading below the others. A run with steps whose
+SCF didn't converge says how many: CASTEP prints an energy and forces for such a step and carries
+on, and D1 trains on every step.
+
 *Why the cell changes after C3.* C2 runs every candidate in every charge state, so its cell sets
 most of the cost of the screening, and the screening cell is the smallest that holds every
 candidate's relaxation (B2) and deep levels (the Γ-only floor). That is enough to rank arrangements
@@ -801,7 +814,7 @@ from D8, optional, which tests the finite-size error of the screening cell that 
 | Label | Step | What it does | Decision |
 |---|---|---|---|
 | D1 | `dataset` | (`model : true`) each defect's training data: its C5 geometry steps and rattled pristine cells | filters (energy, distances, forces); a fifth kept for testing |
-| D2 | `hybrid` | hybrid (HSE06) single points of about a tenth of them, for the model's `hse` head | — |
+| D2 | `hybrid` | hybrid (HSE06) single points of `model_hybrid_points` (6) of them per defect and one rattled pristine cell, for the model's `hse` head | each charge state's lowest structure, then the most different |
 | D3 | `train` | one MACE model per defect: `pbe` and `hse` heads, the total charge embedded | — |
 | D4 | `check` | its test errors, and the hybrid's forces at its minima; trained again if needed | is the model accurate enough? (`model_force_tol`, up to `model_rounds`) |
 | D5 | `search` | the ground-state search with the model, in the electronic cell | the lowest `search_keep` distinct minima of each charge state |
@@ -835,23 +848,36 @@ everything after it describes.
   testing, by a fixed random split. The files are `D_states/model/data/<defect>/pbe_train.xyz` and
   `pbe_test.xyz`.
 - *D2 hybrid* (`model_hybrid : true`): hybrid single points (`hybrid_param`, e.g. `xc_functional :
-  HSE06`, with `hybrid_cell`'s norm-conserving potentials, which CASTEP's hybrids need) of about
-  `model_hybrid_fraction` (10 %) of each defect's D1 structures: each relaxation's first and last
-  step, then an even sample of the rest; at Γ, in their charge state, from their run's spin
-  (`D_states/jobs/hybrid/`), in the electronic cell like everything after C3. A hybrid single point
-  costs tens of PBE ones, and the cell is several times the screening cell, so these are the dearest
-  jobs of the workflow: give `%block runner_hybrid` room (the example asks for 576 cores and 24
-  hours). They keep D1's split. With `model_hybrid : false` the model has only the `pbe` head, and
-  D5 searches with that.
+  HSE06`, with `hybrid_cell`'s norm-conserving potentials, which CASTEP's hybrids need) of
+  `model_hybrid_points` (6) of each defect's D1 structures, at Γ, in their charge state, from their
+  run's spin (`D_states/jobs/hybrid/`), in the electronic cell like everything after C3. The points
+  are shared out over the defect's charge states as evenly as they go (at least one each, so the
+  `hse` head sees every charge state; a spare one goes to the charge state with the most steps). In
+  each charge state D2 picks from the first and last step of each relaxation, the structures the
+  paper always took: its lowest structure first, the minimum the search starts near, then
+  farthest-point sampling, each next pick the structure most unlike those already picked (the
+  root-mean-square displacement of the atoms, each to the nearest image of its partner; atoms far
+  from the defect barely move, so this measures the distortion). With six points and three charge
+  states that is usually each charge state's lowest structure and its most distorted start. One
+  rattled pristine cell is added, a single job shared by every defect. The points are too few to
+  hold any back: all of them train the `hse` head, and D4's hybrid single points at the model's
+  minima test it. A hybrid single point costs tens of PBE ones, and the cell is several times the
+  screening cell, so these are the dearest jobs of the workflow: give `%block runner_hybrid` room
+  (the example asks for 576 cores and 24 hours). With `model_hybrid : false` the model has only the
+  `pbe` head, and D5 searches with that.
 - *D3 train:* `mace_run_train` (`model_command`) in `D_states/model/train/<defect>/`: the heads
   `pbe` and `hse` on one shared representation, trained from scratch
   (`--multiheads_finetuning=False`), the total charge as a categorical embedding
-  (`--embedding_specs`, 21 classes from −10), so that one model covers every charge state, and
-  each head's reference energies fitted to its data;
-  with `model_r_max`, `model_channels`, `model_max_L`, `model_batch`, `model_epochs`,
-  `model_device` and `model_train_args`. `train.sh` in the folder is the command. With
+  (`--embedding_specs`, 21 classes from −10), so that one model covers every charge state, and each
+  head's reference energies fitted to its data; with `model_r_max`, `model_channels`,
+  `model_max_L`, `model_batch`, `model_epochs`, `model_device` and `model_train_args`. The `hse`
+  head's structures are repeated until they are about a tenth of the `pbe` head's, as the hybrid
+  data were in the paper, so that a few single points still weigh in the training; a head with
+  fewer than 20 structures, or repeated ones, is validated on its own structures (`hse_valid.xyz`,
+  each once) instead of holding one back. `train.sh` in the folder is the command. With
   `model_jobscript` it runs as a job, best on a GPU.
-- *D4 check:* the model's errors on each head's test structures (energy per atom, force components),
+- *D4 check:* the model's errors on the test structures (energy per atom, force components; D1's,
+  for the `pbe` head),
   then its minimum in each charge state: its lowest C5 structure (with `distort_cell : screening`,
   the lowest of C2's and C5's) relaxed with the search head (`hse` when there is one) to
   `search_fmax`, and DFT single points there (the hybrid's, and at the screening settings;
@@ -1224,7 +1250,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **J**: [`jobscript`](#runner-settings) (runner)
 - **K**: [`keep_structures`](#d-ground-and-excited-states) (D) · [`kspacing`](#a-host) (A)
 - **L**: [`level_margin`](#c-screening) (C) · [`lineshape`](#g-lineshapes) (G) · [`lineshape_amplitude`](#g-lineshapes) (G) · [`lineshape_delta`](#g-lineshapes) (G) · [`lineshape_displacements`](#g-lineshapes) (G) · [`lineshape_gamma`](#g-lineshapes) (G) · [`lineshape_host`](#g-lineshapes) (G) · [`lineshape_length`](#g-lineshapes) (G) · [`lineshape_method`](#g-lineshapes) (G) · [`lineshape_sigma`](#g-lineshapes) (G) · [`lineshape_temperature`](#g-lineshapes) (G) · [`local_fraction`](#d-ground-and-excited-states) (D)
-- **M**: [`mace`](#mace) (MACE) · [`mace_device`](#mace) (MACE) · [`mace_fmax`](#mace) (MACE) · [`mace_jobscript`](#mace) (MACE) · [`mace_max_jobs`](#mace) (MACE) · [`mace_model`](#mace) (MACE) · [`mace_pack`](#mace) (MACE) · [`mace_python`](#mace) (MACE) · [`mace_steps`](#mace) (MACE) · [`mace_threads`](#mace) (MACE) · [`max_cores`](#runner-settings) (runner) · [`max_jobs`](#runner-settings) (runner) · [`max_nodes`](#runner-settings) (runner) · [`max_restarts`](#runner-settings) (runner) · [`max_walltime`](#runner-settings) (runner) · [`mem_per_core`](#runner-settings) (runner) · [`mem_replicated`](#runner-settings) (runner) · [`mem_safety`](#runner-settings) (runner) · [`model`](#d-ground-and-excited-states) (D) · [`model_batch`](#d-ground-and-excited-states) (D) · [`model_channels`](#d-ground-and-excited-states) (D) · [`model_command`](#d-ground-and-excited-states) (D) · [`model_device`](#d-ground-and-excited-states) (D) · [`model_epochs`](#d-ground-and-excited-states) (D) · [`model_force_tol`](#d-ground-and-excited-states) (D) · [`model_hybrid`](#d-ground-and-excited-states) (D) · [`model_hybrid_fraction`](#d-ground-and-excited-states) (D) · [`model_jobscript`](#d-ground-and-excited-states) (D) · [`model_max_L`](#d-ground-and-excited-states) (D) · [`model_r_max`](#d-ground-and-excited-states) (D) · [`model_rattle_stdev`](#d-ground-and-excited-states) (D) · [`model_rattles`](#d-ground-and-excited-states) (D) · [`model_rounds`](#d-ground-and-excited-states) (D) · [`model_train_args`](#d-ground-and-excited-states) (D) · [`mp_api_key`](#a-host) (A)
+- **M**: [`mace`](#mace) (MACE) · [`mace_device`](#mace) (MACE) · [`mace_fmax`](#mace) (MACE) · [`mace_jobscript`](#mace) (MACE) · [`mace_max_jobs`](#mace) (MACE) · [`mace_model`](#mace) (MACE) · [`mace_pack`](#mace) (MACE) · [`mace_python`](#mace) (MACE) · [`mace_steps`](#mace) (MACE) · [`mace_threads`](#mace) (MACE) · [`max_cores`](#runner-settings) (runner) · [`max_jobs`](#runner-settings) (runner) · [`max_nodes`](#runner-settings) (runner) · [`max_restarts`](#runner-settings) (runner) · [`max_walltime`](#runner-settings) (runner) · [`mem_per_core`](#runner-settings) (runner) · [`mem_replicated`](#runner-settings) (runner) · [`mem_safety`](#runner-settings) (runner) · [`model`](#d-ground-and-excited-states) (D) · [`model_batch`](#d-ground-and-excited-states) (D) · [`model_channels`](#d-ground-and-excited-states) (D) · [`model_command`](#d-ground-and-excited-states) (D) · [`model_device`](#d-ground-and-excited-states) (D) · [`model_epochs`](#d-ground-and-excited-states) (D) · [`model_force_tol`](#d-ground-and-excited-states) (D) · [`model_hybrid`](#d-ground-and-excited-states) (D) · [`model_hybrid_points`](#d-ground-and-excited-states) (D) · [`model_jobscript`](#d-ground-and-excited-states) (D) · [`model_max_L`](#d-ground-and-excited-states) (D) · [`model_r_max`](#d-ground-and-excited-states) (D) · [`model_rattle_stdev`](#d-ground-and-excited-states) (D) · [`model_rattles`](#d-ground-and-excited-states) (D) · [`model_rounds`](#d-ground-and-excited-states) (D) · [`model_train_args`](#d-ground-and-excited-states) (D) · [`mp_api_key`](#a-host) (A)
 - **N**: [`name`](#general) (general) · [`native_pairs`](#b-candidates-the-screening-and-electronic-cells) (B)
 - **O**: [`omp_threads`](#runner-settings) (runner) · [`%block oxidation_states`](#c-screening) (C)
 - **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-the-screening-and-electronic-cells) (B) · [`pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#e-production) (E)
@@ -1360,7 +1386,7 @@ Details: [Phase D](#phase-d-ground-and-excited-states).
 | `model_hybrid` | `true` | D2–D5 | Give the model an `hse` head, trained on hybrid single points (D2), and search with it. `false`: the `pbe` head only. |
 | `hybrid_param` | required with `model_hybrid` | D2, D4 | The `.param` of the hybrid single points, e.g. `xc_functional : HSE06` with a cut-off for norm-conserving potentials ([section 8](#8-the-hybrid-param-and-cell-hybrid_param-hybrid_cell)). |
 | `hybrid_cell` | required with `model_hybrid` | D2, D4 | A `.cell` whose `species_pot` gives norm-conserving potentials (CASTEP's hybrids need them), e.g. the line `NCP`; its structure is ignored. |
-| `model_hybrid_fraction` | `0.1` | D2 | The share of each defect's D1 structures recomputed with the hybrid (at least the first and last step of each relaxation). |
+| `model_hybrid_points` | `6` | D2 | How many of each defect's D1 structures are recomputed with the hybrid: shared out over its charge states (at least one each), each one's lowest structure first, then the ones most unlike those picked, from the first and last steps of its relaxations. One rattled pristine cell is added (one job for every defect). D4 adds more where the model's minima are off. The paper took about 40 for one defect in one charge state. |
 | `model_rattles` | `10` | D1 | Pristine supercells (of the electronic cell, or the screening cell with `distort_cell : screening`) with every atom displaced at random, added to each defect's data. |
 | `model_rattle_stdev` | `0.05 ang` | D1 | Their displacements' standard deviation. |
 | `model_command` | `mace_run_train` | D3, D4, G2 | The training command; the workflow adds the heads, the charge embedding and the settings below. |
@@ -1375,7 +1401,7 @@ Details: [Phase D](#phase-d-ground-and-excited-states).
 | `search_rattles` | `2` | D5 | Extra rattled copies of each distortion. |
 | `search_fmax`, `search_steps` | `0.01 eV/ang`, `1000` | D4, D5 | When a relaxation with the model stops. |
 | `search_keep` | `10` | D5 | The distinct minima of each charge state kept for D6. |
-| `distortion_min_gain` | `0.05 eV` | D6 | (`model : false`) A distortion counts as found when it beats the screened structure by this. |
+| `distortion_min_gain` | `0.05 eV` | C5, D6 | A distortion counts as found when it beats the screened structure by this: in C5's ranking (its verdict), and (`model : false`) in D6. |
 | `share_rounds` | `2` | D6 | (`model : false`) How many rounds of trying a winning distortion in the other charge states of its defect. |
 | `keep_structures` | `1` | D6 | How many distinct structures, lowest first, of each defect and charge state go on to D7, which relaxes them all and takes the lowest as the ground state. |
 | `excite` | `true` | C3, D7 | Run D7. Only the defects with an excitation that passes, and every native defect, go on to E; native defects also skip C3's property filters. With `false`, everything D6 kept goes on, and F3 has no excitations for G. |
@@ -1669,7 +1695,8 @@ norm-conserving pseudopotentials.
 
 The `pbe` and `hse` heads each fit their own reference energies to their own data, so the two sets
 of settings don't need to match. Time one single point of the screening cell first: a hybrid
-single point costs tens of PBE ones.
+single point costs tens of PBE ones, and D2 runs `model_hybrid_points` (6) of them per defect in
+the electronic cell, plus one pristine cell.
 
 ### 9. The model jobscript template (`model_jobscript`)
 
@@ -1961,6 +1988,24 @@ name the multiple; changing it runs B3 and B4 again. At the default, the floor's
 reason are what they were, so a work directory made before runs B3 and B4 again (no jobs) and
 nothing after them.
 
+Then D2's fixed budget, `model_hybrid_points`, which replaced `model_hybrid_fraction` (about 90 to
+150 hybrid single points per defect with 12 distortions in three charge states). Tested on made-up
+relaxations in three charge states: six points give two per charge state, its lowest structure and
+its most distorted start; four give one each and the spare to the charge state with the most steps;
+two still give one each; a bigger budget takes the first and last steps of the relaxations before
+any other step; the rattled pristine cells are never picked, and two defects share one
+pristine-cell job. In D3 the `hse` structures are repeated to a tenth of the `pbe` ones and
+validated on themselves, without the repeats adding up in D4's next round, and G2's training
+command is what it was. The stage-3 test (D1 to D5 on made-up CASTEP output) passes with four
+points over two charge states.
+
+Then C5's ranking. Tested on made-up relaxations in two charge states: a distortion 0.4 eV below
+the start is a new minimum, one that relaxed back into the start's structure shares its letter, a
+lower structure 0.03 eV down is not a new minimum, a failed run comes last with its lowest
+converged step (its later, unconverged step left out), a run with an unconverged step says so, and
+with `distort_cell : screening` the start is C2's screened run. The cell-split test runs C5 end to
+end in both cells with it.
+
 Not tested: real Cirrus jobs (see 9 below), `phases_from : doped` (no Materials Project access
 here), real `mace_run_train` trainings with two heads and the charge embedding (D3, D4, G2: the
 command was checked, not run), real hybrid single points (D2, D4; they need CASTEP to print the
@@ -2024,9 +2069,11 @@ On the first real runs, check:
 8. **C4–C5 in the electronic cell**: for CaO:Sb with the default cells, every survivor's
    distortions run in n432 (`C_screen/jobs/drelax/*_n432`, and `host_n432`). These are the
    biggest jobs of phase C, so check their plan (the runner's `%block runner_drelax`) before the
-   batch goes, and stop after C3 (`--until C3`) to count the survivors first. Afterwards, D6's
-   table shows which distortions beat the carried-over structure, and `C_screen/results.json`
-   which charge states still leave an electron or hole in a band there (each run's `band`).
+   batch goes, and stop after C3 (`--until C3`) to count the survivors first. Afterwards, stop
+   again (`--until C5`): C5's ranking in `C_screen/summary.txt` shows which distortions beat the
+   carried-over structure, which ran into the same structure and which failed (and how low they
+   got first), and `C_screen/results.json` which charge states still leave an electron or hole in
+   a band there (each run's `band`).
 9. **Cirrus** (`charging : core`): look at the first `dryrun.sh` and `job.sh` of a step:
    `--nodes`, `--ntasks-per-node` and `--cpus-per-task` should match the plan in the log, with
    `--exclusive` only on jobs bigger than a node. Then check with
