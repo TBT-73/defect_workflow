@@ -291,9 +291,10 @@ PROJECT_KEYWORDS = {
     "hull_margin": (sc._num("eV"), 0.2), "level_margin": (sc._num("eV"), 0.1),
     "require_bound": (_b, False), "require_spin": (sc._num(), None),
     "require_gap_states": (sc._choice("none", "occupied", "empty", "both"), "none"),
-    "distortions": (_floats(), [-0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0.1, 0.2, 0.3, 0.4, 0.5,
-                                0.6]),
-    "distort_charges": (sc._choice("stable", "screened"), "screened"),
+    "distortions": (_floats(), [-0.4, -0.2, 0.2, 0.4]),
+    "distort_charges": (sc._choice("relevant", "stable", "screened"), "relevant"),
+    "charge_margin": (sc._num("eV"), 0.5), "carrier_reach": (sc._num("eV"), 1.0),
+    "carrier_fraction": (sc._num(), 0.2),
     "distort_around": (sc._choice("auto", "centre", "each", "anchor", "vacancy"), "auto"),
     "distort_cell": (sc._choice("electronic", "screening"), "electronic"),
     "rattle_stdev": (sc._num("ang", "A"), None), "rattle_dmin": (sc._num("ang", "A"), None),
@@ -354,15 +355,17 @@ RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "core
 # The steps that run CASTEP jobs, and the group of steps each belongs to. The runner settings of a
 # step: the project's, changed by its group's defaults (GROUP_DEFAULTS), then by %block
 # runner_<group>, then by %block runner_<step> (Project.runner_items). screen is both a step and
-# a group: runner_screen is for every step at the screening settings (C2, C5, D1's pristine cells,
-# D6, D7), and runner_drelax, runner_rank, runner_excite or runner_dataset changes it for one of
-# them; runner_production is for every step at the production settings (D8, E1, E2, G1, G2's
-# single points); runner_hybrid for the hybrid single points (D2, D4).
+# a group: runner_screen is for every step at the screening settings (C2, C3's single points, C5,
+# D1's pristine cells, D6, D7), and runner_filter, runner_drelax, runner_rank, runner_excite or
+# runner_dataset changes it for one of them; runner_production is for every step at the
+# production settings (D8, E1, E2, G1, G2's single points); runner_hybrid for the hybrid single
+# points (D2, D4).
 RUNNER_STEPS = {"converge": "host", "relax": "host", "bands": "host", "dielectric": "host",
-                "phases": "host", "screen": "screen", "drelax": "screen", "rank": "screen",
-                "excite": "screen", "validate": "production", "relaxations": "production",
-                "zpl": "production", "dataset": "screen", "hybrid": "hybrid", "check": "hybrid",
-                "ccd": "production", "lineshape": "production"}
+                "phases": "host", "screen": "screen", "filter": "screen", "drelax": "screen",
+                "rank": "screen", "excite": "screen", "validate": "production",
+                "relaxations": "production", "zpl": "production", "dataset": "screen",
+                "hybrid": "hybrid", "check": "hybrid", "ccd": "production",
+                "lineshape": "production"}
 RUNNER_GROUPS = ("host", "screen", "production", "hybrid")
 RUNNER_BLOCKS = RUNNER_GROUPS + tuple(s for s in RUNNER_STEPS if s not in RUNNER_GROUPS)
 # what each group of steps uses unless the project file's runner blocks say otherwise
@@ -471,7 +474,7 @@ def read_project(path):
             die(f"{name}: '{key}' {RETIRED[key]}")
         if key.startswith("runner_") and key not in known:
             die(f"{name}: there is no {key}: the runner blocks are runner_host (all of phase A's "
-                "CASTEP steps), runner_screen (C2, C5, D1, D6, D7: the screening settings), "
+                "CASTEP steps), runner_screen (C2, C3, C5, D1, D6, D7: the screening settings), "
                 "runner_production (D8, E1, E2, G1, G2: the production settings), runner_hybrid "
                 "(D2, D4) and, for one step, "
                 + ", ".join(f"runner_{s}" for s in RUNNER_STEPS if s not in RUNNER_GROUPS))
@@ -559,6 +562,12 @@ def read_project(path):
             die(f"{name}: {key} must be at least 1")
     if min(s.scan_lengths) <= 0:
         die(f"{name}: scan_lengths are lengths in Ang, greater than 0")
+    for key in ("charge_margin", "carrier_reach"):
+        if getattr(s, key) < 0:
+            die(f"{name}: {key} can't be negative")
+    if not 0 < s.carrier_fraction <= 1:
+        die(f"{name}: carrier_fraction is a fraction of the cell's atoms, greater than 0 and at "
+            "most 1")
     if s.screen_min_image is not None and s.screen_min_image < 0:
         die(f"{name}: screen_min_image can't be negative (0 switches the Gamma-only floor off)")
     s.converge_kgrids = kgrid_list(name, s.converge_kgrid_min, s.converge_kgrid_max,
@@ -723,7 +732,7 @@ class Project:
     # keep_check : True keeps the jobs' .check files even with delete_check : true (for jobs that
     # later jobs start from). Returns run_batch's result ({'complete', 'jobs', 'calcs'}).
     #   Called by: run_screen_jobs(), step_bands(), step_ccd(), step_check(), step_converge(),
-    #              step_dataset(), step_dielectric(), step_excite(), step_hybrid(),
+    #              step_dataset(), step_dielectric(), step_excite(), step_filter(), step_hybrid(),
     #              step_lineshape(), step_phases(), step_relax(), step_relaxations(), step_screen(),
     #              step_validate(), step_zpl(), validate_gamma()
     #   Calls:     Project.cell_text(), Project.runner(), sc.run_batch()
@@ -746,8 +755,9 @@ class Project:
     # The .param of the production settings: A1's (with the converged cut-off) once it has run,
     # else the project's .param as it is.
     #   Called by: run_screen_jobs(), step_bands(), step_ccd(), step_check(), step_dataset(),
-    #              step_dielectric(), step_excite(), step_lineshape(), step_phases(), step_relax(),
-    #              step_relaxations(), step_screen(), step_validate(), step_zpl(), validate_gamma()
+    #              step_dielectric(), step_excite(), step_filter(), step_lineshape(), step_phases(),
+    #              step_relax(), step_relaxations(), step_screen(), step_validate(), step_zpl(),
+    #              validate_gamma()
     #   Calls:     Project.file(), Project.finished()
     def production_param(self):
         if self.finished("converge"):
@@ -1384,8 +1394,8 @@ def save_cell(p, path, atoms, title):
 # the starting spins as initial magnetic moments.
 #   Called by: Project.host(), distinct_states(), drelax_ranking(), duplicates(), into_cell(),
 #              lineshape_vector(), run_screen_jobs(), step_ccd(), step_check(), step_distort(),
-#              step_excite(), step_lineshape(), step_rank(), step_screen(), step_search(),
-#              step_validate(), step_zpl(), validate_gamma()
+#              step_excite(), step_filter(), step_lineshape(), step_rank(), step_screen(),
+#              step_search(), step_validate(), step_zpl(), validate_gamma()
 #   Calls:     sc.read_structure()
 def load_cell(p, rel):
     return sc.read_structure(p.dir / rel)
@@ -1744,8 +1754,8 @@ def same_basin(prim, comps, P1, atoms1, P2, atoms2, label="defect"):
 # Reads a CASTEP .bands file: k-points, weights, eigenvalues (eV, [spin][k-point][band]), the
 # electrons in each spin channel (one number, the total, when the calculation is not spin-
 # polarised) and the Fermi energies (eV).
-#   Called by: job_summary(), run_screen_jobs(), step_bands(), step_choose(), step_excite(),
-#              step_formation(), step_relaxations(), step_screen(), step_zpl()
+#   Called by: band_state_test(), job_summary(), run_screen_jobs(), step_bands(), step_choose(),
+#              step_excite(), step_formation(), step_relaxations(), step_screen(), step_zpl()
 def read_bands(path):
     lines = Path(path).read_text().splitlines()
 
@@ -1783,7 +1793,7 @@ def read_bands(path):
 # then how many bands) one record of orbital weights per band. Returns {'species', 'rank', 'l'
 # (per orbital), 'kpts', 'weights': [k][spin] -> array (bands x orbitals)}, or None if the file is
 # missing or not in this form.
-#   Called by: dscf_result(), step_excite(), step_zpl()
+#   Called by: band_state_test(), dscf_result(), step_excite(), step_zpl()
 def read_pdos_weights(path):
     path = Path(path)
     if not path.exists():
@@ -1827,7 +1837,7 @@ def read_pdos_weights(path):
 # atom's weight the sum over its orbitals (an atom is a species number and rank). About 1 to 10 for
 # a state on a defect and its neighbours; about the number of atoms of the elements a band is made
 # of (half the cell for a rock-salt band) for a host state. Returns [spin] -> array (bands).
-#   Called by: dscf_result(), step_excite(), step_zpl(), zpl_bands_ok()
+#   Called by: band_state_test(), dscf_result(), step_excite(), step_zpl(), zpl_bands_ok()
 def participation(pw, k=0):
     keys = np.array(list(zip(pw["species"], pw["rank"])))
     _, atom = np.unique(keys, axis=0, return_inverse=True)
@@ -1845,7 +1855,8 @@ def participation(pw, k=0):
 # The number of occupied bands in each spin channel of a .bands (read_bands). From the electron
 # counts when CASTEP gives one per spin (or the total, not spin-polarised); otherwise the bands
 # below the Fermi energy at the first k-point.
-#   Called by: band_edges(), band_masses(), carriers(), defect_levels(), gap_levels()
+#   Called by: band_edges(), band_masses(), carrier_bands(), carriers(), defect_levels(),
+#              gap_levels()
 def occupied_bands(b):
     if b["nspin"] == 1:
         return [int(round(b["nelec"][0] / 2))]
@@ -2475,9 +2486,9 @@ def counts(atoms):
 
 
 # The tag of a charge state in job names (which can't hold + or -): q0, qp1, qm1, ...
-#   Called by: step_ccd(), step_check(), step_distort(), step_excite(), step_hybrid(),
-#              step_lineshape(), step_rank(), step_relaxations(), step_screen(), step_search(),
-#              step_validate(), step_zpl()
+#   Called by: step_ccd(), step_check(), step_distort(), step_excite(), step_filter(),
+#              step_hybrid(), step_lineshape(), step_rank(), step_relaxations(), step_screen(),
+#              step_search(), step_validate(), step_zpl()
 def qtag(q):
     return "q0" if q == 0 else f"q{'p' if q > 0 else 'm'}{abs(q)}"
 
@@ -3773,7 +3784,7 @@ def screen_overrides(p):
 # A screening or distortion job for one structure in charge state q, starting with spin S
 # (spin_polarized, spin : S, and SPIN=S on the anchor atom when there is one): a Gamma-point
 # relaxation without symmetry, with the screening keywords.
-#   Called by: excite_job(), run_screen_jobs(), step_excite(), step_screen()
+#   Called by: excite_job(), run_screen_jobs(), step_excite(), step_filter(), step_screen()
 #   Calls:     screen_overrides()
 def screen_job(p, name, atoms, info, q, S):
     a = atoms.copy()
@@ -3999,36 +4010,115 @@ def duplicates(p, best, groups, env):
     return dup
 
 
-# C3: the defect hull and the property filters.
+# The bands that hold a band state's carriers, at its first k-point (Gamma for the screening),
+# against the host's band edges (vbm, cbm) with the margin band_carriers counts them with: in each
+# spin channel, the occupied bands from margin below the CBM up (electrons in the conduction band)
+# and the empty ones from margin above the VBM down (holes in the valence band). Each: {spin, band
+# (from 0, in its spin channel), kind ('e' or 'h'), depth (eV inside its band: above the CBM for
+# an electron, below the VBM for a hole; a little negative within the margin)}.
+#   Called by: band_state_test()
+#   Calls:     occupied_bands()
+def carrier_bands(b, vbm, cbm, margin):
+    occ, out = occupied_bands(b), []
+    for s in range(b["nspin"]):
+        for n, e in enumerate(b["eig"][s, 0]):
+            if not np.isfinite(e):
+                continue
+            if n < occ[s] and e >= cbm - margin:
+                out.append({"spin": s, "band": n, "kind": "e", "depth": float(e - cbm)})
+            elif n >= occ[s] and e <= vbm + margin:
+                out.append({"spin": s, "band": n, "kind": "h", "depth": float(vbm - e)})
+    return out
+
+
+# Whether a band state is worth carrying on (distort_charges : relevant), from C3's single point of
+# its screened structure with the band weights written (r: the job's result, calc: its Calc; nat:
+# the cell's atoms): every band that holds one of its carriers (carrier_bands) must lie at most
+# carrier_reach inside its band, and be spread over at most carrier_fraction of the cell's atoms
+# (participation): a shallow carrier still on the defect, which a distortion in the electronic cell
+# or a wider gap than the semilocal one may bind, rather than one spread through the cell or deep
+# in a band. A single point that gave no usable energy, bands or weights can't judge it, and it is
+# carried on; one whose carriers all went into gap levels there is bound at that structure, and is
+# carried on too. Returns {ok, depth (eV, the deepest carrier), P (atoms, the most spread), limit
+# (carrier_fraction x nat), why}.
+#   Called by: step_filter()
+#   Calls:     carrier_bands(), participation(), read_bands(), read_pdos_weights()
+def band_state_test(p, r, calc, nat, host):
+    out = {"ok": True, "depth": None, "P": None, "limit": round(p.s.carrier_fraction * nat, 1)}
+    bands = calc.dir / f"{calc.seed}.bands"
+    pw = read_pdos_weights(calc.dir / f"{calc.seed}.pdos_weights")
+    if r["status"] != "done" or r["energy"] is None or not r["scf_converged"]:
+        out["why"] = ("carried on: not judged, its single point failed ("
+                      + (r["reason"] or "no converged energy").splitlines()[0] + ")")
+        return out
+    if not bands.exists() or pw is None:
+        out["why"] = "carried on: not judged, its single point wrote no .bands or .pdos_weights"
+        return out
+    b = read_bands(bands)
+    carriers = carrier_bands(b, host["vbm"], host["cbm"], p.s.level_margin)
+    if not carriers:
+        out["why"] = "carried on: its carriers are in gap levels in the single point"
+        return out
+    P = participation(pw)
+    if any(x["spin"] >= len(P) or x["band"] >= len(P[x["spin"]]) for x in carriers):
+        out["why"] = "carried on: not judged, its .pdos_weights has no weights for its carriers"
+        return out
+    depth = max(x["depth"] for x in carriers)
+    spread = max(float(P[x["spin"]][x["band"]]) for x in carriers)
+    out.update(depth=round(depth, 3), P=round(spread, 1))
+    if depth > p.s.carrier_reach:
+        out.update(ok=False, why=f"left out: {depth:.2f} eV inside the band (carrier_reach "
+                                 f"{p.s.carrier_reach:g} eV)")
+    elif spread > p.s.carrier_fraction * nat:
+        out.update(ok=False, why=f"left out: spread over {spread:.0f} atoms (carrier_fraction "
+                                 f"{p.s.carrier_fraction:g} of {nat}: {out['limit']:g})")
+    else:
+        out["why"] = "carried on"
+    return out
+
+
+# C3: the defect hull, the property filters and the charge states each survivor carries on.
 # A charge state whose best screening run is a band state (in_band: it left an electron in the
-# conduction band or a hole in the valence band instead of in a defect level) isn't judged: its
-# energy is that of a carrier in a band, not of the defect holding it, and it may yet bind in
-# another structure (the distortions) or with a wider gap than the semilocal one. Everything below
-# uses the bound charge states. For each composition group and Fermi level across the gap, the
-# lowest formation energy of any arrangement and bound charge state (relative_formation, with each
-# charge state's correction in the screening cell, so charge states can be compared); an
-# arrangement is kept if its own lowest is within hull_margin of that somewhere in the gap (one with
-# no bound charge state at all can't be judged, and is kept). Its stable charge states are its
-# bound ones that are its lowest somewhere in the gap. The gap is gap if the project file gives it
-# (an experimental or hybrid value), else the screening cell's own: a semilocal gap is too narrow,
-# and a bound charge state that only becomes the lowest above its conduction band edge (the
-# formation energies carried on as the straight lines they are in the Fermi level) still counts
-# then; a band state can't, since its line is the carrier's band edge carried on. The gap levels are
-# still those inside the screening cell's band edges. Then, if asked: gap levels
-# (require_gap_states: occupied, empty, or both = an occupied and an empty level in one spin
-# channel), the final spin (require_spin) and binding against its isolated components
+# conduction band or a hole in the valence band instead of in a defect level) isn't judged by the
+# hull: its energy is that of a carrier in a band, not of the defect holding it, and it may yet
+# bind in another structure (the distortions) or with a wider gap than the semilocal one.
+# Everything below uses the bound charge states. For each composition group and Fermi level across
+# the gap, the lowest formation energy of any arrangement and bound charge state
+# (relative_formation, with each charge state's correction in the screening cell, so charge states
+# can be compared); an arrangement is kept if its own lowest is within hull_margin of that
+# somewhere in the gap (one with no bound charge state at all can't be judged by it). Its stable
+# charge states are its bound ones that are its lowest somewhere in the gap. The gap is gap if the
+# project file gives it (an experimental or hybrid value), else the screening cell's own: a
+# semilocal gap is too narrow, and a bound charge state that only becomes the lowest above its
+# conduction band edge (the formation energies carried on as the straight lines they are in the
+# Fermi level) still counts then; a band state can't, since its line is the carrier's band edge
+# carried on. The gap levels are still those inside the screening cell's band edges. Then, if
+# asked: gap levels (require_gap_states: occupied, empty, or both = an occupied and an empty level
+# in one spin channel), the final spin (require_spin) and binding against its isolated components
 # (require_bound: the components must have been screened too) - each met by at least one stable
-# charge state. A candidate that fails them but has a band state is kept, pending: the bound
-# state might have the property. Arrangements that relaxed into the same structure as a lower one
-# of their group in every charge state both have (duplicates) are dropped too. With excite : true,
-# native defects (is_native) skip the property filters (D7 passes them on to E whatever their
-# excited states, for F), but not the hull or the duplicates. The results list the survivors, with
-# the charge states to carry on (distort_charges; band states always are); the table gives every
-# candidate's verdict, then the correction for each |q| in the screening cell.
+# charge state. Arrangements that relaxed into the same structure as a lower one of their group in
+# every charge state both have (duplicates) are dropped too. With excite : true, native defects
+# (is_native) skip the property filters (D7 passes them on to E whatever their excited states, for
+# F), but not the hull or the duplicates.
+# The charge states each survivor carries on (distort_charges): relevant (the default) - its stable
+# ones, its other bound ones whose line comes within charge_margin of its lowest somewhere in the
+# gap (a distortion may lower one that much, C5's gain, and make it stable), and the band states
+# one charge beyond the stable one at either band edge (one more electron than the state stable at
+# the top of the gap, one more hole than the one at the bottom; every band state of a candidate
+# with none bound) whose carrier is shallow and on the defect: band_state_test, from a single point
+# of the screened structure with the band weights written (C_screen/jobs/filter, runner group
+# screen, %block runner_filter). Only such a band state keeps a candidate that fails the property
+# filters (pending: bound, it might have the property) or has no bound charge state. stable: its
+# stable ones and every band state; screened: every charge state with a usable energy. Under these
+# two, any band state keeps a candidate pending, and one with no bound charge state is kept.
+# The results list the survivors, with the charge states to carry on; the table gives every
+# candidate's verdict, then the judgement of each band state (relevant), then the correction for
+# each |q| in the screening cell. None while the single points run.
 #   Called by: main() (step C3)
-#   Calls:     best_states(), carriers_text(), correction(), duplicates(), format_table(),
-#              host_supercell(), in_band(), internal_pair(), is_native(), relative_formation(),
-#              screen_setup()
+#   Calls:     Project.batch(), Project.production_param(), band_state_test(), best_states(),
+#              carriers_text(), correction(), duplicates(), format_table(), host_supercell(),
+#              in_band(), internal_pair(), is_native(), load_cell(), qtag(), relative_formation(),
+#              screen_job(), screen_setup(), start_spin()
 def step_filter(p):
     cands, prim, P = screen_setup(p)
     scr = p.out("screen")
@@ -4057,38 +4147,39 @@ def step_filter(p):
     dup = duplicates(p, best, groups, order)
     left_out = p.out("prerelax")["skipped"]
     host_el = set(prim.get_chemical_symbols())
-    survivors, rows = [], []
+    relevant = p.s.distort_charges == "relevant"
+
+    # Whether a charge state has the gap levels asked for.
+    def levels_ok(s):
+        lv = s.get("levels") or []
+        want = p.s.require_gap_states
+        return (want == "none" or (want == "occupied" and any(x["occupied"] for x in lv))
+                or (want == "empty" and any(not x["occupied"] for x in lv))
+                or (want == "both" and internal_pair(lv)))
+
+    # Whether a charge state has the spin asked for.
+    def spin_ok(s):
+        return (p.s.require_spin is None or
+                (s["spin"] is not None and abs(abs(s["spin"]) - p.s.require_spin) < 0.25))
+
+    looks = {}                 # each candidate's hull, filters and band states to judge
     for cid in sorted(cands):
         c = cands[cid]
         if cid not in best:
-            why = (f"left out in C1: {left_out[cid]}" if cid in left_out
-                   else "dropped: no usable screening run")
-            rows.append([cid, c["name"], c["group"], "", "", "", "", "", why])
             continue
-        dist, stable = None, []
+        dist, stable, near = None, [], {}
         if cid in env:
             dist = float(np.min(env[cid] - hull[c["group"]]))
             lowest = np.argmin(np.array([form[cid][q] for q in bound[cid]]), axis=0)
             stable = sorted({bound[cid][i] for i in np.unique(lowest)})
+            for q in bound[cid]:                 # how close each other one comes to the lowest
+                gap_q = float(np.min(form[cid][q] - env[cid]))
+                if q not in stable and gap_q <= p.s.charge_margin:
+                    near[q] = round(gap_q, 4)
         why = [f"relaxed into the structure of {dup[cid]}"] if cid in dup else []
         if dist is not None and dist > p.s.hull_margin:
             why.append(f"{dist:.2f} eV above the hull")
-        props = {q: best[cid][q] for q in stable}
-
-        # Whether a charge state has the gap levels asked for.
-        def levels_ok(s):
-            lv = s.get("levels") or []
-            want = p.s.require_gap_states
-            return (want == "none" or (want == "occupied" and any(x["occupied"] for x in lv))
-                    or (want == "empty" and any(not x["occupied"] for x in lv))
-                    or (want == "both" and internal_pair(lv)))
-
-        # Whether a charge state has the spin asked for.
-        def spin_ok(s):
-            return (p.s.require_spin is None or
-                    (s["spin"] is not None and abs(abs(s["spin"]) - p.s.require_spin) < 0.25))
-
-        good = [q for q, s in props.items() if levels_ok(s) and spin_ok(s)]
+        good = [q for q in stable if levels_ok(best[cid][q]) and spin_ok(best[cid][q])]
         failed, fixed = [], []      # the property filters it fails; those a band state can't help
         asked = [x for x, on in (("gap levels", p.s.require_gap_states != "none"),
                                  ("spin", p.s.require_spin is not None)) if on]
@@ -4110,12 +4201,69 @@ def step_filter(p):
                               "component)")
             elif bind[1] <= 0:
                 failed.append(f"not bound (E_b {bind[0]:.2f} to {bind[1]:.2f} eV)")
-        waived = bool(failed or fixed) and p.s.excite and is_native(c, host_el)
-        pending = bool(failed) and not fixed and bool(banded[cid]) and not waived
+        tests = []                  # its band states to judge (relevant): one beyond each edge's
+        if relevant and not why:
+            if bound[cid]:
+                ends = np.array([form[cid][q] for q in bound[cid]])
+                for q, kind in ((bound[cid][int(np.argmin(ends[:, -1]))] - 1, "electrons"),
+                                (bound[cid][int(np.argmin(ends[:, 0]))] + 1, "holes")):
+                    if q in banded[cid] and best[cid][q]["band"][kind] >= BAND_CARRIER:
+                        tests.append(q)
+            else:
+                tests = list(banded[cid])
+        looks[cid] = {"dist": dist, "stable": stable, "near": near, "why": why, "good": good,
+                      "failed": failed, "fixed": fixed, "bind": bind, "tests": tests,
+                      "waived": bool(failed or fixed) and p.s.excite and is_native(c, host_el)}
+
+    judged, jobs, which = {}, [], {}             # the band states' single points (relevant)
+    for cid, look in looks.items():
+        for q in look["tests"]:
+            src = best[cid][q]
+            if not src.get("structure"):
+                judged[(cid, q)] = {"ok": True, "depth": None, "P": None, "limit": None,
+                                    "why": "carried on: not judged, no screened structure"}
+                continue
+            atoms = load_cell(p, src["structure"])
+            name = f"{cid}_{qtag(q)}_bw"
+            job = screen_job(p, name, atoms, p.out("prerelax")["defects"][cid], q,
+                             start_spin(atoms, q, src["spin"]))
+            job.update(kind="sp", overrides=dict(job["overrides"], pdos_calculate_weights="true"))
+            jobs.append(job)
+            which[name] = (cid, q, len(atoms))
+    if jobs:
+        res = p.batch("C_screen/jobs/filter", jobs, "filter", p.production_param())
+        if not res["complete"]:
+            return None
+        for name, (cid, q, nat) in which.items():
+            judged[(cid, q)] = band_state_test(p, res["jobs"][name], res["calcs"][name], nat,
+                                               host)
+
+    survivors, rows, brows = [], [], []
+    for cid in sorted(cands):
+        c = cands[cid]
+        if cid not in best:
+            why = (f"left out in C1: {left_out[cid]}" if cid in left_out
+                   else "dropped: no usable screening run")
+            rows.append([cid, c["name"], c["group"], "", "", "", "", "", "", why])
+            continue
+        look = looks[cid]
+        dist, stable, near, failed, fixed = (look[k] for k in ("dist", "stable", "near",
+                                                               "failed", "fixed"))
+        why, waived, bind = list(look["why"]), look["waived"], look["bind"]
+        passing = [q for q in look["tests"] if judged[(cid, q)]["ok"]]
+        helps = passing if relevant else banded[cid]    # the band states that keep it pending
+        pending = bool(failed) and not fixed and bool(helps) and not waived
         if not (waived or pending):
             why += failed + fixed
-        charges = (sorted(set(stable) | set(banded[cid])) if p.s.distort_charges == "stable"
-                   else sorted(best[cid]))
+        if relevant and dist is None and not passing and not why:
+            why.append("no bound charge state, and no band state with a shallow carrier on the "
+                       "defect")
+        if relevant:
+            charges = sorted(set(stable) | set(near) | set(passing))
+        elif p.s.distort_charges == "stable":
+            charges = sorted(set(stable) | set(banded[cid]))
+        else:
+            charges = sorted(best[cid])
         spins = ", ".join(f"{q:+d}:{best[cid][q]['spin']:.1f}" if best[cid][q]["spin"] is not None
                           else f"{q:+d}:-" for q in stable)
         notes = []
@@ -4124,38 +4272,69 @@ def step_filter(p):
                          + "; ".join(failed + fixed))
         if pending:
             notes.append("pending: " + "; ".join(failed) + ", but "
-                         + " ".join(f"{q:+d}" for q in banded[cid])
-                         + (" is" if len(banded[cid]) == 1 else " are") + " in a band")
+                         + " ".join(f"{q:+d}" for q in helps)
+                         + (" is" if len(helps) == 1 else " are") + " in a band")
+        if near and relevant:
+            notes.append("within charge_margin of stable: "
+                         + ", ".join(f"{q:+d} ({g:.2f} eV)" for q, g in sorted(near.items())))
         if dist is None:
             notes.append("no bound charge state, so the hull can't judge it")
         rows.append([cid, c["name"], c["group"], "" if dist is None else dist,
                      " ".join(f"{q:+d}" for q in stable), spins,
                      ", ".join(f"{q:+d}: {carriers_text(best[cid][q])}" for q in banded[cid]),
                      f"{bind[0]:.2f}..{bind[1]:.2f}" if bind else "",
+                     " ".join(f"{q:+d}" for q in charges) if not why else "",
                      ("kept" + (" (" + "; ".join(notes) + ")" if notes else ""))
                      if not why else "dropped: " + "; ".join(why)])
+        if relevant and not look["why"]:
+            for q in banded[cid]:
+                t = judged.get((cid, q))
+                brows.append([cid, f"{q:+d}", carriers_text(best[cid][q]),
+                              "" if not t or t["depth"] is None else t["depth"],
+                              "" if not t or t["P"] is None else f"{t['P']:g} / {t['limit']:g}",
+                              t["why"] if t else "left out: not one charge beyond the state "
+                                                 "stable at its band edge"])
         if not why:
             survivors.append({"cand": cid, "name": c["name"], "group": c["group"],
                               "hull_distance": dist, "stable": stable, "charges": charges,
+                              "near": {str(q): g for q, g in near.items()},
                               "in_band": banded[cid], "pending": failed if pending else [],
-                              "good": good, "binding": bind,
+                              "band_tests": {str(q): judged[(cid, q)] for q in look["tests"]},
+                              "good": look["good"], "binding": bind,
                               "best": {str(q): best[cid][q] for q in best[cid]}})
+    carry = {"relevant": f"the stable ones, bound ones within charge_margin "
+                         f"({p.s.charge_margin:g} eV) of their defect's lowest somewhere in the "
+                         "gap, and band states with a shallow carrier on the defect (below)",
+             "stable": "the stable ones and every one in a band",
+             "screened": "every one with a usable energy"}[p.s.distort_charges]
     table = format_table(["id", "defect", "composition", "above hull/eV", "stable q",
-                          "spin (q:S)", "in a band (q: carriers)", "E_b/eV", "verdict"], rows,
+                          "spin (q:S)", "in a band (q: carriers)", "E_b/eV", "carried q",
+                          "verdict"], rows,
                          f"Defect hull (margin {p.s.hull_margin:g} eV) and property filters, "
                          f"Fermi levels 0 to {top:.2f} eV above the VBM"
                          + (f" (gap; the screening cell's own gap is {host['gap']:.2f} eV)"
                             if p.s.gap else "")
                          + "; charge states in a band (e: electrons in the conduction band, "
-                         "h: holes in the valence band) are carried on but not judged")
+                         "h: holes in the valence band) are not judged by the hull. Charge "
+                         f"states carried on (distort_charges : {p.s.distort_charges}): {carry}")
+    if brows:
+        table += "\n" + format_table(
+            ["id", "q", "carriers", "depth/eV", "spread/atoms (limit)", "verdict"], brows,
+            "The band states: carried on if one charge beyond the state stable at that band "
+            "edge, with each carrier at most carrier_reach "
+            f"({p.s.carrier_reach:g} eV) inside its band and spread over at most carrier_fraction "
+            f"({p.s.carrier_fraction:g}) of the cell's atoms, from a single point of the screened "
+            "structure with the band weights (C_screen/jobs/filter)")
     charges = sorted({abs(q) for st in best.values() for q in st if q})
     if charges:                    # what the hull's corrections add, in this cell
         table += (f"\nCharge corrections in the screening cell ({p.s.charge_correction}"
                   + (f", eps0 {eps:.3f}" if eps else "") + "): "
                   + ", ".join(f"|q| = {a}: {correction(a, cell, eps, p.s.charge_correction):.3f} eV"
                               for a in charges) + "\n")
+    ncharges = sum(len(s["charges"]) for s in survivors)
     return {"survivors": survivors, "_table": table,
-            "_note": f"{len(survivors)} of {len(cands)} candidates kept"}
+            "_note": f"{len(survivors)} of {len(cands)} candidates kept, {ncharges} charge "
+                     "states carried on"}
 
 
 
@@ -4203,9 +4382,9 @@ def neighbours_to_distort(comps, q, ox):
 
 # The final spin of a charge state's best screening run, as a starting spin with the right parity
 # for its electron count.
-#   Called by: step_ccd(), step_check(), step_distort(), step_excite(), step_hybrid(),
-#              step_lineshape(), step_rank(), step_relaxations(), step_search(), step_zpl(),
-#              validate_gamma()
+#   Called by: step_ccd(), step_check(), step_distort(), step_excite(), step_filter(),
+#              step_hybrid(), step_lineshape(), step_rank(), step_relaxations(), step_search(),
+#              step_zpl(), validate_gamma()
 #   Calls:     electron_parity()
 def start_spin(atoms, q, spin):
     par = electron_parity(atoms, q)
@@ -7721,9 +7900,12 @@ STEPS = [
          owns=("C_screen/jobs/screen", "C_screen/structures/screen"),
          version=1),                               # 1: the band carriers of each run
     Step("filter", "C3", "defect hull and property filters", step_filter,
-         keys=("hull_margin", "require_gap_states", "require_spin", "require_bound",
-               "distort_charges", "charge_correction", "excite", "gap"),
-         needs=("screen", "dielectric", "prerelax")),
+         keys=SCREEN_KEYS + ("hull_margin", "require_gap_states", "require_spin",
+                             "require_bound", "distort_charges", "charge_correction", "excite",
+                             "gap", "charge_margin", "carrier_reach", "carrier_fraction"),
+         needs=("screen", "dielectric", "prerelax"),
+         owns=("C_screen/jobs/filter",),
+         version=1),                         # 1: the relevant charge states (band states judged)
     Step("distort", "C4", "ShakeNBreak distortions of the survivors", step_distort,
          keys=("distortions", "distort_around", "rattle_stdev", "rattle_dmin",
                "oxidation_states", "distort_cell"), needs=("filter", "prerelax", "electronic"),
@@ -7879,11 +8061,12 @@ max_restarts : 20              # a relaxation that runs out of time carries on t
 poll      : 300
 delete_check : true            # delete each .check once its calculation has finished
 # ... and for some steps only, in a runner block: runner_host for all of phase A's CASTEP
-# steps (A1 to A3.1), runner_screen for those at the screening settings (C2, C5, D1's pristine
-# cells, D6, D7), runner_hybrid for the hybrid single points (D2, D4) and runner_production for
-# those at the production settings (D8, E1, E2, G1, G2's single points); for one step:
-# runner_converge (A1), runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3),
-# runner_phases (A3.1), runner_drelax (C5), runner_dataset (D1), runner_check (D4), runner_rank
+# steps (A1 to A3.1), runner_screen for those at the screening settings (C2, C3's single
+# points, C5, D1's pristine cells, D6, D7), runner_hybrid for the hybrid single points (D2, D4)
+# and runner_production for those at the production settings (D8, E1, E2, G1, G2's single
+# points); for one step: runner_converge (A1), runner_relax (A2.1), runner_bands (A2.2),
+# runner_dielectric (A2.3), runner_phases (A3.1), runner_filter (C3), runner_drelax (C5),
+# runner_dataset (D1), runner_check (D4), runner_rank
 # (D6), runner_excite (D7), runner_validate (D8), runner_relaxations (E1), runner_zpl (E2),
 # runner_ccd (G1), runner_lineshape (G2). A step's own block wins over its group's, and that
 # wins over the settings above, for the keywords they give (a %block partitions in one replaces
@@ -7897,7 +8080,7 @@ max_walltime : 4:00:00
 max_cores    : 16
 max_walltime : 0:20:00
 %endblock runner_converge
-%block runner_screen           # C2, C5, D1, D6, D7: Gamma-only screening jobs
+%block runner_screen           # C2, C3, C5, D1, D6, D7: Gamma-only screening jobs
 max_restarts : 0               # (the default for screening: a job that fails is flagged)
 %endblock runner_screen
 %block runner_drelax           # C5: relaxations in the electronic cell, phase C's biggest
@@ -8011,9 +8194,17 @@ require_bound : false          # bound against its isolated components
 level_margin  : 0.1 eV         # gap levels lie further inside the band edges than this;
                                #   anything nearer or past them is in a band, and a run that
                                #   leaves an electron or hole there isn't judged in C3
-distortions   : -0.6 -0.5 -0.4 -0.3 -0.2 -0.1 0.1 0.2 0.3 0.4 0.5 0.6
-distort_charges : screened     # screened (every charge state) | stable (in the gap for that
-                               #   arrangement, plus any in a band)
+distort_charges : relevant     # C3: the charge states carried on: relevant (the stable ones,
+                               #   bound ones within charge_margin of stable, and band states
+                               #   with a shallow carrier on the defect) | stable (the stable
+                               #   ones, plus any in a band) | screened (every one)
+charge_margin : 0.5 eV         #   a distortion may lower a charge state about this much
+                               #   (CaO:Sb's C5: 0.34 eV for a bound one)
+!carrier_reach    : 1.0 eV     #   a band state's carrier at most this far inside its band ...
+!carrier_fraction : 0.2        #   ... and spread over at most this fraction of the cell's atoms
+distortions   : -0.4 -0.2 0.2 0.4  # C4: ShakeNBreak's bond distortions (its own default is
+                               #   -0.6 to 0.6 in steps of 0.1: for CaO:Sb these four found
+                               #   every lowest structure that one did)
 distort_around  : auto         # auto: a single defect's site, a nearest-neighbour complex's
                                #   centre, else each component in turn | centre | each |
                                #   anchor (the first component, e.g. the dopant) | vacancy
@@ -8117,8 +8308,8 @@ freeze_radius : 0              # (untested idea) fix the atoms further than this
 
 # ======================================================================= F: thermodynamics
 charge_correction : lz         # lz | mp | none
-!gap : 7.09 eV                 # band gap for the Fermi-level range of C3, F2 and F3 (default:
-                               #   the screening cell's in C3, A2.2's in F)
+gap : 7.09 eV                  # band gap for the Fermi-level range of C3, F2 and F3 (default:
+                               #   the screening cell's in C3, A2.2's in F): CaO's measured one
 !fermi_temperature  : 1000 K   # self-consistent Fermi level at this temperature
 !quench_temperature : 300 K    # ... with the defects frozen in, then at this one
 deep_level_margin : 0.5 eV     # F3: a level this far from both band edges is "deep" (B3's

@@ -55,9 +55,9 @@ written again as each step finishes. Each phase's `summary.txt` has its part:
 
 The first time, stop after phase B (`--until B`) and read `B_candidates/summary.txt` before the
 screening: the candidate list (each candidate costs about (number of `screen_charges`)
-screening runs in the screening cell, and C4–C5 add a dozen distortions of each survivor's
-charge states in the bigger electronic cell), and the screening and electronic cells B3 and B4
-chose, with what set them.
+screening runs in the screening cell, and C4–C5 add four distortions, and the carried-over
+start, of each charge state a survivor carries on, in the bigger electronic cell), and the
+screening and electronic cells B3 and B4 chose, with what set them.
 
 The example folder holds the project file and every file it names:
 
@@ -201,7 +201,8 @@ Four blocks cover the steps at one set of settings each, and the others one step
 | `runner_bands` | A2.2 |
 | `runner_dielectric` | A2.3 |
 | `runner_phases` | A3.1 |
-| `runner_screen` | every CASTEP step at the screening settings: C2, C5, D1 (its pristine cells), D6 and D7 |
+| `runner_screen` | every CASTEP step at the screening settings: C2, C3 (its single points), C5, D1 (its pristine cells), D6 and D7 |
+| `runner_filter` | C3 |
 | `runner_drelax` | C5 |
 | `runner_dataset` | D1 |
 | `runner_rank` | D6 |
@@ -221,7 +222,7 @@ group, then its own block; the later one wins for any keyword both give. C2 and 
 of their own (their names are their groups'): set them with `runner_screen` and `runner_hybrid`,
 and give the other steps their own blocks where they should differ.
 
-The screening steps (C2, C5, D1, D6, D7) use `max_restarts : 0` and `tolerate_failures : true`
+The screening steps (C2, C3, C5, D1, D6, D7) use `max_restarts : 0` and `tolerate_failures : true`
 (a run that fails is flagged, not rescued), and the hybrid and production steps (D2, D4, D8, E1,
 E2, G1, G2) `tolerate_failures : true`, whatever the project-wide settings say; a runner block can
 change them. The MACE and model jobs have settings of their own (`mace_jobscript`, `mace_pack`,
@@ -675,14 +676,14 @@ move into the electronic cell (B4) for C4 and C5, and stay there.
 |---|---|---|---|
 | C1 | `prerelax` | builds every candidate in the screening cell and relaxes it with MACE (B2's relaxation there, if it ran) | pairs too far apart for the cell are left out; `configuration_margin` drops arrangements far above the lowest |
 | C2 | `screen` | one cheap Γ-point CASTEP relaxation per candidate and charge state, from a triplet (a doublet for an odd electron count) | — (warns if the band edges don't fold onto Γ) |
-| C3 | `filter` | defect hull, duplicates, property filters | within `hull_margin` of the hull; the `require_*` filters |
-| C4 | `distort` | each survivor's screened structures carried into the electronic cell, and ShakeNBreak's distortions of them there | which charge states (`distort_charges`), around which points (`distort_around`), in which cell (`distort_cell`) |
+| C3 | `filter` | defect hull, duplicates, property filters, and the charge states each survivor carries on, with a Γ single point of each band state it judges | within `hull_margin` of the hull; the `require_*` filters; which charge states (`distort_charges`, `charge_margin`, `carrier_reach`, `carrier_fraction`) |
+| C4 | `distort` | each survivor's screened structures carried into the electronic cell, and ShakeNBreak's distortions of them there | by how much (`distortions`), around which points (`distort_around`), in which cell (`distort_cell`) |
 | C5 | `drelax` | Γ-point relaxations of the carried-over structures and their distortions, against the electronic cell's band edges, every geometry step kept; `summary.txt` ranks them | — (it says where a distortion beat the start by `distortion_min_gain`) |
 
-The CASTEP jobs of C2 and C5 run with the runner settings of `%block runner_screen` (and of
-`runner_drelax` for C5 alone, whose jobs, in the electronic cell, are the biggest of phase C), as
-do D6's and D7's: no restarts, and a job that fails is flagged while the others carry on
-(`--resubmit-failed` tries it again).
+The CASTEP jobs of C2, C3 and C5 run with the runner settings of `%block runner_screen` (and of
+`runner_filter` for C3's single points alone, `runner_drelax` for C5's jobs alone, which, in the
+electronic cell, are the biggest of phase C), as do D6's and D7's: no restarts, and a job that
+fails is flagged while the others carry on (`--resubmit-failed` tries it again).
 
 **C1 prerelax.** Each candidate is built in the screening cell; a pair whose components are more
 than half the shortest image distance apart is left out. With `mace : true` it is relaxed with
@@ -722,15 +723,16 @@ k-point grid (the old C2b).
 
 1. *Best state:* for each candidate and charge state, its screening run (the lowest energy over
    its starting spins, with `screen_spins : both`). If that run is a band state (C2), the charge
-   state is *in a band*: it is carried on to the distortions but takes no part in what follows,
-   which uses the candidate's *bound* charge states.
+   state is *in a band*: it takes no part in the hull or the filters, which use the candidate's
+   *bound* charge states, and point 5 decides whether it goes on to the distortions.
 2. *Defect hull:* within a composition group, the formation energy of every arrangement and
    bound charge state across the gap, E + E_corr + q (E_VBM + E_F), without the host energy and
    chemical potentials (the same for all of them). E_corr is the charge correction
    (`charge_correction`, with ε₀ from A2.3) in the screening cell: without it, charge states
    couldn't be compared. An arrangement is kept if its lowest comes within `hull_margin` of the
-   group's lowest somewhere in the gap; one with no bound charge state can't be judged, and is
-   kept. Its *stable* charge states are its bound ones that are its lowest somewhere in the gap.
+   group's lowest somewhere in the gap; one with no bound charge state can't be judged by the
+   hull (point 5 decides whether it stays). Its *stable* charge states are its bound ones that are
+   its lowest somewhere in the gap.
    The gap is `gap` if you give it (an experimental or hybrid value), else the screening cell's
    own. A semilocal gap is too narrow: CaO's PBE gap at Γ is 3.64 eV against a measured 7.1 eV,
    and a bound charge state that only becomes the lowest above the PBE conduction band edge would
@@ -743,16 +745,42 @@ k-point grid (the old C2b).
 4. *Property filters,* each met by a stable charge state: `require_gap_states` (occupied, empty
    or both kinds of gap level), `require_spin` (the final spin), `require_bound` (pairs bound
    against their isolated components somewhere in the gap). A candidate that fails them but has
-   a charge state in a band is kept, *pending*: bound, that state might have the property
-   (Sb<sub>Ca</sub> + V<sub>O</sub>'s triplet is its −1). In a host where PBE leaves many charge
-   states in the bands, these filters drop fewer candidates. With `excite : true` (the
+   a band state that point 5 carries on is kept, *pending*: bound, that state might have the
+   property (Sb<sub>Ca</sub> + V<sub>O</sub>'s triplet is its −1). In a host where PBE leaves many
+   charge states in the bands, these filters drop fewer candidates. With `excite : true` (the
    default), native defects skip these filters (but not the hull or the duplicates), so that
    they reach the production runs (E) for F's Fermi level.
+5. *The charge states carried on* (`distort_charges : relevant`, the default):
+   - the survivor's stable charge states;
+   - its other bound ones whose formation energy comes within `charge_margin` (0.5 eV) of its
+     lowest somewhere in the gap: a distortion can lower a charge state by about that much
+     (C5's gain; CaO:Sb's neutral state gained 0.34 eV) and so make it stable;
+   - a band state one charge beyond a stable one at a band edge (one more electron than the
+     state stable at the top of the gap, one more hole than the one stable at the bottom; every
+     band state of a candidate with none bound), if its carrier is shallow and on the defect.
+     A distortion can bind such a carrier, as one binds Sb<sub>Ca</sub> + V<sub>O</sub>'s fourth
+     electron in its −1 state; one deep in a band or spread through the cell is a free carrier,
+     which no distortion of the defect is likely to bind. This is the *band-state test*: a Γ
+     single point of the screened structure at the screening settings, with the band weights
+     written (`pdos_calculate_weights`), in `C_screen/jobs/filter`. Its carriers are the bands
+     C2 counts them in (from `level_margin` inside a band edge onwards); the state goes on if
+     the deepest lies at most `carrier_reach` (1 eV) inside its band and none is spread over
+     more than `carrier_fraction` (0.2) of the cell's atoms (the participation number, as D7
+     counts it). A single point that fails, or whose carriers settle in gap levels, carries the
+     state on unjudged.
 
-The charge states carried on are every one with a usable energy (`distort_charges : screened`,
-the default) or the stable ones and those in a band (`stable`). `summary.txt` gives every
-candidate's verdict and why, its charge states in a band (with the electrons, e, or holes, h,
-left there), and the correction for each |q| in the screening cell.
+   Only a band state carried on keeps a candidate that fails the property filters (pending) or
+   has no bound charge state; a candidate with no bound state and none carried on is dropped. A
+   `gap` wider than the semilocal one (point 2) makes more of the bound charge states stable, so
+   they go on by their energies. The earlier rules make no single points: `stable` carries on the
+   stable charge states and every band state, `screened` every charge state with a usable
+   energy; under both, any band state keeps a candidate pending, and one with no bound charge
+   state is kept.
+
+`summary.txt` gives every candidate's verdict and why, the charge states it carries on, its charge
+states in a band (with the electrons, e, or holes, h, left there), each band state's test (how far
+inside the band its carriers lie, the atoms they are spread over against the limit, and whether
+it goes on), and the correction for each |q| in the screening cell.
 
 C3 is the only screening step that compares different charge states, so it is the only one that
 needs the correction: C2 (the starting spins), D6 (ranking and sharing) and D7 (excitations)
@@ -811,11 +839,11 @@ fourth electron the 144-atom cell leaves in the conduction band. So everything a
 electronic cell: C4–C5, the model's data, hybrid single points and checks (D1–D4), the search (D5),
 the ranking (D6), the excited states (D7), and E, F and G; only D8, which tests the screening cell,
 goes back to it. The price: C5's relaxations are the dearest runs of phase C (in CaO, three times
-the atoms, so roughly 10 to 30 times a screening run each), about a dozen per charge state of each
-survivor, and D2's and D4's hybrid single points are the dearest of all. With `distort_cell :
-screening`, C4–C5 and D1–D4 stay in the screening cell (the screened run is then the start, and D7
-carries the structures D6 keeps into the electronic cell); when B4 chose the screening cell itself,
-the two are the same.
+the atoms, so roughly 10 to 30 times a screening run each), five per charge state a survivor
+carries on (the start and the four distortions), and D2's and D4's hybrid single points are the
+dearest of all. With `distort_cell : screening`, C4–C5 and D1–D4 stay in the screening cell (the
+screened run is then the start, and D7 carries the structures D6 keeps into the electronic cell);
+when B4 chose the screening cell itself, the two are the same.
 
 ### Phase D: ground and excited states
 
@@ -1253,7 +1281,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 
 - **A**: [`antisites`](#b-candidates-the-screening-and-electronic-cells) (B)
 - **B**: [`band_spread_tol`](#e-production) (E) · [`bands_kspacing`](#a-host) (A) · [`baseline_mb`](#runner-settings) (runner)
-- **C**: [`ccd_points`](#g-lineshapes) (G) · [`charge_correction`](#f-thermodynamics) (F) · [`charging`](#runner-settings) (runner) · [`%block chemical_potentials`](#a-host) (A) · [`configuration_margin`](#c-screening) (C) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kgrid_max`](#a-host) (A) · [`converge_kgrid_min`](#a-host) (A) · [`converge_kgrid_step`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
+- **C**: [`carrier_fraction`](#c-screening) (C) · [`carrier_reach`](#c-screening) (C) · [`ccd_points`](#g-lineshapes) (G) · [`charge_correction`](#f-thermodynamics) (F) · [`charge_margin`](#c-screening) (C) · [`charging`](#runner-settings) (runner) · [`%block chemical_potentials`](#a-host) (A) · [`configuration_margin`](#c-screening) (C) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kgrid_max`](#a-host) (A) · [`converge_kgrid_min`](#a-host) (A) · [`converge_kgrid_step`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
 - **D**: [`decay_length_multiple`](#b-candidates-the-screening-and-electronic-cells) (B) · [`deep_level_margin`](#f-thermodynamics) (F) · [`%block defects`](#b-candidates-the-screening-and-electronic-cells) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_cell`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#d-ground-and-excited-states) (D) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`dopants`](#b-candidates-the-screening-and-electronic-cells) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_pack`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
 - **E**: [`%block elastic_constants`](#d-ground-and-excited-states) (D) · [`electronic_cell`](#b-candidates-the-screening-and-electronic-cells) (B) · [`electronic_depth`](#b-candidates-the-screening-and-electronic-cells) (B) · [`energy`](#general) (general) · [`excite`](#d-ground-and-excited-states) (D) · [`excite_min`](#d-ground-and-excited-states) (D) · [`excite_min_dw`](#d-ground-and-excited-states) (D) · [`%block excite_overrides`](#d-ground-and-excited-states) (D) · [`excite_reach`](#d-ground-and-excited-states) (D) · [`excite_relax`](#d-ground-and-excited-states) (D) · [`excite_spin`](#d-ground-and-excited-states) (D) · [`excite_window`](#d-ground-and-excited-states) (D)
 - **F**: [`fermi_temperature`](#f-thermodynamics) (F) · [`freeze_radius`](#e-production) (E)
@@ -1366,23 +1394,27 @@ Details: [Phase B](#phase-b-candidate-defects-the-screening-and-electronic-cells
 Details: [Phase C](#phase-c-screening). The screening runs are cheap on purpose: Γ point only,
 possibly a lower cut-off, few geometry steps. Their energies rank candidates; phase E redoes the
 survivors properly. The screening settings (`screen_cutoff`, `screen_max_steps`,
-`%block screen_overrides`, `level_margin`) are D1's, D4's, D6's and D7's too.
+`%block screen_overrides`, `level_margin`) are C3's single points', D1's, D4's, D6's and D7's
+too.
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
 | `configuration_margin` | — | C1 | Before any CASTEP run, drop arrangements whose configurational energy (MACE energy above the lowest arrangement of the same composition) is more than this, e.g. `1.0 eV`. Off unless given; needs `mace : true`. MACE has no charge or spin, so keep it generous. Replaces `triage` and `triage_window`. |
 | `screen_charges` | `-1 0 1` (*list*) | C2 | The charge states every candidate is screened in, except one with its own `q=` in `%block defects`. |
 | `screen_spins` | `triplet` | C2 | The starting spin (unpaired electrons): `triplet` runs once from 2, or from 1 (a doublet) when the electron count is odd; `low` runs once from the lowest the electron count allows (0 or 1); `both` runs from that and from that + 2. A starting value: the results keep the final spin. |
-| `screen_cutoff` | the production cut-off | C2, C5, D1, D4, D6, D7 | The cut-off of the screening runs. |
+| `screen_cutoff` | the production cut-off | C2, C3, C5, D1, D4, D6, D7 | The cut-off of the screening runs. |
 | `screen_max_steps` | `50` | C2, C5, D6, D7 | `geom_max_iter` of the screening relaxations. A run that reaches it is logged as failed but keeps its last energy, marked as not converged. |
-| `%block screen_overrides` | — | C2, C5, D1, D4, D6, D7 | Any other `.param` keywords for the screening runs, e.g. a looser `elec_energy_tol`. |
-| `level_margin` | `0.1 eV` | C2, C5, D6, D7 | How far inside the host's band edges (from the pristine cell at the same settings) an eigenvalue must lie to count as a defect level in the gap. Anything closer to an edge, or past it, is in a band: the electrons and holes there make a run a band state (at least 0.5 of either), which C3 doesn't judge. The eigenvalues aren't aligned to the host's, so raise it if a defect cell's band edges sit visibly off the host's. |
+| `%block screen_overrides` | — | C2, C3, C5, D1, D4, D6, D7 | Any other `.param` keywords for the screening runs, e.g. a looser `elec_energy_tol`. |
+| `level_margin` | `0.1 eV` | C2, C3, C5, D6, D7 | How far inside the host's band edges (from the pristine cell at the same settings) an eigenvalue must lie to count as a defect level in the gap. Anything closer to an edge, or past it, is in a band: the electrons and holes there make a run a band state (at least 0.5 of either), which C3 doesn't judge by its energy. The eigenvalues aren't aligned to the host's, so raise it if a defect cell's band edges sit visibly off the host's. |
 | `hull_margin` | `0.2 eV` | C3 | Keep an arrangement if its lowest formation energy comes within this of its composition group's defect hull somewhere in the gap. Allow for the error of the screening settings. |
-| `require_gap_states` | `none` | C3 | Keep only defects with `occupied` gap levels, `empty` ones, or `both` (an occupied and an empty level in the same spin channel: an internal transition), in a stable charge state. A defect that fails but has a charge state in a band is kept, pending. |
-| `require_spin` | — | C3 | Keep only defects with this final spin (unpaired electrons, within 0.25) in a stable charge state, e.g. `2` for a triplet. A defect that fails but has a charge state in a band is kept, pending. |
-| `require_bound` | `false` | C3 | Keep only pairs that are bound against their components somewhere in the gap: E_b = Σ E_f(parts) − E_f(pair) > 0, from their bound charge states. The components must be candidates too. A pair that fails but has a charge state in a band is kept, pending. |
-| `distort_charges` | `screened` | C3 | The charge states that go on to the distortions: `screened` (every one with a usable energy) or `stable` (lowest in energy for that defect somewhere in the gap, plus any in a band). |
-| `distortions` | `-0.6 -0.5 … 0.5 0.6` (*list*) | C4 | ShakeNBreak bond distortions of the nearest neighbours of the point the defect is distorted around: `-0.4` brings them 40 % closer, `0.4` takes them 40 % further. One relaxation per factor, point, charge state and survivor. |
+| `require_gap_states` | `none` | C3 | Keep only defects with `occupied` gap levels, `empty` ones, or `both` (an occupied and an empty level in the same spin channel: an internal transition), in a stable charge state. A defect that fails but has a band state that C3 carries on is kept, pending (with `distort_charges : stable` or `screened`, any band state). |
+| `require_spin` | — | C3 | Keep only defects with this final spin (unpaired electrons, within 0.25) in a stable charge state, e.g. `2` for a triplet. A defect that fails but has a band state that C3 carries on is kept, pending (with `distort_charges : stable` or `screened`, any band state). |
+| `require_bound` | `false` | C3 | Keep only pairs that are bound against their components somewhere in the gap: E_b = Σ E_f(parts) − E_f(pair) > 0, from their bound charge states. The components must be candidates too. A pair that fails but has a band state that C3 carries on is kept, pending (with `distort_charges : stable` or `screened`, any band state). |
+| `distort_charges` | `relevant` | C3 | The charge states each survivor carries on to the distortions. `relevant`: its stable ones (the lowest in formation energy somewhere in the gap), its other bound ones within `charge_margin` of its lowest somewhere in the gap, and a band state one charge beyond the one stable at a band edge (one more electron than at the top of the gap, one more hole than at the bottom; any band state of a defect with none bound) if a Γ single point shows its carrier shallow (`carrier_reach`) and on the defect (`carrier_fraction`). `stable`: the stable ones and every band state. `screened`: every one with a usable energy. The last two make no single points. |
+| `charge_margin` | `0.5 eV` | C3 | With `relevant`, also carry on a bound charge state whose formation energy comes within this of the defect's lowest somewhere in the gap: a distortion may lower it that much and make it stable. Set it from what the distortions gain (C5's gain column; CaO:Sb's neutral state gained 0.34 eV); `0` carries on the stable ones alone. |
+| `carrier_reach` | `1.0 eV` | C3 | With `relevant`, a band state is carried on only if its carriers lie at most this far inside their band in its single point: above the CBM for electrons, below the VBM for holes. Deeper, it is a free carrier that no distortion of the defect is likely to bind. |
+| `carrier_fraction` | `0.2` | C3 | With `relevant`, a band state is carried on only if its carriers are spread over at most this fraction of the cell's atoms (their participation number, from the single point's band weights, as D7 counts it): on the defect, not through the cell. Greater than 0, at most 1. |
+| `distortions` | `-0.4 -0.2 0.2 0.4` (*list*) | C4 | ShakeNBreak bond distortions of the nearest neighbours of the point the defect is distorted around: `-0.4` brings them 40 % closer, `0.4` takes them 40 % further. One relaxation per factor, point, charge state and survivor. These four found the lowest structure of every charge state of CaO:Sb that the full −0.6 to 0.6 set (in steps of 0.1) found, and half the ±0.6 runs there failed or didn't finish relaxing; add more for a host where a defect may need a bigger or finer push. |
 | `distort_around` | `auto` | C4 | The point the distortions are made around: `auto` (a single defect's site; the centre of a complex whose components are nearest neighbours, within 1.25 host bond lengths of each other; each component in turn for one more spread out), `centre` (the mean of the components' positions, or an atom within 0.5 Å of it), `each` (every component in turn), `anchor` (the first component's atom, or its vacant site) or `vacancy` (the vacant site, or the anchor atom for a defect without one). A single defect always uses its own site. |
 | `distort_cell` | `electronic` | C4 to D6 | The cell everything after C3 works in: `electronic` carries each survivor's screened structures into the electronic cell (B4) and does C4–C5's distortions and relaxations, D1's data, D2's and D4's hybrid single points and D4's checks there (D5 to G are there anyway), so a carrier that the screening cell leaves in a band can bind and drive a distortion; C1–C3 stay in the screening cell, where screening every candidate costs least. `screening` keeps C4–C5 and D1–D4 in the screening cell. The same when B4 chose the screening cell itself. |
 | `%block oxidation_states` | guessed | C4 | One `El  value` per line, for ShakeNBreak's count of neighbours to distort: n = q − Σ (oxidation state put there − that of the site), and that many neighbours (the absolute value), or 8 minus it above 4. Without the block, pymatgen guesses the host's, and each dopant takes its common oxidation state closest to that of the element it replaces. |
@@ -1451,7 +1483,7 @@ Details: [Phase F](#phase-f-thermodynamics).
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
 | `charge_correction` | `lz` | C3, D8, F1 | The image-charge correction for charged defects, with ε₀ from A2.3: `lz` (Lany–Zunger), `mp` (first-order Makov–Payne) or `none`. Used for the screening hull, D8's sizes and the final formation energies. |
-| `gap` | from A2.2 (C3: the screening cell's) | C3, F2, F3 | The range of Fermi levels C3 judges the hull and the stable charge states over. The band gap for F2 and F3: the range of Fermi levels, the window in which transition levels are found, E_f at the CBM, and the free carriers (the conduction bands are shifted by the difference). Put an experimental or hybrid value here; the defect energies themselves are not corrected. |
+| `gap` | from A2.2 (C3: the screening cell's) | C3, F2, F3 | The range of Fermi levels C3 judges the hull and the stable charge states over, and so which charge states it carries on. The band gap for F2 and F3: the range of Fermi levels, the window in which transition levels are found, E_f at the CBM, and the free carriers (the conduction bands are shifted by the difference). Put an experimental or hybrid value here; the defect energies themselves are not corrected. |
 | `fermi_temperature` | — | F2 | Find the self-consistent Fermi level, and the defect and carrier concentrations, at this temperature (K), at each chemical-potential limit, for each set of dopants on its own (the native defects alone, each dopant with them, and each mix of dopants one defect brings). Only the defects that reached phase E are included. |
 | `quench_temperature` | — | F2 | With `fermi_temperature`: freeze each defect's total concentration at `fermi_temperature`, then share it out between its charge states at this temperature (K). |
 | `deep_level_margin` | `0.5 eV` | B3, F3 | A transition level at least this far from both band edges counts as deep (F3 lists them). B3's Γ-only floor is for a level this far inside the gap. |
@@ -1479,9 +1511,10 @@ Details: [Phase G](#phase-g-optical-lineshapes).
 These are `supercell_convergence.py`'s keywords for how the CASTEP jobs run (see
 `README_supercell_convergence.md` for the details). In the project file they apply to every CASTEP
 step. A runner block changes them for some steps: `%block runner_host` for every CASTEP step of
-phase A, `%block runner_screen` for C2, C5, D1, D6 and D7, `%block runner_hybrid` for D2 and D4,
-`%block runner_production` for D8, E1, E2, G1 and G2, and `%block runner_converge`,
-`runner_relax`, `runner_bands`, `runner_dielectric`, `runner_phases`, `runner_drelax`,
+phase A, `%block runner_screen` for C2, C3, C5, D1, D6 and D7, `%block runner_hybrid` for D2 and
+D4, `%block runner_production` for D8, E1, E2, G1 and G2, and `%block runner_converge`,
+`runner_relax`, `runner_bands`, `runner_dielectric`, `runner_phases`, `runner_filter`,
+`runner_drelax`,
 `runner_dataset`, `runner_check`, `runner_rank`, `runner_excite`, `runner_validate`,
 `runner_relaxations`, `runner_zpl`, `runner_ccd` or `runner_lineshape` for one step
 ([How a run works](#how-a-run-works) has the table). They hold runner keywords only, and may hold a
@@ -1506,7 +1539,7 @@ here, and `cores_per_node` for the default `mace_pack` ([MACE](#mace) has their 
 | `walltime` | `auto` | `auto`: once jobs have finished, later ones ask for what they need (scaled from the measured time per SCF cycle) instead of the longest walltime; `fixed`: always the longest. |
 | `walltime_safety` | `1.5` | Factor on the walltime estimate. |
 | `sp_walltime` | — | The walltime (`H:MM:SS`) of the first single points, before there is anything to estimate from, if shorter than the longest. One that runs out is resubmitted with the longest. |
-| `max_restarts` | `10` (`0` for C2, C5, D1, D6, D7) | How many times a job that runs out of time, or stops in a way the runner can recover from, is resubmitted; a relaxation carries on from its `.check`. |
+| `max_restarts` | `10` (`0` for C2, C3, C5, D1, D6, D7) | How many times a job that runs out of time, or stops in a way the runner can recover from, is resubmitted; a relaxation carries on from its `.check`. |
 | `delete_check` | `false` | Delete each calculation's `.check` file once it has finished; they can be large. |
 | `dryrun_on` | `compute` | Where the dry runs go (one per distinct input, for the k-points and memory): `compute`, as small batch jobs from your template; `login`, where `dwf.py` runs, with `dryrun_cmd`. On ARCHER2, don't send them to the shared `serial` partition with a whole-node template, which it rejects: use `login`, or `dryrun_partition : standard`. |
 | `dryrun_cmd` | `castep.mpi --dryrun {seed}` | The command for `dryrun_on : login`, e.g. `castep.serial --dryrun {seed}`. |
@@ -1519,7 +1552,7 @@ here, and `cores_per_node` for the default `mace_pack` ([MACE](#mace) has their 
 | `status_cmd` | `squeue` or `qstat` | The command that lists queued and running jobs. |
 | `poll` | `120 s` | Seconds between checks of the queue. |
 | `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once. |
-| `tolerate_failures` | `false` (`true` for C2, C5, D1, D2, D4, D6, D7, D8, E1, E2, G1 and G2) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
+| `tolerate_failures` | `false` (`true` for C2, C3, C5, D1, D2, D4, D6, D7, D8, E1, E2, G1 and G2) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
 | `pack` | `1` | Run up to N of a step's jobs side by side on one node, in one job: with `charging : node`, each on `cores_per_node`/N cores and its share of the node's memory; with `charging : core`, each with its own cores, the pack asking for them all, as many as one node holds ([How a run works](#how-a-run-works)). Needs `cores_per_node` and a jobscript whose CASTEP line uses `srun`. |
 
 `--prepare-only`, `--no-wait`, `--resubmit-failed` and `--force` are command-line switches
@@ -1547,7 +1580,7 @@ starts from that file. Any keyword not in this table (`xc_functional`, `elec_ene
 | Keyword | What the workflow does with it |
 |---|---|
 | `task` | Set for every job: `geometryoptimization` for relaxations, `singlepoint` for single points, `dielectric_task` for the A2.3 run. Yours is ignored. |
-| `cut_off_energy` | A1 sets it on each convergence run and writes the converged value into `production.param`, replacing yours. With `converge : false`, yours is kept. The screening runs (C2, C5, D1, D4, D6, D7) use `screen_cutoff` if it is set. |
+| `cut_off_energy` | A1 sets it on each convergence run and writes the converged value into `production.param`, replacing yours. With `converge : false`, yours is kept. The screening runs (C2, C3, C5, D1, D4, D6, D7) use `screen_cutoff` if it is set. |
 | `basis_precision` | Removed by A1 when it sets `cut_off_energy`. |
 | `charge` | Set per job, to the charge state; removed from `production.param` and from the host, competing-phase and pristine-supercell jobs. Leave it out. |
 | `spin` | The starting total spin (unpaired electrons), set per defect job: from `screen_spins` in C2; from the final spin of the screening run in C5, D6, D7 and D8, and of the run a structure came from in D2 and D4; from D7's relaxed ground state in E1, and E1's in E2, G1 and G2 (for a ΔSCF run, of its ground-state run). Removed from `production.param` and from the host and phase jobs (unless a phase line sets it). A starting value only: with `fix_occupancy : false`, CASTEP holds it for `spin_fix` SCF cycles and then lets it relax. |
@@ -2025,12 +2058,28 @@ written again rather than added to when a step finishes, and `--status` bringing
 with `--status` on the example project, from the project file as read (its runner blocks on one
 line each).
 
-Not tested: real Cirrus jobs (see 9 below), `phases_from : doped` (no Materials Project access
+Then C3's charge states (`distort_charges : relevant`) and the four distortions. Tested on made-up
+candidates, each in its own composition group, with stand-in single points (a `.bands` and a
+`.pdos_weights` that put the carriers' bands where each case needs them): C3 makes one batch, in
+`C_screen/jobs/filter`, of single points with the band weights, only of the band states one charge
+beyond the state stable at a band edge (every band state of a candidate with none bound). A −1
+whose electron is shallow and on six atoms is carried on, and so is a hole one beyond the state
+stable at the VBM; a −1 spread over half the 63-atom cell, or 1.5 eV into the conduction band, is
+left out, with its participation number, limit and depth recorded; one whose electron is in a gap
+level in the single point, or whose single point failed, is carried on unjudged. A bound −1 0.30
+eV above the lowest at the top of the gap is carried on with `charge_margin : 0.5` and not with
+0.2, one 1.00 eV above is left out, and with `gap : 7.09 eV` both become stable above the PBE
+conduction-band edge and go on. A band state next to no stable one is left out without a single
+point; a candidate with no bound state is kept by a band state that passes, and dropped with none.
+With `require_spin : 2`, a candidate whose −1 passes is kept, pending, and one whose −1 is spread
+out is dropped. `stable` and `screened` make no single points and carry on what they did before.
+
+Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), real `mace_run_train` trainings with two heads and the charge embedding (D3, D4, G2: the
 command was checked, not run), real hybrid single points (D2, D4; they need CASTEP to print the
-forces of a single point), real CASTEP ΔSCF (D7, E2, G1) and `.pdos_weights` files (their layout
-is taken from CASTEP's source), real CASTEP stress tensors (D8), real Slurm for the MACE and model
-jobs, a phonon job on a real GPU, and real CASTEP output for the DFPT permittivity and the
+forces of a single point), real CASTEP ΔSCF (D7, E2, G1) and `.pdos_weights` files (C3, D7; their
+layout is taken from CASTEP's source), real CASTEP stress tensors (D8), real Slurm for the MACE and
+model jobs, a phonon job on a real GPU, and real CASTEP output for the DFPT permittivity and the
 `.bands` of spin-polarised runs.
 
 On the first real runs, check:
@@ -2093,19 +2142,25 @@ On the first real runs, check:
    carried-over structure, which ran into the same structure and which failed (and how low they
    got first), and `C_screen/results.json` which charge states still leave an electron or hole in
    a band there (each run's `band`).
-9. **Cirrus** (`charging : core`): look at the first `dryrun.sh` and `job.sh` of a step:
+9. **C3's band-state test** (`distort_charges : relevant`): it reads `.pdos_weights` files as D7
+   does. Run `--until C3` first. In `C_screen/jobs/filter/` (for CaO:Sb, `d001_qm1_bw`, the
+   single point of d001's −1), check that each single point wrote one, and that C3's table of
+   band states in `C_screen/summary.txt` gives the carriers a spread that makes sense: a few
+   atoms to a few tens for one on the defect, a good part of the cell for a free one. If every
+   carrier looks spread out, or none does, the file was read wrongly (see 7).
+10. **Cirrus** (`charging : core`): look at the first `dryrun.sh` and `job.sh` of a step:
    `--nodes`, `--ntasks-per-node` and `--cpus-per-task` should match the plan in the log, with
    `--exclusive` only on jobs bigger than a node. Then check with
    `sacct -j <job id> --format=JobID,Partition,AllocCPUS,ReqMem,MaxRSS,Elapsed` that each job got
    the cores (and so the memory) it asked for, and how much memory it used: `mem_replicated : auto`
    measures it from CASTEP's peak, so the plans tighten as jobs finish.
-10. **D8 (`validate`)**: in the first relaxation's `.castep` (`D_states/jobs/validate/`), check
+11. **D8 (`validate`)**: in the first relaxation's `.castep` (`D_states/jobs/validate/`), check
    that CASTEP printed a "Stress Tensor" block for the final structure (D8 reads the last one), and
    that the pristine single points did too ("Symmetrised Stress Tensor"). Then, in
    `D_states/summary.txt`, that `fit worst` is a few meV: if not, the sizes above the screening
    cell aren't on 1/N yet, and a bigger `validate_sizes` (or longer `scan_lengths`) is needed
    before the verdicts mean anything.
-11. **D1–D5 (`model : true`)**: run `--until D2` first. In D2's table, every hybrid single point
+12. **D1–D5 (`model : true`)**: run `--until D2` first. In D2's table, every hybrid single point
    should count as finished: one that finished without forces in its `.castep` gives no data (the
    `hse` head needs them), so check one `.castep` in `D_states/jobs/hybrid/` for a Forces block.
    Then run one training by hand from its folder (`bash train.sh` in
@@ -2113,10 +2168,10 @@ On the first real runs, check:
    file per head and `--embedding_specs` (mace-torch 0.3.15 or later). D4's table gives the test
    errors and the hybrid's largest force at the model's minimum in each charge state: a few tens of
    meV/Å is good. Look at D5's minima in `D_states/structures/search/` before D7 relaxes them.
-12. **E2**: the table says which excitations ran at the production k-points and which fell back
+13. **E2**: the table says which excitations ran at the production k-points and which fell back
    to Γ, and why. For one that ran with k-points, check in its `.castep` that the constrained
    occupations were applied at every k-point.
-13. **G1 and G2**: G1's misfit column should be a few meV; a large one, or ħω_g far from ħω_e,
+14. **G1 and G2**: G1's misfit column should be a few meV; a large one, or ħω_g far from ħω_e,
    means the equal-mode approximation is poor for that excitation (look at the points in
    `<excitation>_ccd.dat`, and check in the ΔSCF runs at the ends of the path that the same bands
    were constrained). For G2, try a smaller `lineshape_length` first to time the phonon job, and
