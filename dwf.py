@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-dwf.py - the defect workflow (phases A to G of the flowchart) in one script
+dwf.py - the defect workflow (phases A to F of the flowchart) in one script
 
-    python3 dwf.py --example > CaO_Sb.dwf      # an annotated project file to start from
-    nohup python3 dwf.py CaO_Sb.dwf > run.log 2>&1 &
-    python3 dwf.py CaO_Sb.dwf --status         # which steps have finished
+    python3 dwf.py --example CaO_Sb            # writes CaO_Sb.parameters and CaO_Sb.run
+    nohup python3 dwf.py CaO_Sb > run.log 2>&1 &
+    python3 dwf.py CaO_Sb --status             # which steps have finished
 
-One command runs every step in order, A1 to G2, waiting for its CASTEP jobs. Run it again
+A project is two files with one name: NAME.parameters, the science (the host, the dopants,
+every step's settings), and NAME.run, how its jobs run on your machine (the runner settings and
+blocks, the MACE and model jobs); python3 dwf.py NAME reads both. An older dwf.py's project file
+(NAME.dwf, everything in one) becomes the two with  python3 dwf.py --split NAME.dwf.
+
+One command runs every step in order, A1 to F2, waiting for its CASTEP jobs. Run it again
 after any stop (Ctrl-C, touch <workdir>/STOP, --no-wait, a crash) and it carries on where it
 stopped. Give step names, labels or phase letters to run only those (python3 dwf.py CaO_Sb C),
 or --until STEP to stop after a step or phase.
@@ -16,22 +21,20 @@ or --until STEP to stop after a step or phase.
   B  candidates      B1 generate, B2 scan (the supercell sizes, and MACE on every candidate),
                      B3 choose (the screening cell), B4 electronic (the electronic cell, from
                      C4 on: every band-edge valley folded onto Gamma)
-  C  screening       C1 prerelax (MACE), C2 screen, C3 filter, in the screening cell; then
-                     C4 distort (ShakeNBreak), C5 drelax, in the electronic cell
-  D  ground and      with model : true, D1 dataset, D2 hybrid, D3 train, D4 check, D5 search
-     excited states  (a MACE model of each defect, PBE and hybrid heads, searches for its
-                     ground states in the electronic cell); D6 rank, D7 excite (triplets,
-                     localised levels, ΔSCF), D8 validate (optional finite-size test)
-  E  production      E1 relaxations, E2 zpl (production ΔSCF), in the electronic cell
-  F  thermodynamics  F1 corrections, F2 formation (a Fermi level per dopant set), F3 interest
-  G  lineshapes      G1 ccd (1D configuration-coordinate diagram), G2 lineshape (optional:
+  C  screening,      C1 prerelax (MACE), C2 screen, C3 filter, in the screening cell; then
+     ground and      C4 distort (ShakeNBreak), C5 drelax, C6 rank, C7 excite (triplets,
+     excited states  localised levels, ΔSCF), in the electronic cell; C8 validate (optional
+                     finite-size test)
+  D  production      D1 relaxations, D2 zpl (production ΔSCF), in the electronic cell
+  E  thermodynamics  E1 corrections, E2 formation (a Fermi level per dopant set), E3 interest
+  F  lineshapes      F1 ccd (1D configuration-coordinate diagram), F2 lineshape (optional:
                      multi-mode, a PBE model's phonons in a big cell)
 
-Files. Everything goes in the work directory, dwf_<name>/ next to the project file:
+Files. Everything goes in the work directory, dwf_<name>/ next to the project's files:
   results.dwf        everything in one file, as a .castep is for a CASTEP job: every step's
-                     status, the keywords the project file gives and every phase's summary
+                     status, the keywords the project's files give and every phase's summary
   state.json         which steps have finished, and with what inputs (the checkpoints)
-  A_host/ ... G_lineshape/  one folder per phase, each with
+  A_host/ ... F_lineshape/  one folder per phase, each with
     results.json     everything the later steps use from this phase
     summary.txt      the same results as tables, for you to read
     jobs/            its CASTEP jobs, one folder per step
@@ -43,19 +46,20 @@ used (its settings, the files it read, the results of the steps before it) and i
 time. Change a setting and the steps that use it, and the steps after them, run again; CASTEP
 jobs whose inputs did not change are reused, and a job that already ran with other inputs
 stops the script, so results from two sets of settings never mix (--redo STEP starts a step
-again from scratch). A work directory made by a dwf.py from before phase D was split out of
-phase C (when D6 and D7 were C11 and C12, and E and F were D and E) is brought up to date, its
-results kept, with --migrate.
+again from scratch). A work directory made by a dwf.py from when phase D held the ground and
+excited states (D1-D5's model, then D6 rank, D7 excite and D8 validate, now C6-C8; E, F and G
+were production, thermodynamics and lineshapes) is brought up to date, its results kept, with
+--migrate.
 
 All CASTEP jobs go through supercell_convergence.py's batch mode (it must be in the same
 directory), which runs the structures this script builds. Its runner settings (jobscript,
-partitions, cores_per_node, charging, max_cores or max_nodes, max_walltime, ...) go in the
-project file, for every step; %block runner_host, runner_screen, runner_hybrid and
-runner_production change them for the steps at the host, screening, hybrid or production
-settings, and %block runner_<step> for one step (e.g. runner_converge, runner_excite). The MACE
-relaxations (B2, C1, D4, D5) run where this script runs, or, with mace_jobscript, as jobs on
-compute nodes (each job runs this script as a worker: python3 dwf.py --mace-worker
-<tasks>.json); the model trainings (D3, D4, G2) and G2's phonons (python3 dwf.py
+partitions, cores_per_node, charging, max_cores or max_nodes, max_walltime, ...) go in NAME.run,
+for every step; %block runner_host, runner_screen and runner_production change them for the
+steps at the host, screening or production settings, and %block runner_<step> for one step
+(e.g. runner_converge, runner_excite). The MACE relaxations (B2, C1) run where this script runs,
+or, with mace_jobscript, as jobs on compute nodes (each job runs this script as a worker: python3
+dwf.py --mace-worker <tasks>.json); %block runner_scan and runner_prerelax give B2's and C1's
+MACE jobs settings of their own. F2's model training and phonons (python3 dwf.py
 --phonon-worker spec.json) run here, or as jobs with model_jobscript.
 """
 
@@ -72,6 +76,7 @@ import shlex
 import shutil
 import socket
 import sys
+import textwrap
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -110,7 +115,7 @@ log, die = sc.log, sc.die
 # output (read_bands, occupied_bands, band_edges, gap_levels, internal_pair, read_permittivity,
 # read_trajectory, read_pdos_weights, participation), the charge correction (correction), MACE
 # (mace_relaxations, which runs mace_relax here or mace_jobs on compute nodes, whose workers are
-# mace_worker; train_command, train_tasks and run_training for the models), ΔSCF (dscf_job,
+# mace_worker; train_command and run_training for F2's model), ΔSCF (dscf_job,
 # dscf_result), lineshapes (pl_spectrum, phonon_worker) and tables (format_table).
 # Project.out() and Project.phase_dir() are used by almost every step, so they are left out of
 # the "Calls" lists, as are log() and die().
@@ -121,18 +126,23 @@ STATE, RESULTS, SUMMARY = "state.json", "results.json", "summary.txt"
 # the work directory's file of everything (every step's status, the project file's keywords and
 # every phase's summary), rewritten as the steps finish: the workflow's .castep
 OVERVIEW = "results.dwf"
-PHASE_DIRS = {"A": "A_host", "B": "B_candidates", "C": "C_screen", "D": "D_states",
-              "E": "E_production", "F": "F_thermo", "G": "G_lineshape"}
+PHASE_DIRS = {"A": "A_host", "B": "B_candidates", "C": "C_screen", "D": "D_production",
+              "E": "E_thermo", "F": "F_lineshape"}
 PHASE_TITLES = {"A": "host", "B": "candidate defects, the screening and electronic cells",
-                "C": "screening", "D": "ground and excited states",
-                "E": "production ground and excited states", "F": "thermodynamics",
-                "G": "optical lineshapes"}
-# Work directories made before phase D was split out of phase C (D6 rank and D7 excite were C11
-# and C12, and production and thermodynamics were phases D and E): the phase folders that were
-# renamed, and what D6 and D7 kept in C_screen/ (--migrate, migrate_workdir)
-OLD_PHASE_DIRS = {"D_production": "E_production", "E_thermo": "F_thermo"}
-OLD_C_PATHS = ("jobs/share_*", "jobs/excite_gs", "jobs/excite", "structures/share",
-               "structures/excite")
+                "C": "screening, ground and excited states",
+                "D": "production ground and excited states", "E": "thermodynamics",
+                "F": "optical lineshapes"}
+# Work directories made while phase D held the ground and excited states (D1-D5's ground-state
+# model, D6 rank, D7 excite and D8 validate, now C6-C8; production, thermodynamics and lineshapes
+# were phases E, F and G): the phase folders that were renamed, the folder that held D6-D8, what
+# they kept there, and the steps that are gone (--migrate, migrate_workdir)
+OLD_PHASE_DIRS = {"E_production": "D_production", "F_thermo": "E_thermo",
+                  "G_lineshape": "F_lineshape"}
+OLD_D_DIR = "D_states"
+OLD_D_PATHS = ("jobs/share_*", "jobs/excite_relax", "jobs/excite_gs", "jobs/excite",
+               "jobs/validate", "jobs/validate_gamma", "structures/share",
+               "structures/excite_relax", "structures/excite", "structures/validate")
+OLD_STEPS = ("dataset", "hybrid", "train", "check", "search")
 HB2M = 3.80998                                # hbar^2 / (2 m_e), eV Ang^2
 GPA_A3 = 6.241509e-3                          # eV in 1 GPa Ang^3
 # B2: the atoms at a supercell's edge, whose MACE displacements show whether a defect's strain
@@ -144,7 +154,7 @@ SCAN_CONFIRM = 3
 # C2: a Gamma-point gap of the screening cell this much above A2.2's means band edges that don't
 # fold onto Gamma (eV)
 FOLD_GAP_TOL = 0.05
-# C2-D6: a screening run with at least this many electrons in the conduction band (or holes in the
+# C2-C6: a screening run with at least this many electrons in the conduction band (or holes in the
 # valence band) left them there instead of in defect levels: a band state, not a bound one
 BAND_CARRIER = 0.5
 # C4 (distort_around : auto): a complex whose components are all within this many host bond
@@ -152,36 +162,32 @@ BAND_CARRIER = 0.5
 PAIR_BOND_FACTOR = 1.25
 # C4: an atom this close to a complex's centre (Ang) is the centre the distortions are made around
 CENTRE_ATOM_TOL = 0.5
-# D7: two relaxations of a defect (in different cells, or from the model and from DFT) are in the
+# C7: two relaxations of a defect (in different cells, or before and after C7 relaxes it) are in the
 # same basin if no atom near the defect is displaced from its site by more than this differently
 # (Ang)
 BASIN_TOL = 0.2
 # C5's ranking: two relaxations are compared for being the same structure only when their energies
 # are within this (eV); further apart, they are different minima
 RANK_E_TOL = 0.05
-# D1: the structures left out of a model's training data (more than MODEL_E_WINDOW eV above the
+# F2: the structures left out of its model's training data (more than MODEL_E_WINDOW eV above the
 # lowest of their charge state, atoms closer than MODEL_MIN_DIST Ang, a force above MODEL_MAX_FORCE
 # eV/Ang), the share kept for testing, the random seed; the total charge's embedding (classes from
 # -CHARGE_OFFSET)
 MODEL_E_WINDOW, MODEL_MIN_DIST, MODEL_MAX_FORCE = 3.0, 1.5, 10.0
 MODEL_TEST_FRACTION, MODEL_SEED = 0.2, 7
 CHARGE_OFFSET, CHARGE_CLASSES = 10, 21
-# D3: the 'hse' head's training structures are repeated until they are about this share of the
-# 'pbe' head's (as the hybrid data were in the paper), so a few hybrid single points still weigh in
-# the training; a head with fewer than MODEL_HOLDOUT_MIN structures (or repeated ones) is validated
-# on its own structures instead of holding some back
-MODEL_HSE_SHARE, MODEL_HOLDOUT_MIN = 0.1, 20
-# The settings a MACE relaxation task may carry for the ground-state model (D4, D5), in this order
-# (mace_key's, mace_relax's)
+# The settings a MACE relaxation task may carry of its own (a model other than mace_model, one of
+# a multi-head model's heads, a total charge, fmax, steps), in this order (mace_key's,
+# mace_relax's)
 EXTRA_TASK_KEYS = ("model", "head", "charge", "fmax", "steps")
-# D7, E2: the smallest Kohn-Sham step taken as an excitation (it skips a degenerate partner level),
+# C7, D2: the smallest Kohn-Sham step taken as an excitation (it skips a degenerate partner level),
 # eV; and a mode's energy from a curvature, hbar sqrt(eV / (amu Ang^2)), in eV
 KS_STEP_MIN = 0.1
 HW_UNIT = 0.0646541
 # B4: how far beyond the ladder (in steps of ELECTRONIC_STEP Ang, at most ELECTRONIC_TRIES of them)
 # to look for a cell that folds every band-edge k-point onto Gamma
 ELECTRONIC_STEP, ELECTRONIC_TRIES = 0.5, 30
-# G2: the model's relaxation of the big cell before its force constants (eV/Ang, steps), the
+# F2: the model's relaxation of the big cell before its force constants (eV/Ang, steps), the
 # lowest mode energy counted (eV; below it, the cell's translations) and how often (s) a phonon job
 # saves the force constants it has so far
 LINESHAPE_FMAX, LINESHAPE_STEPS = 0.002, 3000
@@ -295,7 +301,7 @@ PROJECT_KEYWORDS = {
     "supercell": (_size, None), "screen_min_image": (sc._num("ang", "A"), None),
     "electronic_cell": (_cellsize, None), "electronic_depth": (sc._num("eV"), 0.25),
     "decay_length_multiple": (sc._num(), 4.0),
-    # C: screening
+    # C: screening, ground and excited states
     "screen_charges": (sc._ints(), [-1, 0, 1]),
     "screen_spins": (sc._choice("triplet", "low", "both"), "triplet"),
     "screen_cutoff": (sc._num("eV"), None), "screen_max_steps": (sc._num(cast=int), 50),
@@ -312,20 +318,6 @@ PROJECT_KEYWORDS = {
     "distort_cell": (sc._choice("electronic", "screening"), "electronic"),
     "rattle_stdev": (sc._num("ang", "A"), None), "rattle_dmin": (sc._num("ang", "A"), None),
     "oxidation_states": ("lines", None),
-    # D: ground and excited states
-    "model": (_b, False), "model_hybrid": (_b, True), "hybrid_cell": (_t, None),
-    "hybrid_param": (_t, None), "model_hybrid_points": (sc._num(cast=int), 6),
-    "model_rattles": (sc._num(cast=int), 10), "model_rattle_stdev": (sc._num("ang", "A"), 0.05),
-    "model_jobscript": ("template", None), "model_command": (_t, "mace_run_train"),
-    "model_device": (_t, None), "model_epochs": (sc._num(cast=int), 300),
-    "model_r_max": (sc._num("ang", "A"), 5.0), "model_channels": (sc._num(cast=int), 64),
-    "model_max_L": (sc._num(cast=int), 1), "model_batch": (sc._num(cast=int), 4),
-    "model_train_args": (_t, ""), "model_force_tol": (sc._num("eV/ang", "eV/A"), 0.1),
-    "model_rounds": (sc._num(cast=int), 2),
-    "search_distortions": (_floats(), [-0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0.1, 0.2, 0.3,
-                                       0.4, 0.5, 0.6, 0.7]),
-    "search_rattles": (sc._num(cast=int), 2), "search_fmax": (sc._num("eV/ang", "eV/A"), 0.01),
-    "search_steps": (sc._num(cast=int), 1000), "search_keep": (sc._num(cast=int), 10),
     "distortion_min_gain": (sc._num("eV"), 0.05), "share_rounds": (sc._num(cast=int), 2),
     "keep_structures": (sc._num(cast=int), 1),
     "excite": (_b, True), "excite_window": (_floats(2), None),
@@ -337,14 +329,19 @@ PROJECT_KEYWORDS = {
     "validate_defects": (_w, []), "validate_sizes": (sc._num(cast=int), 3),
     "validate_gamma": (_b, True),
     "elastic_constants": ("lines", None),
-    # E: production
+    # D: production
     "production_overrides": ("kv", {}), "freeze_radius": (sc._num("ang", "A"), 0.0),
     "band_spread_tol": (sc._num("eV"), 0.05),
-    # F: thermodynamics
+    # E: thermodynamics
     "charge_correction": (sc._choice("lz", "mp", "none"), "lz"), "gap": (sc._num("eV"), None),
     "fermi_temperature": (sc._num("K"), None), "quench_temperature": (sc._num("K"), None),
     "deep_level_margin": (sc._num("eV"), 0.5),
-    # G: lineshapes
+    # F: lineshapes (F2's model: model_*)
+    "model_jobscript": ("template", None), "model_command": (_t, "mace_run_train"),
+    "model_device": (_t, None), "model_epochs": (sc._num(cast=int), 300),
+    "model_r_max": (sc._num("ang", "A"), 5.0), "model_channels": (sc._num(cast=int), 64),
+    "model_max_L": (sc._num(cast=int), 1), "model_batch": (sc._num(cast=int), 4),
+    "model_train_args": (_t, ""),
     "ccd_points": (_floats(), [-0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4]),
     "lineshape_temperature": (sc._num("K"), 10.0), "lineshape_sigma": (sc._num("eV"), 0.006),
     "lineshape_gamma": (sc._num("eV"), 0.002), "lineshape": (_b, False),
@@ -355,7 +352,19 @@ PROJECT_KEYWORDS = {
     "lineshape_delta": (sc._num("ang", "A"), 0.01),
 }
 LIST_KEYS = {"transform", "converge_cutoffs", "dopants", "scan_lengths", "screen_charges",
-             "distortions", "excite_window", "search_distortions", "ccd_points"}  # or block
+             "distortions", "excite_window", "ccd_points"}  # or block
+# The project keywords that say how jobs run rather than what they compute: they go in NAME.run,
+# with the runner keywords (RUNNER_KEYS) and blocks, not in NAME.parameters: where the work goes,
+# the MACE jobs and F2's model jobs
+RUN_PROJECT_KEYS = {"workdir", "mace_jobscript", "mace_pack", "mace_max_jobs", "mace_python",
+                    "mace_threads", "mace_device", "model_jobscript", "model_command",
+                    "model_device"}
+# The steps whose MACE relaxations may have settings of their own, in %block runner_scan (B2) or
+# runner_prerelax (C1) in NAME.run, and the keywords such a block may hold: the MACE job settings
+# and max_walltime, the jobs' --time (Project.mace_settings)
+MACE_STEPS = ("scan", "prerelax")
+MACE_BLOCK_KEYS = ("mace_jobscript", "mace_pack", "mace_max_jobs", "mace_threads", "mace_python",
+                   "mace_device", "max_walltime")
 # supercell_convergence keywords that control how jobs run (allowed in the project file, for every
 # step, and in %block runner_<group> or runner_<step>)
 RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "cores",
@@ -370,23 +379,20 @@ RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "core
 # step: the project's, changed by its group's defaults (GROUP_DEFAULTS), then by %block
 # runner_<group>, then by %block runner_<step> (Project.runner_items). screen is both a step and
 # a group: runner_screen is for every step at the screening settings (C2, C3's single points, C5,
-# D1's pristine cells, D6, D7), and runner_filter, runner_drelax, runner_rank, runner_excite or
-# runner_dataset changes it for one of them; runner_production is for every step at the
-# production settings (D8, E1, E2, G1, G2's single points); runner_hybrid for the hybrid single
-# points (D2, D4).
+# C6, C7), and runner_filter, runner_drelax, runner_rank or runner_excite changes it for one of
+# them; runner_production is for every step at the production settings (C8, D1, D2, F1, F2's
+# single points).
 RUNNER_STEPS = {"converge": "host", "relax": "host", "bands": "host", "dielectric": "host",
                 "phases": "host", "screen": "screen", "filter": "screen", "drelax": "screen",
                 "rank": "screen", "excite": "screen", "validate": "production",
-                "relaxations": "production", "zpl": "production", "dataset": "screen",
-                "hybrid": "hybrid", "check": "hybrid", "ccd": "production",
+                "relaxations": "production", "zpl": "production", "ccd": "production",
                 "lineshape": "production"}
-RUNNER_GROUPS = ("host", "screen", "production", "hybrid")
+RUNNER_GROUPS = ("host", "screen", "production")
 RUNNER_BLOCKS = RUNNER_GROUPS + tuple(s for s in RUNNER_STEPS if s not in RUNNER_GROUPS)
-# what each group of steps uses unless the project file's runner blocks say otherwise
+# what each group of steps uses unless the .run file's runner blocks say otherwise
 GROUP_DEFAULTS = {"host": "",
                   "screen": "max_restarts : 0\ntolerate_failures : true",
-                  "production": "tolerate_failures : true",
-                  "hybrid": "tolerate_failures : true"}
+                  "production": "tolerate_failures : true"}
 
 
 # The k-point grids of A1's scan, coarse to fine: from converge_kgrid_min to converge_kgrid_max
@@ -418,7 +424,8 @@ def kgrid_list(name, lo, hi, step):
 
 
 # The keyword, or the block's name, of an item of a CASTEP-style file (sc.parse_castep_input).
-#   Called by: Project.runner(), Project.runner_items(), read_project(), write_results()
+#   Called by: Project.runner(), Project.runner_items(), mace_block(), read_project(),
+#              write_results()
 def item_key(x):
     return x["name"] if x["type"] == "block" else x["key"]
 
@@ -432,19 +439,21 @@ _NO_SERIES = ("has been removed with the CASTEP size series of one defect (the o
               "scans every candidate with MACE, and the survivors run in the electronic cell "
               "(B4) from C4 on")
 _NO_E0 = ("has been removed with E0's size series: every defect now runs in the electronic cell "
-          "(B4), and D8 (validate : true) tests its finite-size error on a few defects")
-_NO_E2 = ("has been removed with the old E2: G2 (lineshape : true) trains its own model on the "
+          "(B4), and C8 (validate : true) tests its finite-size error on a few defects")
+_NO_E2 = ("has been removed with the old E2: F2 (lineshape : true) trains its own model on the "
           "production runs")
+_NO_MODEL = ("has been removed, with D1-D5 (the ground-state model): C6 ranks C5's "
+             "relaxations, with sharing between charge states")
 RETIRED = {"series_tol": _NO_E0, "runner_cells": _NO_E0, "finetune": _NO_E2,
            "finetune_args": _NO_E2, "runner_finetune": _NO_E2,
            "triage": "has been renamed: use configuration_margin (in eV; giving it switches the "
                      "filter on)",
            "triage_window": "has been renamed: use configuration_margin (in eV; giving it switches "
                             "the filter on)",
-           "zpl_window": "has been removed, with step C3b and its Kohn-Sham ZPL estimate: D7 "
+           "zpl_window": "has been removed, with step C3b and its Kohn-Sham ZPL estimate: C7 "
                          "filters on the ΔSCF ZPL instead (excite : true, excite_window)",
            "series_defect": _NO_SERIES,
-           "series_charge": _NO_SERIES + " (in every charge state the defect reaches E in)",
+           "series_charge": _NO_SERIES + " (in every charge state the defect reaches D in)",
            "series_sizes": _NO_SERIES + "; the sizes are now lengths: scan_lengths (Ang)",
            "series_choice": _NO_SERIES + ", taking the smaller of the first two sizes that agree "
                             "within series_tol",
@@ -453,7 +462,7 @@ RETIRED = {"series_tol": _NO_E0, "runner_cells": _NO_E0, "finetune": _NO_E2,
                          "the most compact supercell with every periodic image at least that "
                          "far away",
            "finetuned_model": "has been removed: B2 and C1 use mace_model (a foundation model or "
-                              "your own .model file); G2 (lineshape : true) trains its own model "
+                              "your own .model file); F2 (lineshape : true) trains its own model "
                               "on the production runs",
            "dispersion_check": _NO_C2B, "dispersion_defect": _NO_C2B, "dispersion_tol": _NO_C2B,
            "runner_dispersion": _NO_C2B,
@@ -462,60 +471,111 @@ RETIRED = {"series_tol": _NO_E0, "runner_cells": _NO_E0, "finetune": _NO_E2,
            "band_state_cell": "has been replaced by distort_cell: C4 and C5 work in the electronic "
                               "cell for every charge state of every survivor (distort_cell : "
                               "electronic, the default), band states included",
-           "model_hybrid_fraction": "has been replaced by model_hybrid_points: the number of "
-                                    "each defect's D1 structures D2 recomputes with the hybrid "
-                                    "(default 6, shared out over its charge states)"}
+           "model_hybrid_fraction": _NO_MODEL, "runner_hybrid": _NO_MODEL,
+           "runner_dataset": _NO_MODEL, "runner_check": _NO_MODEL,
+           **{k: _NO_MODEL for k in ("model", "model_hybrid", "hybrid_cell", "hybrid_param",
+                                     "model_hybrid_points", "model_rattles",
+                                     "model_rattle_stdev", "model_force_tol", "model_rounds",
+                                     "search_distortions", "search_rattles", "search_fmax",
+                                     "search_steps", "search_keep")}}
 
 
-# Reads the project file into a namespace of settings.
-# Every keyword must be a project keyword (PROJECT_KEYWORDS) or a runner keyword (RUNNER_KEYS,
-# passed to supercell_convergence.batch_args); %block runner_<group> or runner_<step>
-# (RUNNER_BLOCKS) holds runner keywords, and may hold a %block partitions, for a group of steps or
-# one step. A typo gets the closest keyword suggested, and a retired one (RETIRED) what to do.
-# Returns (settings, the text each setting was given as, the runner items, {group or step: runner
-# items}).
-#   Called by: Project.__init__()
-#   Calls:     compliance(), item_key(), kgrid_list(), sc.block_rows(), sc.parse_castep_input()
-def read_project(path):
-    name = path.name
-    vals, raw, runner, blocks = {}, {}, [], {}
-    known = set(PROJECT_KEYWORDS) | RUNNER_KEYS | {f"runner_{b}" for b in RUNNER_BLOCKS}
-    for it in sc.parse_castep_input(path.read_text()):
-        if it["type"] == "raw":
+# The settings of a MACE step's own block (%block runner_scan or runner_prerelax, it: the parsed
+# block; name: the file, for messages): the MACE job keywords it gives (MACE_BLOCK_KEYS), each
+# converted as the .run file's own, and max_walltime. Returns {keyword: value}.
+#   Called by: read_project()
+#   Calls:     item_key(), sc.parse_castep_input()
+def mace_block(it, name):
+    key, out = item_key(it), {}
+    for x in sc.parse_castep_input("\n".join(it["body"])):
+        if x["type"] == "raw":
             continue
+        k = item_key(x)
+        if k not in MACE_BLOCK_KEYS:
+            die(f"{name}: %block {key} holds the settings of {STEP_INDEX[key[7:]].label}'s MACE "
+                "jobs (" + ", ".join(MACE_BLOCK_KEYS) + f"), not '{k}'")
+        if k in out:
+            die(f"{name}: '{k}' is given more than once in %block {key}")
+        if k == "mace_jobscript":
+            out[k] = (["text", "\n".join(x["body"]).strip("\n") + "\n"] if x["type"] == "block"
+                      else ["file", x["value"]])
+            continue
+        conv = sc._slurm_time if k == "max_walltime" else PROJECT_KEYWORDS[k][0]
+        try:
+            out[k] = conv(x.get("value", ""))
+        except ValueError as err:
+            die(f"{name}: bad value for {k} in %block {key} ('{x.get('value')}'): {err}")
+        if k in ("mace_pack", "mace_max_jobs", "mace_threads") and out[k] < 1:
+            die(f"{name}: {k} must be at least 1 (in %block {key})")
+    return out
+
+
+# Reads a project's two files into a namespace of settings: path, NAME.parameters (the project
+# keywords, PROJECT_KEYWORDS, but those of RUN_PROJECT_KEYS), and run_path, NAME.run (how the jobs
+# run: the runner keywords, RUNNER_KEYS, passed to supercell_convergence.batch_args, the
+# RUN_PROJECT_KEYS and the runner blocks). %block runner_<group> or runner_<step> (RUNNER_BLOCKS)
+# holds runner keywords, and may hold a %block partitions, for a group of steps or one step;
+# %block runner_scan or runner_prerelax (MACE_STEPS) holds B2's or C1's MACE job settings
+# (mace_block). A keyword in the wrong file stops with where it goes; a typo gets the closest
+# keyword suggested, and a retired one (RETIRED) what to do. Returns (settings, the text each
+# setting was given as, the runner items, {group or step: runner items}, {MACE step: its block's
+# settings}).
+#   Called by: Project.__init__()
+#   Calls:     compliance(), item_key(), kgrid_list(), mace_block(), sc.block_rows(),
+#              sc.parse_castep_input()
+def read_project(path, run_path):
+    vals, raw, runner, blocks, mace_blocks = {}, {}, [], {}, {}
+    known = (set(PROJECT_KEYWORDS) | RUNNER_KEYS
+             | {f"runner_{b}" for b in RUNNER_BLOCKS + MACE_STEPS})
+    items = [(src, it) for src in (path, run_path) for it in sc.parse_castep_input(src.read_text())
+             if it["type"] != "raw"]
+    for src, it in items:
+        name = src.name
         key = item_key(it)
         if key in RETIRED:
             die(f"{name}: '{key}' {RETIRED[key]}")
         if key.startswith("runner_") and key not in known:
             die(f"{name}: there is no {key}: the runner blocks are runner_host (all of phase A's "
-                "CASTEP steps), runner_screen (C2, C3, C5, D1, D6, D7: the screening settings), "
-                "runner_production (D8, E1, E2, G1, G2: the production settings), runner_hybrid "
-                "(D2, D4) and, for one step, "
-                + ", ".join(f"runner_{s}" for s in RUNNER_STEPS if s not in RUNNER_GROUPS))
+                "CASTEP steps), runner_screen (C2, C3, C5, C6, C7: the screening settings), "
+                "runner_production (C8, D1, D2, F1, F2: the production settings), for one step "
+                + ", ".join(f"runner_{s}" for s in RUNNER_STEPS if s not in RUNNER_GROUPS)
+                + ", and for the MACE jobs of B2 or C1 runner_scan or runner_prerelax")
         if key not in known:
             close = difflib.get_close_matches(key, sorted(known), n=1)
             die(f"{name}: unknown keyword '{key}'" + (f" - did you mean '{close[0]}'?" if close
                                                        else "")
-                + "  (--example lists them all)")
+                + "  (--example NAME writes a pair of files with them all)")
+        running = key in RUNNER_KEYS or key in RUN_PROJECT_KEYS or key.startswith("runner_")
+        if running and src != run_path:
+            die(f"{name}: '{key}' says how jobs run: it goes in {run_path.name}")
+        if not running and src == run_path:
+            die(f"{name}: '{key}' is not a setting for running jobs: it goes in {path.name}")
         if key in raw:
             die(f"{name}: '{key}' is given more than once")
         if key in RUNNER_KEYS:
             runner.append(it)
             raw[key] = it.get("value", "(%block)")
             continue
+        if key[len("runner_"):] in MACE_STEPS:
+            if it["type"] != "block":
+                die(f"{name}: {key} is a block of MACE job settings (%block {key} ... "
+                    f"%endblock {key})")
+            mace_blocks[key[len("runner_"):]] = mace_block(it, name)
+            raw[key] = "(%block)"
+            continue
         if key.startswith("runner_"):
             if it["type"] != "block":
                 die(f"{name}: {key} is a block of runner settings (%block {key} ... "
                     f"%endblock {key})")
-            items = [x for x in sc.parse_castep_input("\n".join(it["body"])) if x["type"] != "raw"]
+            body = [x for x in sc.parse_castep_input("\n".join(it["body"])) if x["type"] != "raw"]
             seen = set()
-            for k in map(item_key, items):
+            for k in map(item_key, body):
                 if k not in RUNNER_KEYS:
                     die(f"{name}: %block {key} can only hold runner settings, not '{k}'")
                 if k in seen:
                     die(f"{name}: '{k}' is given more than once in %block {key}")
                 seen.add(k)
-            blocks[key[len("runner_"):]] = items
+            blocks[key[len("runner_"):]] = body
             raw[key] = "(%block)"
             continue
         conv, _ = PROJECT_KEYWORDS[key]
@@ -556,11 +616,13 @@ def read_project(path):
     s = SimpleNamespace(**{k: (v if not isinstance(v, (list, dict)) else type(v)(v))
                            for k, (_, v) in PROJECT_KEYWORDS.items()})
     s.__dict__.update(vals)
+    name = path.name
     for key in ("host_cell", "param"):
         if getattr(s, key) is None:
             die(f"{name}: '{key}' is required")
     if not any(item_key(x) == "jobscript" for x in runner):
-        die(f"{name}: give the jobscript template, as 'jobscript : file' or %block jobscript")
+        die(f"{run_path.name}: give the jobscript template, as 'jobscript : file' or "
+            "%block jobscript")
     if s.transform is not None and round(np.linalg.det(np.reshape(s.transform, (3, 3)))) <= 0:
         die(f"{name}: transform must have a positive determinant")
     for key in ("pair_max_distance", "scan_tol", "scan_edge_tol", "band_spread_tol",
@@ -570,10 +632,9 @@ def read_project(path):
         if getattr(s, key) is not None and getattr(s, key) <= 0:
             die(f"{name}: {key} must be greater than 0")
     for key in ("mace_threads", "mace_steps", "mace_pack", "mace_max_jobs", "validate_sizes",
-                "model_epochs", "model_channels", "model_batch", "model_rounds", "search_steps",
-                "search_keep", "model_hybrid_points"):
+                "model_epochs", "model_channels", "model_batch"):
         if getattr(s, key) is not None and getattr(s, key) < 1:
-            die(f"{name}: {key} must be at least 1")
+            die(f"{run_path.name if key in RUN_PROJECT_KEYS else name}: {key} must be at least 1")
     if min(s.scan_lengths) <= 0:
         die(f"{name}: scan_lengths are lengths in Ang, greater than 0")
     for key in ("charge_margin", "carrier_reach"):
@@ -594,38 +655,40 @@ def read_project(path):
     if s.lineshape_temperature < 0 or s.lineshape_displacements < 0 or s.lineshape_host < 0:
         die(f"{name}: lineshape_temperature, lineshape_displacements and lineshape_host can't be "
             "negative")
-    compliance(s.elastic_constants)                # a bad block stops now, not at D8
-    if s.model and s.model_hybrid and not (s.hybrid_param and s.hybrid_cell):
-        die(f"{name}: model_hybrid (the model's hybrid head, D2) needs hybrid_param (a .param with "
-            "e.g. xc_functional : HSE06) and hybrid_cell (a .cell whose species_pot gives "
-            "norm-conserving potentials); or set model_hybrid : false")
-    return s, raw, runner, blocks
+    compliance(s.elastic_constants)                # a bad block stops now, not at C8
+    return s, raw, runner, blocks, mace_blocks
 
 
 # A project: its settings, files, directories, checkpoints (state.json), results (results.json
 # of each phase) and job runner. main() makes one from the project file and the command-line
 # switches, and passes it to the steps.
 class Project:
-    # Reads the project file and the state of earlier runs, and checks the runner settings of
-    # every step now (rather than when the step starts, perhaps days later), and the MACE jobs'
-    # template, and that their workers fit on a node. Stops if the work directory has the phase
-    # folders of an older dwf.py (old_layout), unless this is --migrate.
+    # Reads the project's two files (path: NAME.parameters; NAME.run beside it) and the state of
+    # earlier runs, and checks the runner settings of every step now (rather than when the step
+    # starts, perhaps days later), and each MACE step's job template, and that its workers fit on
+    # a node. Stops if the work directory has the phase folders of an older dwf.py (old_layout),
+    # unless this is --migrate.
     #   Called by: main()
-    #   Calls:     Project.mace_runner(), Project.mace_template(), Project.runner(), old_layout(),
-    #              read_project()
+    #   Calls:     Project.mace_runner(), Project.mace_settings(), Project.mace_template(),
+    #              Project.runner(), old_layout(), read_project()
     def __init__(self, path, cl):
         self.path, self.base, self.cl = path, path.parent, cl
-        self.s, self.raw, self.runner_project, self.runner_blocks = read_project(path)
+        self.run_path = path.with_name(path.stem + ".run")
+        (self.s, self.raw, self.runner_project, self.runner_blocks,
+         self.mace_blocks) = read_project(path, self.run_path)
         self._runners, self._mace, self._model_ids, self._results = {}, {}, {}, {}
         self._mace_args = None
         for step in RUNNER_STEPS:
             self.runner(step)
-        if self.s.mace and self.s.mace_jobscript:
-            self.mace_template()
-            cpn, n = self.mace_runner().cores_per_node, self.s.mace_pack or 1
-            if cpn and n * self.s.mace_threads > cpn:
-                die(f"{path.name}: mace_pack x mace_threads ({n} x {self.s.mace_threads}) is more "
-                    f"cores than a node has ({cpn})")
+        for step in MACE_STEPS if self.s.mace else ():
+            m = self.mace_settings(step)
+            if m.mace_jobscript:
+                self.mace_template(step)
+                cpn, n = self.mace_runner().cores_per_node, m.mace_pack or 1
+                if cpn and n * m.mace_threads > cpn:
+                    die(f"{self.run_path.name}: mace_pack x mace_threads ({n} x "
+                        f"{m.mace_threads}) of {STEP_INDEX[step].label}'s MACE jobs is more cores "
+                        f"than a node has ({cpn})")
         self.name = self.s.name or path.stem
         self.dir = self.base / (self.s.workdir or f"dwf_{self.name}")
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -633,16 +696,16 @@ class Project:
         self.state = (json.loads(self.state_file.read_text()) if self.state_file.exists()
                       else {"steps": {}})
         if old_layout(self.dir) and not getattr(cl, "migrate", False):
-            die(f"{self.dir} was made by an older dwf.py, from before phase D (ground and excited "
-                "states: D6 rank and D7 excite, which were C11 and C12) was split out of phase C, "
-                "when production and thermodynamics were phases D and E. Once none of its jobs "
-                f"from C11 on are queued or running, run  python3 dwf.py {path.name} --migrate  "
-                "to move its folders to the new layout (nothing runs again); or finish it with "
-                "the older dwf.py")
+            die(f"{self.dir} was made by an older dwf.py, from when phase D held the ground and "
+                "excited states (D1-D5's model, D6 rank, D7 excite, D8 validate: now C6-C8) and "
+                "production, thermodynamics and lineshapes were phases E, F and G. Once none of "
+                f"its jobs from D6 on are queued or running, run  python3 dwf.py {path.stem} "
+                "--migrate  to move its folders to the new layout (nothing runs again but C6, "
+                "from its finished jobs); or finish it with the older dwf.py")
 
     # A file named by a project keyword (relative to the project file); stops if it is missing.
-    #   Called by: Project.cell_text(), Project.production_param(), inputs_hash(), step_check(),
-    #              step_converge(), step_dielectric(), step_hybrid(), step_relax()
+    #   Called by: Project.cell_text(), Project.production_param(), inputs_hash(), step_converge(),
+    #              step_dielectric(), step_relax()
     def file(self, key):
         value = getattr(self.s, key)
         p = self.base / value
@@ -664,7 +727,7 @@ class Project:
         write_json(self.state_file, self.state)
 
     # The results of a phase's steps: its results.json, read once ({} if there is none yet).
-    #   Called by: Project.out(), Project.save_results()
+    #   Called by: Project.out(), Project.save_results(), main(), migrate_workdir()
     def results(self, phase):
         if phase not in self._results:
             f = self.dir / PHASE_DIRS[phase] / RESULTS
@@ -745,10 +808,9 @@ class Project:
     # the runner settings of the step (its name, e.g. 'relax') and the project's STOP file;
     # keep_check : True keeps the jobs' .check files even with delete_check : true (for jobs that
     # later jobs start from). Returns run_batch's result ({'complete', 'jobs', 'calcs'}).
-    #   Called by: run_screen_jobs(), step_bands(), step_ccd(), step_check(), step_converge(),
-    #              step_dataset(), step_dielectric(), step_excite(), step_filter(), step_hybrid(),
-    #              step_lineshape(), step_phases(), step_relax(), step_relaxations(), step_screen(),
-    #              step_validate(), step_zpl(), validate_gamma()
+    #   Called by: run_screen_jobs(), step_bands(), step_ccd(), step_converge(), step_dielectric(),
+    #              step_excite(), step_filter(), step_lineshape(), step_phases(), step_relax(),
+    #              step_relaxations(), step_screen(), step_validate(), step_zpl(), validate_gamma()
     #   Calls:     Project.cell_text(), Project.runner(), sc.run_batch()
     def batch(self, subdir, jobs, step, param_text, cell_text=None, spacing=None,
               keep_check=False):
@@ -768,10 +830,9 @@ class Project:
 
     # The .param of the production settings: A1's (with the converged cut-off) once it has run,
     # else the project's .param as it is.
-    #   Called by: run_screen_jobs(), step_bands(), step_ccd(), step_check(), step_dataset(),
-    #              step_dielectric(), step_excite(), step_filter(), step_lineshape(), step_phases(),
-    #              step_relax(), step_relaxations(), step_screen(), step_validate(), step_zpl(),
-    #              validate_gamma()
+    #   Called by: run_screen_jobs(), step_bands(), step_ccd(), step_dielectric(), step_excite(),
+    #              step_filter(), step_lineshape(), step_phases(), step_relax(), step_relaxations(),
+    #              step_screen(), step_validate(), step_zpl(), validate_gamma()
     #   Calls:     Project.file(), Project.finished()
     def production_param(self):
         if self.finished("converge"):
@@ -795,10 +856,9 @@ class Project:
 
     # The relaxed host primitive cell from A2.1 (ASE Atoms, from A_host/host_relaxed.cell).
     #   Called by: doped_phases(), run_screen_jobs(), screen_setup(), step_bands(), step_ccd(),
-    #              step_check(), step_choose(), step_corrections(), step_dielectric(),
-    #              step_electronic(), step_excite(), step_formation(), step_generate(),
-    #              step_interest(), step_limits(), step_lineshape(), step_relaxations(),
-    #              step_scan(), step_validate(), step_zpl()
+    #              step_choose(), step_corrections(), step_dielectric(), step_electronic(),
+    #              step_excite(), step_formation(), step_generate(), step_interest(), step_limits(),
+    #              step_lineshape(), step_relaxations(), step_scan(), step_validate(), step_zpl()
     #   Calls:     load_cell()
     def host(self):
         return load_cell(self, self.out("relax")["cell"])
@@ -814,29 +874,32 @@ class Project:
         return model
 
     # The MACE calculator for a model (default mace_model: a foundation model's name, or a model
-    # file), loaded once (mace-torch, on mace_device), for the relaxations run here. head: one of
-    # a multi-head model's heads (D1-D5's 'pbe' or 'hse'), loaded as a MACECalculator.
-    #   Called by: mace_relax(), model_errors()
+    # file), loaded once for each device (mace-torch, on mace_device), for the relaxations run
+    # here, with mace_threads threads: the .run file's, or with run (a MACE step's mace_settings)
+    # that step's. head: one of a multi-head model's heads, loaded as a MACECalculator.
+    #   Called by: mace_relax()
     #   Calls:     Project.model_path()
-    def mace(self, model=None, head=None):
+    def mace(self, model=None, head=None, run=None):
         model = self.model_path(model)
+        device = (run and run.mace_device) or self.s.mace_device
+        threads = (run and run.mace_threads) or self.s.mace_threads
         if head is not None:
-            key = f"{model}#{head}"
+            key = f"{model}#{head}@{device}"
             if key not in self._mace:
                 import warnings
                 warnings.filterwarnings("ignore")
                 try:
-                    import torch
                     from mace.calculators import MACECalculator
                 except ImportError as err:
-                    die(f"the ground-state model needs mace-torch in this Python "
+                    die(f"a multi-head MACE model needs mace-torch in this Python "
                         f"({sys.executable}): pip install mace-torch ({err})")
-                torch.set_num_threads(self.s.mace_threads)
-                self._mace[key] = MACECalculator(model_paths=model, head=head,
-                                                 device=self.s.mace_device,
+                self._mace[key] = MACECalculator(model_paths=model, head=head, device=device,
                                                  default_dtype="float64")
+            import torch
+            torch.set_num_threads(threads)
             return self._mace[key]
-        if model not in self._mace:
+        key = f"{model}@{device}"
+        if key not in self._mace:
             import warnings
             warnings.filterwarnings("ignore")
             try:
@@ -845,13 +908,13 @@ class Project:
             except ImportError as err:
                 die(f"mace : true needs the mace-torch package in this Python ({sys.executable})"
                     f":\n    pip install mace-torch\nor set mace : false ({err})")
-            torch.set_num_threads(self.s.mace_threads)
             try:
-                self._mace[model] = mace_mp(model=model, device=self.s.mace_device,
-                                            default_dtype="float64")
+                self._mace[key] = mace_mp(model=model, device=device, default_dtype="float64")
             except Exception as err:          # unknown model, no network for the download
                 die(f"could not load the MACE model '{model}': {err}")
-        return self._mace[model]
+        import torch
+        torch.set_num_threads(threads)
+        return self._mace[key]
 
     # What identifies a MACE model in the caches: its name, or for a model file its contents
     # (MD5), so a model trained again under the same name isn't mistaken for the old one.
@@ -924,22 +987,35 @@ class Project:
                 "the command goes")
         return value
 
-    # The MACE jobs' template (mace_jobscript: a file relative to the project file, or the text of
-    # %block mace_jobscript), checked for its one {COMMAND} line (comment lines don't count),
-    # which the job's workers go in place of.
+    # The settings of a MACE step's jobs (step: one of MACE_STEPS, B2 scan or C1 prerelax): the
+    # .run file's mace_jobscript, mace_pack, mace_max_jobs, mace_threads, mace_python and
+    # mace_device, each replaced by the step's own block (%block runner_scan or runner_prerelax)
+    # where it gives one, and its max_walltime (the jobs' --time; without it, the template's).
+    # Returns a namespace of MACE_BLOCK_KEYS.
+    #   Called by: Project.__init__(), Project.mace_template(), mace_jobs(), mace_python(),
+    #              mace_relaxations()
+    def mace_settings(self, step):
+        own = self.mace_blocks.get(step, {})
+        return SimpleNamespace(**{k: own.get(k, getattr(self.s, k, None))
+                                  for k in MACE_BLOCK_KEYS})
+
+    # A MACE step's job template (its mace_jobscript, mace_settings: a file relative to the
+    # project files, or the text of %block mace_jobscript), checked for its one {COMMAND} line
+    # (comment lines don't count), which the job's workers go in place of.
     #   Called by: Project.__init__(), mace_jobs()
-    def mace_template(self):
-        kind, value = self.s.mace_jobscript
+    def mace_template(self, step):
+        kind, value = self.mace_settings(step).mace_jobscript
         if kind == "file":
             f = self.base / value
             if not f.is_file():
-                die(f"{self.path.name}: the mace_jobscript file was not found: {f}")
+                die(f"{self.run_path.name}: the mace_jobscript file was not found: {f}")
             value = f.read_text()
         if sum("{COMMAND}" in line and not line.lstrip().startswith("#")
                for line in value.splitlines()) != 1:
-            die(f"{self.path.name}: the mace_jobscript template needs one line with {{COMMAND}} "
-                "where the MACE workers go, e.g.\n    {COMMAND}\n(or with srun in front, e.g. "
-                "srun --exact --ntasks=1 --cpus-per-task=8 {COMMAND}, to start each one with srun)")
+            die(f"{self.run_path.name}: the mace_jobscript template needs one line with "
+                "{COMMAND} where the MACE workers go, e.g.\n    {COMMAND}\n(or with srun in "
+                "front, e.g. srun --exact --ntasks=1 --cpus-per-task=8 {COMMAND}, to start each "
+                "one with srun)")
         return value
 
     # The settings the MACE jobs share with the CASTEP jobs: submit_cmd, status_cmd and poll (and
@@ -978,7 +1054,7 @@ class Step:
 # file), the contents of its files (and, for a step that uses %block phases, of the structure files
 # listed there), the result fingerprints of the steps it needs and the step's version (if not 0).
 # Stops if one of those steps hasn't finished.
-#   Called by: main()
+#   Called by: main(), migrate_workdir()
 #   Calls:     Project.file()
 def inputs_hash(p, step):
     data = {"keys": {k: p.raw.get(k) for k in step.keys}, "files": {}, "needs": {}}
@@ -998,9 +1074,10 @@ def inputs_hash(p, step):
 
 
 # The fingerprint of a step's results, which the steps after it depend on: the results themselves
-# and the contents of every file under the work directory they name (e.g. the structures), so a
-# step that is run again with different results makes the later ones run again.
-#   Called by: main()
+# (as results.json has them, so the fingerprint can be worked out again from it) and the contents
+# of every file under the work directory they name (e.g. the structures), so a step that is run
+# again with different results makes the later ones run again.
+#   Called by: main(), migrate_workdir()
 def outputs_hash(p, outputs):
     files = {}
 
@@ -1059,15 +1136,16 @@ def write_summary(p, phase):
 
 # Writes results.dwf in the work directory: everything in one file, as a .castep is for a CASTEP
 # job. It is written again whenever a phase's summary.txt is (each step that finishes or stops),
-# at the end of every run and by --status: the project, every step's status (status_lines), the
-# keywords the project file gives (as written; the rest are at their defaults), then the summary
-# of each phase that has run (phase_text), A to G. No step reads it.
+# at the end of every run and by --status: the project and its two files, every step's status
+# (status_lines), the keywords those files give (as written; the rest are at their defaults), then
+# the summary of each phase that has run (phase_text), A to F. No step reads it.
 #   Called by: main(), print_status(), write_summary()
 #   Calls:     item_key(), phase_text(), sc.block_rows(), status_lines()
 def write_results(p):
     title = f"dwf.py results: project {p.name}"
     lines = [title, "=" * len(title), "",
-             f"project file    {p.path.resolve()}",
+             f"project files   {p.path.resolve()}"
+             + (f", {p.run_path.name}" if getattr(p, "run_path", None) else ""),
              f"work directory  {p.dir.resolve()}/",
              f"written         {time.strftime('%Y-%m-%d %H:%M')}, "
              "and again whenever a step finishes",
@@ -1090,7 +1168,7 @@ def write_results(p):
             return v if it is None else f"(%block, {len(it['body'])} lines)"
         return " / ".join(" ".join(r) for r in sc.block_rows(it))
 
-    head = "Settings: the keywords the project file gives (the rest are at their defaults)"
+    head = "Settings: the keywords the project's files give (the rest are at their defaults)"
     width = max((len(k) for k in p.raw), default=0)
     lines += ["", head, "-" * len(head)] + [f"  {k:<{width}} : {given(k, v)}"
                                             for k, v in p.raw.items()]
@@ -1128,7 +1206,7 @@ def print_status(p):
 
 
 # Moves a step's files aside (<path>.old-<time>) and forgets that it ran, and its results: --redo.
-# An owned path with a * in it (e.g. D_states/jobs/share_*) moves every match, except earlier
+# An owned path with a * in it (e.g. C_screen/jobs/share_*) moves every match, except earlier
 # .old- copies.
 #   Called by: main()
 #   Calls:     Project.save_results(), Project.save_state(), write_summary()
@@ -1148,105 +1226,350 @@ def reset_step(p, step):
     write_summary(p, step.phase)
 
 
-# Whether a work directory was made by a dwf.py from before phase D was split out of phase C: it
-# has the old phase folders (D_production/, E_thermo/), or phase C's results.json holds the
-# results of D6 or D7.
+# Whether a work directory was made by a dwf.py from when phase D held the ground and excited
+# states (D1-D5, D6 rank, D7 excite, D8 validate) and hasn't been migrated: it has one of the
+# phase folders that have been renamed since (OLD_PHASE_DIRS), state.json has a record of one of
+# D1-D5 (OLD_STEPS), or D_states/results.json has D6's, D7's or D8's results. (D_states/ itself
+# stays after --migrate, with what D1-D5 made.)
 #   Called by: Project.__init__(), migrate_workdir()
 def old_layout(d):
     if any((d / old).is_dir() for old in OLD_PHASE_DIRS):
         return True
-    f = d / PHASE_DIRS["C"] / RESULTS
-    return f.is_file() and bool({"rank", "excite"} & set(json.loads(f.read_text())))
+    state, res = d / STATE, d / OLD_D_DIR / RESULTS
+    steps = json.loads(state.read_text()).get("steps", {}) if state.is_file() else {}
+    moved = json.loads(res.read_text()) if res.is_file() else {}
+    return bool(set(OLD_STEPS) & set(steps) or {"rank", "excite", "validate"} & set(moved))
 
 
-# --migrate: brings a work directory made before phase D was split out of phase C (old_layout) up
-# to date, unless a step from D6 on is still running (its jobs may be queued: it should finish
-# with the dwf.py that started it). Renames D_production/ to E_production/ and E_thermo/ to
-# F_thermo/ (OLD_PHASE_DIRS), and moves D6's and D7's jobs and structures from C_screen/ to
-# D_states/ (OLD_C_PATHS) and their results from C_screen/results.json to D_states/results.json.
-# The paths in every results.json and in state.json are changed to match (and F3's for_F becomes
-# for_G), the steps' labels in state.json are updated, and every phase's summary.txt is written
-# again. The checkpoints are kept, so nothing runs again.
+# --migrate: brings a work directory made while phase D held the ground and excited states
+# (old_layout) up to date, unless a step from C6 on (or one of D1-D5) is still running (its jobs
+# may be queued: it should finish with the dwf.py that started it). Moves C6's, C7's and C8's jobs
+# and structures (OLD_D_PATHS) from D_states/ to C_screen/, and their results from
+# D_states/results.json to C_screen/results.json; renames E_production/ to D_production/,
+# F_thermo/ to E_thermo/ and G_lineshape/ to F_lineshape/ (OLD_PHASE_DIRS). The paths in every
+# results.json and in state.json are changed to match (and E3's for_G becomes for_F), the records
+# of the steps that are gone (OLD_STEPS: D1-D5) are dropped from state.json, the others' labels
+# updated, and every phase's summary.txt is written again. D_states/ keeps what D1-D5 made, which
+# nothing reads any more. The checkpoints are brought up to date with the new paths, so nothing
+# runs again but C6 (it no longer waits for D5), from its finished jobs; with model : false it
+# gives the same results, and the steps after it don't run again.
 #   Called by: main()
-#   Calls:     Project.save_state(), old_layout(), write_json(), write_summary()
+#   Calls:     Project.results(), Project.save_state(), inputs_hash(), old_layout(), outputs_hash(),
+#              write_json(), write_summary()
 def migrate_workdir(p):
     d = p.dir
     if not old_layout(d):
         log(f"{d}: already in the layout of this dwf.py - nothing to migrate")
         return
-    busy = [f"{s.label} {s.name}" for s in STEPS if s.phase in "DEF"
-            and p.state["steps"].get(s.name, {}).get("status") == "running"]
+    first = STEPS.index(STEP_INDEX["rank"])
+    busy = [f"{s.label} {s.name}" for s in STEPS[first:]
+            if p.state["steps"].get(s.name, {}).get("status") == "running"]
+    busy += [name for name in OLD_STEPS
+             if p.state["steps"].get(name, {}).get("status") == "running"]
     if busy:
         die(f"{', '.join(busy)} still running (its jobs may be queued): let it finish with the "
             "dwf.py that started it, then --migrate")
     for old, new in OLD_PHASE_DIRS.items():
+        if (d / old).is_dir() and (d / new).exists():
+            die(f"{d} has both {old}/ and {new}/: move one of them aside first")
+    for old, new in OLD_PHASE_DIRS.items():
         if (d / old).is_dir():
-            if (d / new).exists():
-                die(f"{d} has both {old}/ and {new}/: move one of them aside first")
             (d / old).rename(d / new)
             log(f"moved {old}/ to {new}/")
-    src, dst = d / PHASE_DIRS["C"], d / PHASE_DIRS["D"]
-    for pattern in OLD_C_PATHS:
+    src, dst = d / OLD_D_DIR, d / PHASE_DIRS["C"]
+    for pattern in OLD_D_PATHS:
         for x in sorted(src.glob(pattern)):
             target = dst / x.relative_to(src)
+            if target.exists():
+                die(f"{d}: both {x.relative_to(d)} and {target.relative_to(d)} exist: move one "
+                    "of them aside first")
             target.parent.mkdir(parents=True, exist_ok=True)
             x.rename(target)
             log(f"moved {x.relative_to(d)} to {target.relative_to(d)}")
     subs = ([(f"{old}/", f"{new}/") for old, new in OLD_PHASE_DIRS.items()]
-            + [(f"{PHASE_DIRS['C']}/{x.rstrip('*')}", f"{PHASE_DIRS['D']}/{x.rstrip('*')}")
-               for x in OLD_C_PATHS] + [('"for_F"', '"for_G"')])
+            + [(f"{OLD_D_DIR}/{x.rstrip('*')}", f"{PHASE_DIRS['C']}/{x.rstrip('*')}")
+               for x in OLD_D_PATHS] + [('"for_G"', '"for_F"')])
     for f in [*sorted(d.glob(f"*/{RESULTS}")), d / STATE]:
         if f.is_file():
             text = f.read_text()
             for a, b in subs:
                 text = text.replace(a, b)
             f.write_text(text)
-    res = {ph: json.loads((d / PHASE_DIRS[ph] / RESULTS).read_text())
-           if (d / PHASE_DIRS[ph] / RESULTS).is_file() else {} for ph in "CD"}
-    for name in ("rank", "excite"):
-        if name in res["C"]:
-            res["D"][name] = res["C"].pop(name)
-    for ph in "CD":
-        (d / PHASE_DIRS[ph]).mkdir(parents=True, exist_ok=True)
-        write_json(d / PHASE_DIRS[ph] / RESULTS,
-                   {s.name: res[ph][s.name] for s in STEPS if s.name in res[ph]})
+    res_c = (json.loads((dst / RESULTS).read_text()) if (dst / RESULTS).is_file() else {})
+    old_f = src / RESULTS
+    res_d = json.loads(old_f.read_text()) if old_f.is_file() else {}
+    for name in ("rank", "excite", "validate"):
+        if name in res_d:
+            res_c[name] = res_d.pop(name)
+    dst.mkdir(parents=True, exist_ok=True)
+    write_json(dst / RESULTS, {s.name: res_c[s.name] for s in STEPS if s.name in res_c})
+    if old_f.is_file():
+        write_json(old_f, res_d)
     p.state = json.loads(p.state_file.read_text()) if p.state_file.is_file() else {"steps": {}}
+    for name in OLD_STEPS:
+        p.state["steps"].pop(name, None)
     for name, rec in p.state["steps"].items():
         if name in STEP_INDEX:
             rec["label"] = STEP_INDEX[name].label
-    p.save_state()
     p._results = {}
+
+    # The checkpoints of C6 and the steps after it, whose results now name the new folders: which
+    # were up to date (their inputs fingerprint, worked out as this dwf.py does with the earlier
+    # steps' results fingerprints as they were), then each one's results fingerprint again from
+    # its results as they are now, and the inputs fingerprint again of each that was up to date,
+    # so it stays so. C6 isn't (it no longer needs D5): it runs again, and if it gives the same
+    # results (from its finished jobs) nothing after it does.
+    done = [s for s in STEPS[first:] if p.state["steps"].get(s.name, {}).get("status") == "done"]
+    fresh = []
+    for s in done:
+        try:
+            if inputs_hash(p, s) == p.state["steps"][s.name].get("inputs"):
+                fresh.append(s)
+        except SystemExit:                 # one of the steps it needs hasn't finished
+            pass
+    for s in done:
+        res = p.results(s.phase)
+        if s.name in res:
+            p.state["steps"][s.name]["out_hash"] = outputs_hash(p, res[s.name])
+    for s in fresh:
+        p.state["steps"][s.name]["inputs"] = inputs_hash(p, s)
+    p.save_state()
     for phase in PHASE_DIRS:
         if (d / PHASE_DIRS[phase]).is_dir():
             write_summary(p, phase)
-    log(f"{d}: migrated to the phases of this dwf.py (C screening, D ground and excited states, "
-        "E production, F thermodynamics) - run it as usual")
+    log(f"{d}: migrated to the phases of this dwf.py (C screening, ground and excited states; "
+        "D production; E thermodynamics; F lineshapes); D_states/ keeps what D1-D5 made (no "
+        "longer used) - run it as usual")
+
+
+# --------------------------------------------------------------------------
+# A project's two files: --example, and --split for an older dwf.py's one
+# --------------------------------------------------------------------------
+# What an older dwf.py's step labels are now, for the comments --split keeps: D6-D8 became C6-C8,
+# and E, F and G became D, E and F (their phase folders too); D1-D5 were removed, and their
+# mentions become 'old D1' and so on.
+OLD_LABELS = {"D6": "C6", "D7": "C7", "D8": "C8", "E1": "D1", "E2": "D2", "F1": "E1", "F2": "E2",
+              "F3": "E3", "G1": "F1", "G2": "F2"}
+OLD_PHASES = {"D": "C", "E": "D", "F": "E", "G": "F"}
+OLD_FOLDERS = {"D_states": "C_screen", **OLD_PHASE_DIRS}
+
+
+# A comment of an older project file with its step labels, phases and phase folders as they are
+# now (OLD_LABELS, OLD_PHASES, OLD_FOLDERS), and a section heading's phase letter (# ===== E:
+# production becomes D: production). A phase is a letter after 'phase' or 'phases', or alone
+# after 'to', 'for', 'in', 'into', 'from' or 'of' (goes on to E: D now); other single letters
+# are left, as they may be something else (its E as it is: an energy). Only the comment of a
+# line changes: all of a line starting with # or !, else what follows its first ' #' or ' !'.
+#   Called by: split_text()
+def relabel_comment(line):
+    m = re.match(r"(#\s*={3,}\s+)([D-G])(:.*)", line)
+    if m:
+        return m.group(1) + OLD_PHASES[m.group(2)] + m.group(3)
+    s = line.lstrip()
+    at = 0 if s[:1] in "#!" else min((k for k in (line.find(" #"), line.find(" !")) if k >= 0),
+                                     default=-1)
+    if at < 0:
+        return line
+
+    # One match: a range of removed steps, a step label, a phase or a folder.
+    def sub(m):
+        x = m.group(0)
+        if m.group("range"):
+            return f"old {x}"
+        if m.group("label"):
+            return OLD_LABELS.get(x, f"old {x}" if x[0] == "D" and x[1] in "12345" else x)
+        if m.group("phase"):
+            return m.group("word") + OLD_PHASES[m.group("letter")]
+        if m.group("bare"):
+            return m.group("pre") + OLD_PHASES[m.group("alone")]
+        return OLD_FOLDERS[x]
+
+    pat = (r"(?P<range>\bD[1-5]\s*-\s*D[1-5]\b)|(?P<label>(?<![\w.])[D-G][0-9](?!\w))"
+           r"|(?P<phase>(?P<word>\bphases? )(?P<letter>[D-G])\b)"
+           r"|(?P<bare>(?P<pre>\b(?:to|for|in|into|from|of) )(?P<alone>[D-G])(?![\w-]))|"
+           + "|".join(re.escape(k) for k in OLD_FOLDERS))
+    return line[:at] + re.sub(pat, sub, line[at:]).replace("phases A to G", "phases A to F")
+
+
+# Splits the text of an older dwf.py's project file (everything in one, NAME.dwf) into the two a
+# project now has: (NAME.parameters text, NAME.run text, the keywords left out). Each keyword or
+# block - also one commented out with ! (an optional setting; a line starting with # is prose) -
+# goes with the comment lines just above it and the indented comment lines just below it: to the
+# .run text if it says how jobs run (RUNNER_KEYS, RUN_PROJECT_KEYS, the runner blocks), else to
+# the .parameters text; comment lines just above a section heading (# ===...) stay with the
+# keyword before them. One this dwf.py no longer has (RETIRED, e.g. D1-D5's) is left out, any
+# section heading above it going to the next keyword of the .parameters text. Comment lines after
+# the last keyword go to the .parameters text. Comments get the step labels of this dwf.py
+# (relabel_comment).
+#   Called by: split_project()
+#   Calls:     relabel_comment()
+def split_text(text):
+    run_keys = RUNNER_KEYS | RUN_PROJECT_KEYS
+    known = set(PROJECT_KEYWORDS) | run_keys | set(RETIRED)
+    lines = text.splitlines()
+    units, pre, i = [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        s = line.strip()
+        commented = s[:1] in "#!"
+        bare = s[1:].strip() if s[:1] == "!" else s
+        mb = re.match(r"%block\s+(\w+)", bare, re.I)
+        mk = re.match(r"([A-Za-z_]\w*)\s*[:=]" if commented else r"([A-Za-z_]\w*)", bare)
+        if not s or (commented and line[:1].isspace()):
+            (pre if pre or not units or not s else units[-1]["lines"]).append(line)
+            i += 1
+            continue
+        name = (mb or mk).group(1).lower() if (mb or mk) else ""
+        if mb and (not commented or (s[:1] == "!" and (name in known
+                                                        or name.startswith("runner_")))):
+            key, body = mb.group(1).lower(), [line]
+            i += 1
+            while i < len(lines):
+                body.append(lines[i])
+                i += 1
+                if re.match(r"[#!]?\s*%endblock\b", body[-1].strip(), re.I):
+                    break
+        elif mk and (not commented or (s[:1] == "!" and mk.group(1).lower() in known)):
+            key, body = mk.group(1).lower(), [line]
+            i += 1
+        else:
+            pre.append(line)
+            i += 1
+            continue
+        while i < len(lines) and lines[i][:1].isspace() and lines[i].strip()[:1] in "#!":
+            body.append(lines[i])
+            i += 1
+        head = next((k for k, ln in enumerate(pre) if re.match(r"#\s*={3,}", ln.strip())), None)
+        if head and units:                 # what comes before a section heading ends the last one
+            units[-1]["lines"] += pre[:head]
+            pre = pre[head:]
+        units.append({"key": key, "lines": pre + body})
+        pre = []
+    params, run, dropped, carry = [], [], [], []
+    for u in units:
+        if u["key"] in RETIRED:
+            dropped.append(u["key"])
+            carry += [ln for ln in u["lines"] if re.match(r"#\s*={3,}", ln.strip())]
+        elif u["key"] in run_keys or u["key"].startswith("runner_"):
+            run.extend(u["lines"])
+        else:
+            params.extend(([""] if carry else []) + carry + u["lines"])
+            carry = []
+    params += carry + pre
+
+    # The lines as text: comments relabelled, no more than one blank line in a row.
+    def text_of(out):
+        out = [relabel_comment(ln) for ln in out]
+        keep = [ln for k, ln in enumerate(out) if ln.strip() or (k and out[k - 1].strip())]
+        while keep and not keep[0].strip():
+            keep.pop(0)
+        return "\n".join(keep).rstrip() + "\n"
+
+    return text_of(params), text_of(run), dropped
+
+
+# --split OLD.dwf: writes OLD.parameters and OLD.run beside it from an older dwf.py's project file
+# (split_text), leaving it as it is; stops if either exists already. Each starts with a note of
+# where it came from and what was left out.
+#   Called by: main()
+#   Calls:     split_text()
+def split_project(path):
+    if not path.is_file():
+        die(f"no file {path}")
+    outs = [path.with_suffix(s) for s in (".parameters", ".run")]
+    for f in outs:
+        if f.exists():
+            die(f"{f} exists already: move it aside first (nothing was written)")
+    params, run, dropped = split_text(path.read_text())
+    stem = path.stem
+    for out, other, body in ((outs[0], outs[1], params), (outs[1], outs[0], run)):
+        note = (f"Made by dwf.py --split from {path.name} ({time.strftime('%Y-%m-%d')}), whose "
+                f"other half is {other.name}. The comments' step labels are this dwf.py's: D6-D8 "
+                "are now C6-C8, and phases E, F and G are now D, E and F. D1-D5 (the ground-state "
+                "model) were removed: the comments call them old D1 to old D5.")
+        if dropped:
+            note += (" Left out, as this dwf.py doesn't have them: " + ", ".join(dropped)
+                     + f" (see {path.name}).")
+        lines = textwrap.wrap(note, 98, initial_indent="# ", subsequent_indent="# ",
+                              break_on_hyphens=False)
+        out.write_text("\n".join(lines) + "\n\n" + body)
+    log(f"wrote {outs[0].name} (the science) and {outs[1].name} (how the jobs run) from "
+        f"{path.name}" + (f"; left out: {', '.join(dropped)}" if dropped else "")
+        + f". Check them, then run  python3 dwf.py {stem}")
+
+
+# --example NAME: writes NAME.parameters and NAME.run, the annotated example project (CaO:Sb on
+# Cirrus: EXAMPLE_PARAMETERS, EXAMPLE_RUN); stops if either exists already.
+#   Called by: main()
+def write_example(stem):
+    outs = [Path(stem + s) for s in (".parameters", ".run")]
+    for f in outs:
+        if f.exists():
+            die(f"{f} exists already: give another name (nothing was written)")
+    outs[0].write_text(EXAMPLE_PARAMETERS)
+    outs[1].write_text(EXAMPLE_RUN)
+    log(f"wrote {outs[0]} and {outs[1]}: the example project (CaO:Sb on Cirrus). Edit them, "
+        f"then run  python3 dwf.py {stem}")
+
+
+# The .parameters file of the project a command-line word names: NAME, NAME.parameters or
+# NAME.run, with its NAME.run beside it. Stops if either is missing; an older dwf.py's project
+# file (NAME.dwf) with how to split it. NAME.dwf named when the pair is there: a note that the
+# pair is what is read.
+#   Called by: main()
+#   Calls:     log()
+def project_path(word):
+    base = Path(word)
+    if base.suffix in (".parameters", ".run", ".dwf"):
+        base = base.with_suffix("")
+    params, run, old = (base.with_name(base.name + s) for s in (".parameters", ".run", ".dwf"))
+    if not params.is_file() and not run.is_file():
+        if old.is_file():
+            die(f"{old} is a project file of an older dwf.py: a project is now two files, "
+                f"{params.name} (the science) and {run.name} (how the jobs run). Make them from "
+                f"it with  python3 dwf.py --split {old}")
+        die(f"no project {word}: dwf.py reads {params} and {run} (--example NAME writes a pair to "
+            "start from)")
+    for f in (params, run):
+        if not f.is_file():
+            die(f"no {f}: a project is two files, {params.name} and {run.name}")
+    if Path(word).suffix == ".dwf":
+        log(f"note: reading {params.name} and {run.name}; {old.name}, an older dwf.py's project "
+            "file, is not read (edit the pair)")
+    return params
 
 
 # The command line, and the work it does: runs the steps in order (all of them, or those named by
 # name, label or phase letter, up to --until), skipping those that have finished with the same
 # inputs, and stops at the first that isn't finished (jobs still queued with --no-wait). A step
 # that finishes has its results put in its phase's results.json, its checkpoint (with its note
-# and table) in state.json, and its phase's summary.txt written again. --status prints the
-# checkpoints; --redo starts steps again from scratch; --example prints an annotated project file;
-# --migrate updates a work directory made by an older dwf.py (migrate_workdir); --mace-worker and
-# --phonon-worker are what a MACE or G2 phonon job runs (mace_worker, phonon_worker), not a project.
+# and table) in state.json, and its phase's summary.txt written again. A project is named by
+# NAME (its NAME.parameters and NAME.run: project_path). --status prints the checkpoints; --redo
+# starts steps again from scratch; --example NAME writes an annotated project (write_example);
+# --split OLD.dwf makes the two files from an older dwf.py's one (split_project); --migrate
+# updates a work directory made by an older dwf.py (migrate_workdir); --mace-worker and
+# --phonon-worker are what a MACE or F2 phonon job runs (mace_worker, phonon_worker), not a project.
 #   Called by: the main block
-#   Calls:     Project.__init__(), Project.finished(), Project.save_results(), Project.save_state(),
-#              inputs_hash(), mace_worker(), migrate_workdir(), outputs_hash(), phonon_worker(),
-#              print_status(), reset_step(), write_results(), write_summary()
+#   Calls:     Project.__init__(), Project.finished(), Project.results(), Project.save_results(),
+#              Project.save_state(), inputs_hash(), mace_worker(), migrate_workdir(),
+#              outputs_hash(), phonon_worker(), print_status(), project_path(), reset_step(),
+#              split_project(), write_example(), write_results(), write_summary()
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("project", nargs="?", help="the project file (<name>.dwf) or its name")
+    ap.add_argument("project", nargs="?", help="the project's name: NAME, for its two files "
+                    "NAME.parameters and NAME.run")
     ap.add_argument("steps", nargs="*", help="run only these steps: names (relax), labels (A2.1) "
-                    "or phases (A to G); default: all of them")
+                    "or phases (A to F); default: all of them")
     ap.add_argument("--until", metavar="STEP", help="stop after this step or phase (e.g. B)")
     ap.add_argument("--redo", action="append", default=[], metavar="STEP",
                     help="start this step again from scratch (can be given more than once)")
     ap.add_argument("--status", action="store_true",
                     help="show which steps have finished (and bring results.dwf up to date)")
-    ap.add_argument("--example", action="store_true", help="print an annotated project file")
+    ap.add_argument("--example", nargs="?", const="example", metavar="NAME",
+                    help="write an annotated example project, NAME.parameters and NAME.run")
+    ap.add_argument("--split", metavar="OLD.dwf",
+                    help="make OLD.parameters and OLD.run from an older dwf.py's project file")
     ap.add_argument("--prepare-only", action="store_true",
                     help="write the inputs of the next CASTEP jobs, submit nothing")
     ap.add_argument("--no-wait", action="store_true",
@@ -1257,12 +1580,12 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="keep the results of jobs whose inputs have changed")
     ap.add_argument("--migrate", action="store_true",
-                    help="move the folders of a work directory made by an older dwf.py (before "
-                    "phase D was split out of C) to this version's layout")
+                    help="move the folders of a work directory made by an older dwf.py (when "
+                    "phase D held D1-D8) to this version's layout")
     ap.add_argument("--mace-worker", metavar="TASKS",
                     help="(what a MACE job runs) relax the structures in this task file")
     ap.add_argument("--phonon-worker", metavar="SPEC",
-                    help="(what a G2 job runs) a defect's force constants with its model")
+                    help="(what a F2 job runs) a defect's force constants with its model")
     cl = ap.parse_args()
     if cl.mace_worker:
         mace_worker(cl.mace_worker)
@@ -1271,16 +1594,15 @@ def main():
         phonon_worker(cl.phonon_worker)
         return
     if cl.example:
-        print(EXAMPLE_PROJECT, end="")
+        write_example(cl.example)
+        return
+    if cl.split:
+        split_project(Path(cl.split))
         return
     if not cl.project:
-        ap.error("give the project file (or --example for an annotated one)")
-    path = Path(cl.project)
-    if not path.is_file() and Path(cl.project + ".dwf").is_file():
-        path = Path(cl.project + ".dwf")
-    if not path.is_file():
-        die(f"no project file {cl.project} or {cl.project}.dwf")
-    p = Project(path, cl)
+        ap.error("give the project's name, NAME for NAME.parameters and NAME.run (or --example "
+                 "NAME for an annotated pair)")
+    p = Project(project_path(cl.project), cl)
     if cl.migrate:
         migrate_workdir(p)
         return
@@ -1294,7 +1616,7 @@ def main():
         hits = [s for s in STEPS if w in (s.name, s.label.lower(), s.phase.lower())]
         if not hits:
             die(f"no step or phase '{word}': the steps are "
-                + ", ".join(f"{s.label} {s.name}" for s in STEPS) + ", the phases A to G")
+                + ", ".join(f"{s.label} {s.name}" for s in STEPS) + ", the phases A to F")
         return hits
 
     chosen = {s.name for w in cl.steps for s in find(w)} or {s.name for s in STEPS}
@@ -1347,8 +1669,8 @@ def main():
             p.save_results(step.name, outputs)
             p.state["steps"][step.name] = {
                 "status": "done", "label": step.label, "inputs": h,
-                "out_hash": outputs_hash(p, outputs), "time": time.strftime("%Y-%m-%d %H:%M"),
-                "note": note, "table": table}
+                "out_hash": outputs_hash(p, p.results(step.phase)[step.name]),
+                "time": time.strftime("%Y-%m-%d %H:%M"), "note": note, "table": table}
             p.save_state()
             write_summary(p, step.phase)
             log(f"{step.label} {step.name}: finished" + (f" - {note}" if note else ""))
@@ -1388,8 +1710,7 @@ def atoms_from_dict(d):
 # (load_cell) gives the same atom numbers. Only the structure: each job adds its k-points,
 # species_pot and the rest. Returns the path relative to the work directory, as the results give
 # it.
-#   Called by: dscf_result(), job_summary(), production_summary(), step_distort(), step_prerelax(),
-#              step_search()
+#   Called by: dscf_result(), job_summary(), production_summary(), step_distort(), step_prerelax()
 def save_cell(p, path, atoms, title):
     path.parent.mkdir(parents=True, exist_ok=True)
     frac = atoms.get_scaled_positions(wrap=True)
@@ -1407,9 +1728,9 @@ def save_cell(p, path, atoms, title):
 # Reads a structure saved by save_cell (rel: relative to the work directory), as ASE Atoms with
 # the starting spins as initial magnetic moments.
 #   Called by: Project.host(), distinct_states(), drelax_ranking(), duplicates(), into_cell(),
-#              lineshape_vector(), run_screen_jobs(), step_ccd(), step_check(), step_distort(),
-#              step_excite(), step_filter(), step_lineshape(), step_rank(), step_screen(),
-#              step_search(), step_validate(), step_zpl(), validate_gamma()
+#              lineshape_vector(), run_screen_jobs(), step_ccd(), step_distort(), step_excite(),
+#              step_filter(), step_lineshape(), step_rank(), step_screen(), step_validate(),
+#              step_zpl(), validate_gamma()
 #   Calls:     sc.read_structure()
 def load_cell(p, rel):
     return sc.read_structure(p.dir / rel)
@@ -1530,8 +1851,7 @@ def composition_change(comps):
 # cartesian), each component's position, the anchor's atom index (None for a vacancy) and the
 # positions of the vacancies.
 #   Called by: big_cell(), carry_over(), into_cell(), match_ideal(), run_screen_jobs(), step_ccd(),
-#              step_check(), step_lineshape(), step_prerelax(), step_scan(), step_search(),
-#              step_validate(), step_zpl()
+#              step_lineshape(), step_prerelax(), step_scan(), step_validate(), step_zpl()
 #   Calls:     comp_name(), sc.anchor_site(), sc.build_supercell(), sc.get_distances(),
 #              sc.pure_translations(), sc.translation_copies()
 def build_defect(prim, P, comps, label="defect"):
@@ -1631,9 +1951,8 @@ def build_defect(prim, P, comps, label="defect"):
 
 
 # The pristine supercell P x (primitive cell), without the site labels build_supercell adds.
-#   Called by: run_screen_jobs(), step_dataset(), step_distort(), step_excite(), step_filter(),
-#              step_lineshape(), step_relaxations(), step_screen(), step_search(), step_validate(),
-#              step_zpl(), validate_gamma()
+#   Called by: run_screen_jobs(), step_distort(), step_excite(), step_filter(), step_lineshape(),
+#              step_relaxations(), step_screen(), step_validate(), step_zpl(), validate_gamma()
 #   Calls:     sc.build_supercell()
 def host_supercell(prim, P):
     atoms = sc.build_supercell(prim, P)
@@ -1732,7 +2051,7 @@ def common_atoms(v1, syms1, v2, syms2, radius):
 # perfect-crystal sites. radius defaults to just under half the smaller cell's shortest image
 # distance, the region the two cells describe in the same way. Works for any host and any pair of
 # supercells of it. Returns (Atoms, info) as build_defect does.
-#   Called by: big_cell(), into_cell(), step_check(), step_distort(), step_search(), step_validate()
+#   Called by: big_cell(), into_cell(), step_distort(), step_validate()
 #   Calls:     build_defect(), common_atoms(), displacement_field(), min_image()
 def carry_over(prim, comps, src_P, src_atoms, dst_P, radius=None, label="defect"):
     ideal, _, u, v = displacement_field(prim, comps, src_P, src_atoms, label)
@@ -2104,7 +2423,7 @@ def correction(q, cell, eps, method):
 # --------------------------------------------------------------------------
 # What identifies one MACE relaxation in the caches: the structure, the model (Project.model_id)
 # and the optimiser's settings (mace_fmax, mace_steps, or a relaxation's own fmax and steps), and
-# for the ground-state model the head and the total charge.
+# for a task with its own head or total charge (EXTRA_TASK_KEYS) those too.
 #   Called by: mace_relax(), mace_relaxations()
 #   Calls:     Project.model_id(), atoms_to_dict()
 def mace_key(p, atoms, model=None, head=None, charge=None, fmax=None, steps=None):
@@ -2182,30 +2501,33 @@ def mace_run(calc, atoms, fmax, steps, charge=None):
     return work, e0, e1, int(getattr(opt, "nsteps", 0))
 
 
-# Relaxes a structure with MACE here, in this process (model: default mace_model; head, charge,
-# fmax and steps for the ground-state model), unless its cache file already holds the result
-# (mace_cached). Returns (relaxed Atoms, energy before, energy after, steps).
+# Relaxes a structure with MACE here, in this process (model: default mace_model; a task's own
+# head, charge, fmax and steps, EXTRA_TASK_KEYS), with a MACE step's threads and device (run:
+# its mace_settings), unless its cache file already holds the result (mace_cached). Returns
+# (relaxed Atoms, energy before, energy after, steps).
 #   Called by: mace_relaxations()
 #   Calls:     Project.mace(), mace_cached(), mace_key(), mace_run(), save_mace_result()
-def mace_relax(p, atoms, cache, model=None, head=None, charge=None, fmax=None, steps=None):
+def mace_relax(p, atoms, cache, model=None, head=None, charge=None, fmax=None, steps=None,
+               run=None):
     key = mace_key(p, atoms, model, head, charge, fmax, steps)
     hit = mace_cached(cache, key)
     if hit:
         return hit
-    result = mace_run(p.mace(model, head), atoms, fmax or p.s.mace_fmax,
+    result = mace_run(p.mace(model, head, run), atoms, fmax or p.s.mace_fmax,
                       steps or p.s.mace_steps, charge)
     save_mace_result(cache, key, result)
     return result
 
 
-# A step's MACE relaxations (mace_model): {cache file: (relaxed Atoms, energy before, energy
-# after, steps)}, or None while MACE jobs are still queued (--no-wait) or after --prepare-only.
-# tasks: [{'atoms', 'cache', 'label'}, and for the ground-state model 'model', 'head', 'charge',
-# 'fmax', 'steps' (EXTRA_TASK_KEYS)]. A relaxation whose cache file already holds it (the same
-# structure, model and settings: mace_key) is not run again. The others run as jobs on compute
-# nodes with mace_jobscript (mace_jobs), else here, one after the other (mace_relax).
-#   Called by: step_check(), step_prerelax(), step_scan(), step_search()
-#   Calls:     mace_cached(), mace_jobs(), mace_key(), mace_relax()
+# A step's MACE relaxations (mace_model; step: B2 scan or C1 prerelax, MACE_STEPS): {cache file:
+# (relaxed Atoms, energy before, energy after, steps)}, or None while MACE jobs are still queued
+# (--no-wait) or after --prepare-only. tasks: [{'atoms', 'cache', 'label'}, and optionally a
+# task's own 'model', 'head', 'charge', 'fmax', 'steps' (EXTRA_TASK_KEYS)]. A relaxation whose
+# cache file already holds it (the same structure, model and settings: mace_key) is not run
+# again. The others run as jobs on compute nodes with the step's mace_jobscript (mace_settings:
+# the .run file's, or its own block's; mace_jobs), else here, one after the other (mace_relax).
+#   Called by: step_prerelax(), step_scan()
+#   Calls:     Project.mace_settings(), mace_cached(), mace_jobs(), mace_key(), mace_relax()
 def mace_relaxations(p, step, tasks):
     out, todo = {}, []
     for t in tasks:
@@ -2215,27 +2537,29 @@ def mace_relaxations(p, step, tasks):
             out[str(t["cache"])] = hit
         else:
             todo.append(t)
-    if todo and p.s.mace_jobscript:
+    run = p.mace_settings(step)
+    if todo and run.mace_jobscript:
         if not mace_jobs(p, step, todo):
             return None
         for t in todo:
             out[str(t["cache"])] = mace_cached(t["cache"], t["key"])
-    for k, t in enumerate([] if p.s.mace_jobscript else todo):
+    for k, t in enumerate([] if run.mace_jobscript else todo):
         log(f"{STEP_INDEX[step].label}: {t['label']}: MACE relaxation ({len(t['atoms'])} atoms; "
             f"{k + 1} of {len(todo)})")
         out[str(t["cache"])] = mace_relax(p, t["atoms"], t["cache"],
-                                          *(t.get(k) for k in EXTRA_TASK_KEYS))
+                                          *(t.get(k) for k in EXTRA_TASK_KEYS), run=run)
     return out
 
 
-# The Python the MACE jobs run: mace_python, or else the one running dwf.py, with any linked folder
+# The Python a step's MACE jobs run: its mace_python (mace_settings; step None: the .run file's,
+# for F2's model jobs), or else the one running dwf.py, with any linked folder
 # on its path followed to where it really is (e.g. a ~/shared that links to /work/...), as the
 # compute nodes may not see the link's side (on Cirrus and ARCHER2, /home). Only the folders: a
 # venv's bin/python is itself a link to the Python the venv was made from, and following that
 # would leave the venv. A bare command (e.g. python3) is left to the job's PATH.
 #   Called by: mace_jobs(), step_lineshape()
-def mace_python(p):
-    py = p.s.mace_python or sys.executable
+def mace_python(p, step=None):
+    py = (p.mace_settings(step).mace_python if step else p.s.mace_python) or sys.executable
     if "/" not in py:
         return py
     path = Path(py).expanduser()
@@ -2243,14 +2567,16 @@ def mace_python(p):
 
 
 # The MACE relaxations a step still needs (mace_relaxations), run as batch jobs on compute nodes, in
-# <phase>/jobs/mace_<step>/job_NNN/. Each job is the mace_jobscript template with its {COMMAND} line
-# made into mace_pack workers, each running  <python> dwf.py --mace-worker tasks_KK.json  (the
-# python from mace_python()) in the background with mace_threads threads (whatever is in front of
-# {COMMAND} on its line, e.g. srun ..., goes in front of each), then wait; a {NCORES} in the
-# template becomes the cores those workers use (workers x mace_threads), so on a machine that
-# charges by the core (charging : core) a job asks for just those. The relaxations are shared out
-# between at most mace_max_jobs jobs, biggest first, onto whichever worker has the fewest atoms so
-# far, so the workers finish together. The jobs go in jobs.json there; waiting polls the queue
+# <phase>/jobs/mace_<step>/job_NNN/, with the step's MACE settings (mace_settings: the .run file's,
+# or its own block's, %block runner_scan or runner_prerelax). Each job is its mace_jobscript
+# template with its {COMMAND} line made into mace_pack workers, each running  <python> dwf.py
+# --mace-worker tasks_KK.json  (the python from mace_python()) in the background with mace_threads
+# threads (whatever is in front of {COMMAND} on its line, e.g. srun ..., goes in front of each),
+# then wait; a {NCORES} in the template becomes the cores those workers use (workers x
+# mace_threads), so on a machine that charges by the core (charging : core) a job asks for just
+# those, and the block's max_walltime becomes its --time. The relaxations are shared out between
+# at most mace_max_jobs jobs, biggest first, onto whichever worker has the fewest atoms so far, so
+# the workers finish together. The jobs go in jobs.json there; waiting polls the queue
 # (status_cmd) every poll seconds, like the CASTEP jobs, and the project's STOP file stops it. A
 # relaxation still missing once its job has ended (e.g. it ran out of time) goes into a new job, at
 # most MACE_ATTEMPTS times; then the run stops, with how the last of its jobs ended (why_ended).
@@ -2258,9 +2584,9 @@ def mace_python(p):
 # relaxation is done, False while jobs are queued (--no-wait) or after --prepare-only (the job
 # scripts are then in prepared/).
 #   Called by: mace_relaxations()
-#   Calls:     Project.mace_model_file(), Project.mace_runner(), Project.mace_template(),
-#              Project.model_path(), atoms_to_dict(), mace_cached(), mace_python(), sc.job_active(),
-#              sc.send_job(), write_json()
+#   Calls:     Project.mace_model_file(), Project.mace_runner(), Project.mace_settings(),
+#              Project.mace_template(), Project.model_path(), atoms_to_dict(), mace_cached(),
+#              mace_python(), sc.add_sbatch_option(), sc.job_active(), sc.send_job(), write_json()
 def mace_jobs(p, step, todo):
     args = p.mace_runner()
     d = p.phase_dir(STEP_INDEX[step].phase) / "jobs" / f"mace_{step}"
@@ -2268,8 +2594,9 @@ def mace_jobs(p, step, todo):
     state_file = d / "jobs.json"
     state = (json.loads(state_file.read_text()) if state_file.exists()
              else {"jobs": [], "tries": {}})
-    template, stop = p.mace_template(), p.dir / "STOP"
-    pack = p.s.mace_pack or max(1, (args.cores_per_node or p.s.mace_threads) // p.s.mace_threads)
+    run = p.mace_settings(step)
+    template, stop = p.mace_template(step), p.dir / "STOP"
+    pack = run.mace_pack or max(1, (args.cores_per_node or run.mace_threads) // run.mace_threads)
     label = STEP_INDEX[step].label
     model = p.mace_model_file() if any(not t.get("model") for t in todo) else None
     announced = False
@@ -2295,7 +2622,8 @@ def mace_jobs(p, step, todo):
     def why_ended(jdir):
         outs = sorted(jdir.glob("slurm-*.out"))
         if any("DUE TO TIME LIMIT" in f.read_text(errors="replace") for f in outs):
-            return "Slurm stopped it at its time limit (give mace_jobscript a longer --time)"
+            return ("Slurm stopped it at its time limit (give the jobs longer: max_walltime "
+                    f"in %block runner_{step}, or a longer --time in the template)")
         for f in sorted(jdir.glob("worker_*.log")) + outs:
             lines = [x.strip() for x in f.read_text(errors="replace").splitlines() if x.strip()]
             if lines:
@@ -2305,7 +2633,7 @@ def mace_jobs(p, step, todo):
     # Writes the scripts of new jobs for some relaxations into a folder each (its task files, one
     # per worker, and job.sh); returns [(folder, [cache files])].
     def write_jobs(tasks, where):
-        n_jobs = min(p.s.mace_max_jobs, math.ceil(len(tasks) / pack))
+        n_jobs = min(run.mace_max_jobs, math.ceil(len(tasks) / pack))
         slots = [{"tasks": [], "atoms": 0} for _ in range(min(len(tasks), n_jobs * pack))]
         for t in sorted(tasks, key=lambda t: -len(t["atoms"])):
             s = min(slots, key=lambda s: s["atoms"])
@@ -2319,7 +2647,7 @@ def mace_jobs(p, step, todo):
             for k, s in enumerate(slots[j::n_jobs]):
                 f = jdir / f"tasks_{k + 1:02d}.json"
                 f.write_text(json.dumps({
-                    "model": model, "device": p.s.mace_device, "threads": p.s.mace_threads,
+                    "model": model, "device": run.mace_device, "threads": run.mace_threads,
                     "fmax": p.s.mace_fmax, "steps": p.s.mace_steps,
                     "tasks": [dict({"cache": str(Path(t["cache"]).resolve()), "key": t["key"],
                                     "label": t["label"], "atoms": atoms_to_dict(t["atoms"])},
@@ -2333,15 +2661,17 @@ def mace_jobs(p, step, todo):
             i = next(k for k, line in enumerate(lines)
                      if "{COMMAND}" in line and not line.lstrip().startswith("#"))
             pre, post = lines[i].split("{COMMAND}", 1)
-            py, me = mace_python(p), str(Path(__file__).resolve())
-            run = [f"{pre}env OMP_NUM_THREADS={p.s.mace_threads} {shlex.quote(py)} "
+            py, me = mace_python(p, step), str(Path(__file__).resolve())
+            cmds = [f"{pre}env OMP_NUM_THREADS={run.mace_threads} {shlex.quote(py)} "
                    f"{shlex.quote(me)} --mace-worker {shlex.quote(str(f.resolve()))}{post} > "
                    f"{shlex.quote(str((jdir / f'worker_{k + 1:02d}.log').resolve()))} 2>&1 &"
                    for k, f in enumerate(files)]
-            run += ["wait", f"echo finished > {shlex.quote(str((jdir / 'finished').resolve()))}"]
-            text = "\n".join(lines[:i] + run + lines[i + 1:]) + "\n"
+            cmds += ["wait", f"echo finished > {shlex.quote(str((jdir / 'finished').resolve()))}"]
+            text = "\n".join(lines[:i] + cmds + lines[i + 1:]) + "\n"
+            if run.max_walltime:                           # the step's own block: the jobs' time
+                text = sc.add_sbatch_option(text, f"--time={run.max_walltime}")
             name = f"dwf_mace_{step}_{jdir.name}"
-            cores = len(files) * p.s.mace_threads          # (for a template that asks for cores)
+            cores = len(files) * run.mace_threads          # (for a template that asks for cores)
             (jdir / "job.sh").write_text(text.replace("{JOBNAME}", name)
                                          .replace("{NCORES}", str(cores)))
             made.append((jdir, caches))
@@ -2466,12 +2796,11 @@ def write_json(path, data):
 # A text table for summary.txt and the log: a title, a header row, a rule and the rows, in columns
 # as wide as needed (numbers to the right, text to the left). Floats are shown with 4 decimals,
 # None as blank.
-#   Called by: drelax_ranking(), ladder_table(), problem_table(), rank_model(), step_ccd(),
-#              step_check(), step_choose(), step_converge(), step_corrections(), step_dataset(),
-#              step_electronic(), step_excite(), step_filter(), step_formation(), step_generate(),
-#              step_hybrid(), step_interest(), step_limits(), step_lineshape(), step_phases(),
-#              step_prerelax(), step_rank(), step_relaxations(), step_scan(), step_search(),
-#              step_train(), step_validate(), step_zpl()
+#   Called by: drelax_ranking(), ladder_table(), problem_table(), step_ccd(), step_choose(),
+#              step_converge(), step_corrections(), step_electronic(), step_excite(), step_filter(),
+#              step_formation(), step_generate(), step_interest(), step_limits(), step_lineshape(),
+#              step_phases(), step_prerelax(), step_rank(), step_relaxations(), step_scan(),
+#              step_validate(), step_zpl()
 def format_table(header, rows, title=""):
     cells = [[("" if v is None else (f"{v:.4f}" if isinstance(v, float) else str(v)))
               for v in r] for r in rows]
@@ -2500,9 +2829,8 @@ def counts(atoms):
 
 
 # The tag of a charge state in job names (which can't hold + or -): q0, qp1, qm1, ...
-#   Called by: step_ccd(), step_check(), step_distort(), step_excite(), step_filter(),
-#              step_hybrid(), step_lineshape(), step_rank(), step_relaxations(), step_screen(),
-#              step_search(), step_validate(), step_zpl()
+#   Called by: step_ccd(), step_distort(), step_excite(), step_filter(), step_lineshape(),
+#              step_rank(), step_relaxations(), step_screen(), step_validate(), step_zpl()
 def qtag(q):
     return "q0" if q == 0 else f"q{'p' if q > 0 else 'm'}{abs(q)}"
 
@@ -2709,7 +3037,7 @@ def step_relax(p):
 
 # A2.2: band edges of the relaxed host from a single point on a Gamma-centred grid at
 # bands_kspacing (default half the production spacing): VBM, CBM and gap from the .bands file,
-# which the Fermi-level analysis (F2) also uses.
+# which the Fermi-level analysis (E2) also uses.
 #   Called by: main() (step A2.2)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              band_edges(), read_bands(), sc.kgrid()
@@ -2871,7 +3199,7 @@ def step_phases(p):
     phases = phase_list(p)
     if not phases:
         return {"phases": {}, "_note": "no competing phases given, so no chemical-potential "
-                "limits (F2 then gives energies without the mu terms)"}
+                "limits (E2 then gives energies without the mu terms)"}
     jobs = []
     for name, atoms, o in phases:
         mol = bool(o.get("molecule"))
@@ -3194,7 +3522,7 @@ def user_defects(p, prim):
 
 # A candidate record: its components, name, composition change and group (composition_change),
 # the separation of a pair, its orientational multiplicity and the number of anchor sites per
-# primitive cell (both for concentrations in F).
+# primitive cell (both for concentrations in E).
 #   Called by: generate(), user_defects()
 #   Calls:     composition_change(), defect_name()
 def candidate(prim, comps, sep, mult):
@@ -3397,7 +3725,7 @@ def inverse_n_fit(points):
 
 # B2: the size ladder (size_ladder: the supercell for each of scan_lengths) and, with mace : true
 # and scan : true, the MACE scan of every candidate. Each candidate is built in every size it fits
-# (fits) and relaxed with MACE (positions only, the host's lattice vectors kept, as in C and E;
+# (fits) and relaxed with MACE (positions only, the host's lattice vectors kept, as in C and D;
 # mace_model; mace_relaxations, on compute nodes with mace_jobscript). Its relaxation energy R
 # (unrelaxed - relaxed) shows whether the cell holds the relaxation. With scan_test : line (the
 # default) a candidate is converged at the smallest size from which R lies on a line
@@ -3608,7 +3936,7 @@ def gamma_floor(p, masses, depth=None):
     return best
 
 
-# B3: the screening cell, which every candidate in C (and D1-D4's data) is built in.
+# B3: the screening cell, which every candidate in C1-C3 is built in.
 # supercell if given (n x transform, or the most compact cell for a length); otherwise the smallest
 # size of the ladder at least as big as every candidate's converged size (B2; a candidate that never
 # converged counts as needing the largest size) and as the Gamma-only floor (gamma_floor), with
@@ -3695,9 +4023,9 @@ def edge_folding(masses, P):
 
 
 # B4: the electronic cell, the supercell the survivors move into after C3 and every judgement of a
-# defect's electronic structure is made in: C4-C5's distortions (distort_cell), D5's search, D7's
-# excited states, E's production runs, and so F and G (C1-C3, which screen every candidate, stay in
-# the screening cell, where they cost least). The screening cell (B3) is sized for the relaxation
+# defect's electronic structure is made in: C4-C6's distortions (distort_cell), C7's excited
+# states, D's production runs, and so E and F (C1-C3, which screen every candidate, stay in the
+# screening cell, where they cost least). The screening cell (B3) is sized for the relaxation
 # (B2) and for levels at least deep_level_margin inside the gap; at the semilocal level many levels
 # sit closer to the band edges than that, and a Gamma-point run only sees the host states whose
 # k-points fold onto its Gamma. So the electronic cell is the smallest size of the ladder, from the
@@ -3776,11 +4104,10 @@ def step_electronic(p):
 
 
 # ==========================================================================================
-# PHASE C: SCREENING (flowchart C1-C5)
+# PHASE C: SCREENING, GROUND AND EXCITED STATES (flowchart C1-C8)
 # ==========================================================================================
 # The candidates (B1) and the screening cell (B3): (candidates by id, primitive host, matrix).
-#   Called by: step_dataset(), step_distort(), step_filter(), step_prerelax(), step_screen(),
-#              step_search()
+#   Called by: step_distort(), step_filter(), step_prerelax(), step_screen()
 #   Calls:     Project.host()
 def screen_setup(p):
     return p.out("generate")["candidates"], p.host(), np.array(p.out("choose")["matrix"])
@@ -3788,8 +4115,7 @@ def screen_setup(p):
 
 # The .param keywords of the screening runs: screen_cutoff, screen_max_steps and
 # %block screen_overrides.
-#   Called by: excite_job(), run_screen_jobs(), screen_job(), step_check(), step_dataset(),
-#              step_excite(), step_screen()
+#   Called by: excite_job(), run_screen_jobs(), screen_job(), step_excite(), step_screen()
 def screen_overrides(p):
     o = {"geom_max_iter": p.s.screen_max_steps}
     if p.s.screen_cutoff:
@@ -4105,7 +4431,7 @@ def band_state_test(p, r, calc, nat, host):
 # can be compared); an arrangement is kept if its own lowest is within hull_margin of that
 # somewhere in the gap (one with no bound charge state at all can't be judged by it). Its stable
 # charge states are its bound ones that are its lowest somewhere in the gap. The gap is gap if the
-# project file gives it (an experimental or hybrid value), else the screening cell's own: a
+# project gives it (an experimental or hybrid value), else the screening cell's own: a
 # semilocal gap is too narrow, and a bound charge state that only becomes the lowest above its
 # conduction band edge (the formation energies carried on as the straight lines they are in the
 # Fermi level) still counts then; a band state can't, since its line is the carrier's band edge
@@ -4115,8 +4441,8 @@ def band_state_test(p, r, calc, nat, host):
 # (require_bound: the components must have been screened too) - each met by at least one stable
 # charge state. Arrangements that relaxed into the same structure as a lower one of their group in
 # every charge state both have (duplicates) are dropped too. With excite : true, native defects
-# (is_native) skip the property filters (D7 passes them on to E whatever their excited states, for
-# F), but not the hull or the duplicates.
+# (is_native) skip the property filters (C7 passes them on to D whatever their excited states, for
+# E), but not the hull or the duplicates.
 # The charge states each survivor carries on (distort_charges): relevant (the default) - its stable
 # ones, its other bound ones whose line comes within charge_margin of its lowest somewhere in the
 # gap (a distortion may lower one that much, C5's gain, and make it stable), and the band states
@@ -4285,7 +4611,7 @@ def step_filter(p):
                           else f"{q:+d}:-" for q in stable)
         notes = []
         if waived:
-            notes.append("native, so the property filters are waived for F: "
+            notes.append("native, so the property filters are waived for E: "
                          + "; ".join(failed + fixed))
         if pending:
             notes.append("pending: " + "; ".join(failed) + ", but "
@@ -4356,12 +4682,12 @@ def step_filter(p):
 
 
 # --------------------------------------------------------------------------
-# C4, C5: distortions, the start of the ground-state search that phase D carries on
+# C4, C5: distortions, the start of the ground-state search that C6 carries on
 # --------------------------------------------------------------------------
 # The oxidation states for counting the neighbours to distort: %block oxidation_states, else
 # pymatgen's guess for the host and, for each dopant, its common oxidation state closest to that
 # of the element it replaces (or its most positive one).
-#   Called by: step_distort(), step_search()
+#   Called by: step_distort()
 #   Calls:     sc.element()
 def oxidation_states(p, prim, cands):
     if p.s.oxidation_states:
@@ -4386,7 +4712,7 @@ def oxidation_states(p, prim, cands):
 # How many neighbours ShakeNBreak's rule distorts for a defect in charge state q: n = sum over the
 # components of -(oxidation state put there - that of the site) + q, and |n| neighbours if |n| <= 4,
 # else 8 - |n|.
-#   Called by: step_distort(), step_search()
+#   Called by: step_distort()
 def neighbours_to_distort(comps, q, ox):
     n = q
     for c in comps:
@@ -4399,9 +4725,8 @@ def neighbours_to_distort(comps, q, ox):
 
 # The final spin of a charge state's best screening run, as a starting spin with the right parity
 # for its electron count.
-#   Called by: step_ccd(), step_check(), step_distort(), step_excite(), step_filter(),
-#              step_hybrid(), step_lineshape(), step_rank(), step_relaxations(), step_search(),
-#              step_zpl(), validate_gamma()
+#   Called by: step_ccd(), step_distort(), step_excite(), step_filter(), step_lineshape(),
+#              step_rank(), step_relaxations(), step_zpl(), validate_gamma()
 #   Calls:     electron_parity()
 def start_spin(atoms, q, spin):
     par = electron_parity(atoms, q)
@@ -4420,7 +4745,7 @@ def start_spin(atoms, q, spin):
 # each: every component in turn; auto: a single defect's own site, the centre of a complex whose
 # components are all within PAIR_BOND_FACTOR host bond lengths (bond) of each other, else each
 # component. A single defect has one point whatever the mode.
-#   Called by: step_distort(), step_search()
+#   Called by: step_distort()
 def distortion_centres(atoms, comps, info, mode, bond):
     from ase.geometry import find_mic
     cell = np.asarray(atoms.cell)
@@ -4563,12 +4888,12 @@ def step_distort(p):
 
 
 # Runs a list of distortion-type jobs (name, cand, starting structure, q, spin) with the
-# screening settings in <phase>/jobs/<subdir> (C_screen/ for drelax, D_states/ for rank), with the
+# screening settings in <phase>/jobs/<subdir> (C_screen/ for drelax, C_screen/ for rank), with the
 # runner settings of the step that runs them, and returns ({name: job_summary}, {cell tag: its
 # band edges}), the final structures saved in <phase>/structures/<structdir>. A job in another
 # cell than the screening cell (its 'matrix' and 'cell': C4's in the electronic cell) has its
 # defect found in that cell (build_defect) and its levels and band carriers measured against that
-# cell's own band edges at the same settings: those given for its cell in edges (C5's, for D6),
+# cell's own band edges at the same settings: those given for its cell in edges (C5's, for C6),
 # else from a single point of its pristine supercell in the same batch (host_<cell tag>).
 # (None, None) while the batch hasn't finished.
 #   Called by: step_drelax(), step_rank()
@@ -4645,10 +4970,10 @@ def step_energies(text, which="auto"):
 # undistorted job; with distort_cell : screening, C2's screened run). Runs that relaxed into the
 # same structure (same_structures, tried only for energies within RANK_E_TOL) share a letter, A the
 # lowest. A charge state has a new minimum when its lowest structure is not the start's and is
-# lower by at least distortion_min_gain (D6's test). Runs without a usable energy come last, with
+# lower by at least distortion_min_gain (C6's test). Runs without a usable energy come last, with
 # the lowest of their steps whose SCF converged (step_energies); a run with steps whose SCF did
-# not converge says how many (D1 trains on every step). Returns (the tables, the charge states
-# with a new minimum, all charge states).
+# not converge says how many. Returns (the tables, the charge states with a new minimum, all
+# charge states).
 #   Called by: step_drelax()
 #   Calls:     format_table(), load_cell(), same_structures(), step_energies()
 def drelax_ranking(p, runs):
@@ -4746,10 +5071,9 @@ def drelax_ranking(p, runs):
 
 
 # C5: relaxes every structure C4 made with the screening settings (C2's, Gamma point, no
-# restarts), in the cell C4 made it in, against that cell's band edges (run_screen_jobs). Each
-# run's .castep keeps every geometry step (energies and forces): D1's training data. Its summary
-# ranks every relaxation of each charge state against its start (drelax_ranking), so whether a
-# distortion found a new minimum can be looked at before phase D (--until C5).
+# restarts), in the cell C4 made it in, against that cell's band edges (run_screen_jobs). Its
+# summary ranks every relaxation of each charge state against its start (drelax_ranking), so
+# whether a distortion found a new minimum can be looked at before C6 (--until C5).
 #   Called by: main() (step C5)
 #   Calls:     drelax_ranking(), problem_table(), run_screen_jobs()
 def step_drelax(p):
@@ -4771,7 +5095,7 @@ def step_drelax(p):
 # atom (all come from the same cell with the same atom order). The tolerances are tight (stol 0.05,
 # i.e. about 0.1 A for a typical oxide): defect ground states can differ by a few tenths of an
 # Angstrom around the defect, which pymatgen's defaults would merge.
-#   Called by: distinct_states(), drelax_ranking(), duplicates(), step_rank(), step_search()
+#   Called by: distinct_states(), drelax_ranking(), duplicates(), step_rank()
 #   Calls:     sc.displacements()
 def same_structures(atoms_list):
     try:
@@ -4800,70 +5124,13 @@ def same_structures(atoms_list):
     return groups
 
 
-# ==========================================================================================
-# PHASE D: GROUND AND EXCITED STATES (flowchart D1-D8)
-# ==========================================================================================
 # --------------------------------------------------------------------------
-# D1-D5: the ground-state model (model : true)
+# Training data and model jobs (F2's model of the production runs)
 # --------------------------------------------------------------------------
-# After Wang, Mosquera-Lois and Walsh (arXiv:2603.05238): a MACE model for each defect, trained on
-# its own C5 relaxations (a 'pbe' head) and on hybrid single points of a tenth of them (an 'hse'
-# head, on the same representation), with a learned embedding of the total charge, so one model
-# covers every charge state. Its hybrid head then relaxes far more starting structures than C4-C5
-# can (D5), at about the hybrid level. Like everything after C3, all of it happens in the cell the
-# survivors work in (work_cell): the electronic cell by default.
-
-# The cell the survivors work in after C3, C4's (distort_cell): the electronic cell by default.
-# Returns (its matrix, its tag, the end of the names of jobs in it: '_<tag>', or '' in the
-# screening cell).
-#   Called by: step_check(), step_dataset(), step_hybrid()
-def work_cell(p):
-    c4, choose = p.out("distort"), p.out("choose")
-    if c4.get("electronic"):
-        return np.array(c4["cell"]["matrix"]), c4["cell"]["tag"], f"_{c4['cell']['tag']}"
-    return np.array(choose["matrix"]), choose["tag"], ""
-
-
-# The defects D1-D5 model: C3's survivors, each with the charge states it carries on.
-#   Called by: step_dataset(), step_search()
-def model_defects(p):
-    return {s["cand"]: sorted(s["charges"]) for s in p.out("filter")["survivors"]}
-
-
-# A survivor's (s, C3's) lowest relaxed structure in charge state q, in the cell C4 worked in (its
-# 'cell'; energies compare only within one cell): the lowest of its C5 runs there, and, when that
-# is the screening cell, of its screened one (C2) too; when none of those has an energy, its
-# screened structure. Returns (the run, with 'step' C2 or C5, its supercell matrix), or
-# (None, None).
-#   Called by: step_check(), step_search()
-def lowest_start(p, s, q):
-    P0 = p.out("choose")["matrix"]
-    M = (p.out("distort").get("cell") or {}).get("matrix") or P0
-    runs = [dict(r, name=name, step="C5") for name, r in p.out("drelax")["runs"].items()
-            if r["cand"] == s["cand"] and r["q"] == q and (r.get("matrix") or P0) == M]
-    b = s["best"].get(str(q))
-    screened = [dict(b, step="C2", matrix=P0)] if b else []
-    for pool in (runs + (screened if M == P0 else []), screened):
-        pool = [r for r in pool if r.get("energy") is not None and r.get("structure")]
-        if pool:
-            best = min(pool, key=lambda r: r["energy"])
-            return best, best.get("matrix") or P0
-    return None, None
-
-
-# A folder of the model's files: D_states/model/<part>/<defect>.
-#   Called by: step_dataset(), step_hybrid(), train_tasks()
-def model_dir(p, part, cid):
-    d = p.phase_dir("D") / "model" / part / cid
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 # Every geometry step of a .castep as a training structure (read_trajectory, with the free energy
 # E-TS that the forces belong to): ASE Atoms with info REF_energy, total_charge (q), run (the job),
-# step, spin (the run's final spin, a starting spin for a hybrid single point) and arrays
-# REF_forces.
-#   Called by: step_check(), step_dataset(), step_hybrid(), step_lineshape()
+# step, spin (the run's final spin) and arrays REF_forces.
+#   Called by: step_lineshape()
 #   Calls:     read_trajectory()
 def castep_frames(path, q, spin, run):
     out = []
@@ -4876,11 +5143,11 @@ def castep_frames(path, q, spin, run):
     return out
 
 
-# D1's filters, as in the paper: a structure more than MODEL_E_WINDOW above the lowest of its
-# charge state in its cell (its number of atoms: C5 also relaxes band states in the electronic
-# cell), with two atoms closer than MODEL_MIN_DIST, or a force above MODEL_MAX_FORCE (the first
+# The filters of F2's training data, after Wang, Mosquera-Lois and Walsh (arXiv:2603.05238): a
+# structure more than MODEL_E_WINDOW above the lowest of its charge state in its cell (its number
+# of atoms), with two atoms closer than MODEL_MIN_DIST, or a force above MODEL_MAX_FORCE (the first
 # steps of a wild distortion) is left out. Returns the structures kept.
-#   Called by: step_dataset(), step_lineshape()
+#   Called by: step_lineshape()
 def filter_frames(frames):
 
     # What a structure's energy is compared within: its charge and its number of atoms.
@@ -4903,248 +5170,15 @@ def filter_frames(frames):
     return out
 
 
-# D1: the training set of each defect C3 kept (model_defects), in the cell the survivors work in
-# (work_cell: the electronic cell by default): every geometry step of its C5 relaxations in the
-# charge states it carries on (castep_frames, at the screening settings: the 'pbe' head; with
-# distort_cell : screening, C2's too, which are in the same cell), and model_rattles pristine
-# supercells of that cell with random displacements (model_rattle_stdev; single points at the
-# screening settings, D_states/jobs/dataset), filtered (filter_frames) and split
-# MODEL_TEST_FRACTION for testing, the rest for training (a fixed seed; info 'split'), in
-# D_states/model/data/<defect>/pbe_train.xyz and pbe_test.xyz. Each structure's info 'supercell'
-# is its cell's tag.
-#   Called by: main() (step D1)
-#   Calls:     Project.batch(), Project.production_param(), castep_frames(), filter_frames(),
-#              format_table(), host_supercell(), model_defects(), model_dir(), screen_overrides(),
-#              screen_setup(), work_cell()
-def step_dataset(p):
-    if not p.s.model:
-        return {"skipped": True, "_note": "model : false (D6 ranks C5's relaxations)"}
-    import ase.io
-    cands, prim, _ = screen_setup(p)
-    M, tag, end = work_cell(p)
-    defs = model_defects(p)
-    host = host_supercell(prim, M)
-    rng = np.random.default_rng(MODEL_SEED)
-    jobs = []
-    for k in range(p.s.model_rattles):
-        a = host.copy()
-        a.positions += rng.normal(0.0, p.s.model_rattle_stdev, a.positions.shape)
-        jobs.append({"name": f"host_r{k + 1}{end}", "atoms": a, "kind": "sp", "kgrid": [1, 1, 1],
-                     "symmetry": False, "overrides": {k: v for k, v in screen_overrides(p).items()
-                                                      if k != "geom_max_iter"}})
-    hosts = []
-    if jobs:
-        res = p.batch(f"{PHASE_DIRS['D']}/jobs/dataset", jobs, "dataset", p.production_param())
-        if not res["complete"]:
-            return None
-        for j in jobs:
-            c = res["calcs"][j["name"]]
-            if res["jobs"][j["name"]]["energy"] is not None:
-                for a in castep_frames(c.castep, 0, 0.0, j["name"]):
-                    a.info["supercell"] = tag
-                    hosts.append(a)
-    sources = [(p.out("drelax")["runs"], "drelax")]
-    if not end:                           # (C4 worked in the screening cell, where C2's runs are)
-        sources.insert(0, (p.out("screen")["runs"], "screen"))
-    tag0 = p.out("choose")["tag"]
-    out, rows = {}, []
-    for cid, qs in sorted(defs.items()):
-        frames = []
-        for runs, sub in sources:
-            for name, r in sorted(runs.items()):
-                f = p.dir / PHASE_DIRS["C"] / "jobs" / sub / name / f"{name}.castep"
-                if r["cand"] == cid and r["q"] in qs and f.exists():
-                    for a in castep_frames(f, r["q"], r.get("spin"), name):
-                        a.info["supercell"] = r.get("cell") or tag0
-                        frames.append(a)
-        kept = filter_frames(frames) + hosts
-        order = np.random.default_rng(MODEL_SEED).permutation(len(kept))
-        ntest = int(round(MODEL_TEST_FRACTION * len(kept)))
-        for n, i in enumerate(order):
-            kept[i].info["split"] = "test" if n < ntest else "train"
-        d = model_dir(p, "data", cid)
-        files = {}
-        for split in ("train", "test"):
-            sel = [a for a in kept if a.info["split"] == split]
-            if sel:
-                ase.io.write(str(d / f"pbe_{split}.xyz"), sel, format="extxyz")
-                files[split] = str((d / f"pbe_{split}.xyz").relative_to(p.dir))
-        out[cid] = {"charges": qs, "steps": len(frames), "kept": len(kept) - len(hosts),
-                    "host": len(hosts), "files": files}
-        rows.append([cid, cands[cid]["name"], " ".join(f"{q:+d}" for q in qs), len(frames),
-                     len(kept) - len(hosts), len(hosts),
-                     sum(a.info["split"] == "train" for a in kept),
-                     sum(a.info["split"] == "test" for a in kept)])
-    table = format_table(["id", "defect", "charges", "steps", "kept", "host", "train", "test"],
-                         rows, f"Training data in {tag} (the geometry steps of the runs there; "
-                               f"kept: within {MODEL_E_WINDOW:g} eV of the lowest of their "
-                               f"charge state and cell, no atoms closer than {MODEL_MIN_DIST:g} "
-                               f"A, no force above {MODEL_MAX_FORCE:g} eV/A)")
-    return {"defects": out, "cell": tag, "_table": table,
-            "_note": f"{len(out)} defects, {sum(x['kept'] for x in out.values())} structures "
-                     f"in {tag}"}
-
-
-# The root-mean-square displacement (Ang) between two structures of the same atoms in the same
-# cell, each atom to the nearest image of its partner.
-#   Called by: hybrid_picks()
-def rms_displacement(a, b):
-    d = np.asarray(b.positions) - np.asarray(a.positions)
-    cell = np.asarray(a.cell)
-    f = np.linalg.solve(cell.T, d.T).T
-    d = (f - np.round(f)) @ cell
-    return float(np.sqrt(np.mean(np.sum(d * d, axis=1))))
-
-
-# The structures D2 recomputes with the hybrid: budget of a defect's D1 structures
-# (model_hybrid_points), shared out over its charge states as evenly as they allow (at least one
-# each, so a charge state is never left without hybrid data). In each charge state the pool is the
-# first and last step of each relaxation (the structures the paper always took): its lowest
-# structure first (the minimum the search starts near), then farthest-point sampling, each next
-# pick the pool structure furthest from those already picked (rms_displacement: atoms far from the
-# defect barely move, so this measures the distortion), so a few single points span the distortions
-# and minima the relaxations reached; a charge state with more picks than its pool takes the rest
-# of its steps the same way. The rattled pristine cells (runs host_*) are left out (D2 adds one).
-# Returns the indices of the picks.
-#   Called by: step_hybrid()
-#   Calls:     rms_displacement()
-def hybrid_picks(frames, budget):
-    groups = {}
-    for i, a in enumerate(frames):
-        if not str(a.info.get("run", "")).startswith("host_"):
-            groups.setdefault((int(a.info["total_charge"]), len(a)), []).append(i)
-    if not groups:
-        return []
-    keys = sorted(groups)
-    share = {k: max(1, budget // len(keys)) for k in keys}
-    spare = max(0, budget - sum(share.values()))          # to the charge states with most steps
-    for k in sorted(keys, key=lambda k: (-len(groups[k]), k))[:spare]:
-        share[k] += 1
-    picks = []
-    for k in keys:
-        runs = {}
-        for i in groups[k]:
-            runs.setdefault(frames[i].info.get("run", ""), []).append(i)
-        pool = set()
-        for idx in runs.values():
-            idx = sorted(idx, key=lambda i: frames[i].info.get("step", 0))
-            pool.update({idx[0], idx[-1]})
-        chosen = [min(sorted(pool), key=lambda i: frames[i].info["REF_energy"])]
-        for cands in (sorted(pool), [i for i in groups[k] if i not in pool]):
-            dmin = {i: min(rms_displacement(frames[i], frames[c]) for c in chosen)
-                    for i in cands if i not in chosen}
-            while len(chosen) < share[k] and dmin:
-                j = max(dmin, key=lambda i: (dmin[i], -i))
-                chosen.append(j)
-                del dmin[j]
-                for i in dmin:
-                    dmin[i] = min(dmin[i], rms_displacement(frames[i], frames[j]))
-        picks += chosen
-    return sorted(picks)
-
-
-# D2 (model_hybrid : true): hybrid single points (hybrid_param, e.g. xc_functional : HSE06, and
-# hybrid_cell, its species_pot with norm-conserving potentials, which CASTEP's non-local exchange
-# needs) of model_hybrid_points of each defect's D1 structures (hybrid_picks: shared out over its
-# charge states, the lowest first, then the most different) and of one rattled pristine cell
-# (shared by every defect: one job), at Gamma, in their charge state with their run's spin to
-# start, in the cell they are in: the one the survivors work in after C3 (work_cell; the
-# electronic cell by default, where a hybrid costs many times what it does in the screening cell).
-# They run in D_states/jobs/hybrid (runner group 'hybrid'). They are too few to hold any back for
-# testing: all are the 'hse' head's training data, in D_states/model/hybrid/<defect>/hse_train.xyz
-# (D4's hybrid single points at the model's minima test it). With model_hybrid : false the model
-# has the 'pbe' head only, and D5 searches with it.
-#   Called by: main() (step D2)
-#   Calls:     Project.batch(), Project.file(), castep_frames(), format_table(), hybrid_picks(),
-#              model_dir(), qtag(), start_spin(), work_cell()
-def step_hybrid(p):
-    if not (p.s.model and p.s.model_hybrid):
-        return {"skipped": True, "_note": "no hybrid head (model or model_hybrid false)"}
-    import ase.io
-    data = p.out("dataset")["defects"]
-    param, cell = p.file("hybrid_param").read_text(), p.file("hybrid_cell").read_text()
-    _, tag, end = work_cell(p)
-    jobs, meta, picked = [], {}, {}
-
-    # A hybrid single point of the structure a, as the job name, for the defect cid (a job that is
-    # already there, the shared pristine cell, is given to cid as well).
-    def add(name, a, cid):
-        if name in meta:
-            meta[name][0].append(cid)
-            return
-        q = int(a.info["total_charge"])
-        atoms = Atoms(a.get_chemical_symbols(), positions=a.positions, cell=a.cell, pbc=True)
-        S = start_spin(atoms, q, a.info.get("spin"))
-        jobs.append({"name": name, "atoms": atoms, "kind": "sp", "kgrid": [1, 1, 1],
-                     "symmetry": False,
-                     "overrides": {"charge": q, "spin": S, "spin_polarized": "true"}})
-        meta[name] = ([cid], q, a.info.get("run", ""), S)
-
-    for cid, x in sorted(data.items()):
-        frames = []
-        for split in ("train", "test"):
-            if split in x["files"]:
-                frames += ase.io.read(str(p.dir / x["files"][split]), ":")
-        picks = hybrid_picks(frames, p.s.model_hybrid_points)
-        if len(picks) > p.s.model_hybrid_points:
-            log(f"note: D2: {cid} has more charge states than model_hybrid_points "
-                f"({p.s.model_hybrid_points}): one hybrid single point in each")
-        counts = {}
-        for n, i in enumerate(picks):
-            q = int(frames[i].info["total_charge"])
-            counts[q] = counts.get(q, 0) + 1
-            add(f"{cid}_{qtag(q)}_h{n + 1:04d}{end}", frames[i], cid)
-        hosts = sorted((a for a in frames if str(a.info.get("run", "")).startswith("host_")),
-                       key=lambda a: (len(a.info["run"]), a.info["run"]))
-        if hosts:
-            add(f"hse_{hosts[0].info['run']}", hosts[0], cid)
-        picked[cid] = (", ".join(f"{q:+d}: {n}" for q, n in sorted(counts.items()))
-                       + (", host: 1" if hosts else ""))
-    res = p.batch(f"{PHASE_DIRS['D']}/jobs/hybrid", jobs, "hybrid", param, cell_text=cell)
-    if not res["complete"]:
-        return None
-    got, rows, ndone = {}, [], 0
-    for name, (cids, q, run, S) in meta.items():
-        r = res["jobs"][name]
-        if r["energy"] is None or not r["scf_converged"]:
-            continue
-        ndone += 1
-        for a in castep_frames(res["calcs"][name].castep, q, S, run):
-            a.info["split"] = "train"
-            for cid in cids:
-                got.setdefault(cid, []).append(a)
-    out = {}
-    for cid in sorted(data):
-        frames = got.get(cid, [])
-        d = model_dir(p, "hybrid", cid)
-        files = {}
-        if frames:
-            ase.io.write(str(d / "hse_train.xyz"), frames, format="extxyz")
-            files["train"] = str((d / "hse_train.xyz").relative_to(p.dir))
-        if (d / "hse_test.xyz").exists():          # (left by an older dwf.py, which held some back)
-            (d / "hse_test.xyz").unlink()
-        asked = sum(1 for m in meta.values() if cid in m[0])
-        out[cid] = {"asked": asked, "done": len(frames), "files": files}
-        rows.append([cid, picked.get(cid, ""), asked, len(frames)])
-        if not frames:
-            log(f"WARNING: D2: no hybrid single point of {cid} finished (or printed forces): its "
-                "model will have no 'hse' head data")
-    table = format_table(["id", "picks (per charge state)", "asked", "finished"], rows,
-                         f"Hybrid single points for the 'hse' head, in {tag} "
-                         f"(model_hybrid_points {p.s.model_hybrid_points} per defect)")
-    return {"defects": out, "_table": table,
-            "_note": f"{ndone} of {len(meta)} hybrid single points finished"}
-
-
 # The mace_run_train command of a defect's model, run in its folder (the training files copied
-# there): heads 'pbe' (and 'hse' when there is hybrid data), each with its train and test file,
+# there): its heads (F2's model has one, 'pbe'), each with its train and test file,
 # validated on 10 % of its training set, or on its own training structures ({head}_valid.xyz) when
 # it has too few to hold some back (heads: [(head, has a test file, validated on its own)]), and
 # E0s fitted to the data (average); the total charge as a categorical embedding (CHARGE_CLASSES
 # classes from -CHARGE_OFFSET); trained from scratch (multiheads_finetuning off); model_r_max,
 # model_channels, model_max_L, model_batch, model_epochs, model_device (default mace_device) and
 # model_train_args added at the end.
-#   Called by: step_lineshape(), train_tasks()
+#   Called by: step_lineshape()
 def train_command(p, heads):
     hd = {h: {"train_file": f"{h}_train.xyz",
               **({"valid_file": f"{h}_valid.xyz"} if own else {"valid_fraction": 0.1}),
@@ -5163,59 +5197,8 @@ def train_command(p, heads):
             f"--device={p.s.model_device or p.s.mace_device} {p.s.model_train_args}").strip()
 
 
-# The training of some defects' models: for each, a folder (part/<defect>) with its data (the
-# D1 and D2 files, and extra structures added by D4: extra {defect: {head: [Atoms]}}) and
-# train.sh (a changed training set clears the folder's old model: check_training). The 'hse'
-# head's structures are repeated until they are about MODEL_HSE_SHARE of the 'pbe' head's, as the
-# hybrid data were in the paper: D2 recomputes only a few structures (model_hybrid_points), and
-# otherwise the training would hardly see them. A head with fewer than MODEL_HOLDOUT_MIN
-# structures, or repeated ones, is validated on its own structures ({head}_valid.xyz, each once),
-# so none is held back (D4's single points at the model's minima test the 'hse' head).
-# Returns [{'cid', 'dir', 'command', 'heads'}].
-#   Called by: step_check(), step_train()
-#   Calls:     check_training(), model_dir(), train_command()
-def train_tasks(p, part, cids, extra=None, base=None):
-    import ase.io
-    tasks = []
-    for cid in cids:
-        d = model_dir(p, part, cid)
-        heads, npbe = [], 0
-        for head, step in (("pbe", "dataset"), ("hse", "hybrid")):
-            files = ((p.out(step).get("defects") or {}).get(cid) or {}).get("files") or {}
-            frames = {s: (ase.io.read(str(p.dir / files[s]), ":") if s in files else [])
-                      for s in ("train", "test")}
-            if base:                               # the previous round's training sets, each once
-                prev = next((f for f in (base / cid / f"{head}_valid.xyz",
-                                         base / cid / f"{head}_train.xyz") if f.exists()), None)
-                frames["train"] = ase.io.read(str(prev), ":") if prev else []
-            frames["train"] += (extra or {}).get(cid, {}).get(head, [])
-            if not frames["train"]:
-                continue
-            unique = frames["train"]
-            reps = 1
-            if head == "pbe":
-                npbe = len(unique)
-            else:
-                reps = max(1, math.ceil(MODEL_HSE_SHARE * npbe / len(unique)))
-                frames["train"] = unique * reps
-            own = reps > 1 or len(unique) < MODEL_HOLDOUT_MIN
-            for s, sel in dict(frames, valid=unique if own else []).items():
-                f = d / f"{head}_{s}.xyz"
-                if sel:
-                    ase.io.write(str(f), sel, format="extxyz")
-                elif f.exists():                   # (a set this round doesn't have)
-                    f.unlink()
-            heads.append((head, bool(frames["test"]), own))
-        cmd = train_command(p, heads)
-        (d / "train.sh").write_text("#!/bin/bash\n# The ground-state model of "
-                                    f"{cid} (dwf.py)\n{cmd}\n")
-        check_training(d, cmd)
-        tasks.append({"cid": cid, "dir": d, "command": cmd, "heads": [h[0] for h in heads]})
-    return tasks
-
-
 # The model file a training wrote in its folder (the second stage's, if there is one), or None.
-#   Called by: run_training(), step_check(), step_lineshape(), step_train()
+#   Called by: run_training(), step_lineshape()
 def trained_model(d):
     for name in ("model_stagetwo.model", "model.model"):
         if (Path(d) / name).exists():
@@ -5223,8 +5206,8 @@ def trained_model(d):
     return None
 
 
-# Runs model jobs until each has made what it makes: trainings (train_tasks; done when its folder
-# has a model, trained_model) and G2's phonon calculations (a task's own 'done' file). With
+# Runs model jobs until each has made what it makes: F2's trainings (done when its folder has a
+# model, trained_model) and its phonon calculations (a task's own 'done' file). With
 # model_jobscript as batch jobs (the template's {COMMAND} line becomes 'cd <folder> && <command> >
 # <log> 2>&1', the task's 'log', default train.log; {JOBNAME} and {NCORES} filled in; submitted
 # with the runner's submit_cmd, polled every poll s; --prepare-only writes them only, --no-wait
@@ -5232,7 +5215,7 @@ def trained_model(d):
 # the run with the end of its log. A task: {'cid' (its name), 'dir', 'command', and optionally
 # 'done', 'log', 'what' (for messages, default 'training') and 'job' (the job name's prefix)}.
 # Returns True when every task is done.
-#   Called by: step_check(), step_lineshape(), step_train()
+#   Called by: step_lineshape()
 #   Calls:     Project.mace_runner(), Project.template(), sc.job_active(), sc.send_job(),
 #              trained_model(), write_json()
 def run_training(p, label, tasks):
@@ -5306,311 +5289,8 @@ def run_training(p, label, tasks):
         time.sleep(args.poll)
 
 
-# D3: trains each defect's model (train_tasks, run_training) in D_states/model/train/<defect>:
-# heads 'pbe' and, with hybrid data, 'hse', a total-charge embedding, from scratch.
-#   Called by: main() (step D3)
-#   Calls:     format_table(), run_training(), train_tasks(), trained_model()
-def step_train(p):
-    if not p.s.model:
-        return {"skipped": True, "_note": "model : false"}
-    tasks = train_tasks(p, "train", sorted(p.out("dataset")["defects"]))
-    if not run_training(p, "D3", tasks):
-        return None
-    models = {t["cid"]: {"model": str(trained_model(t["dir"]).relative_to(p.dir)),
-                         "heads": t["heads"]} for t in tasks}
-    table = format_table(["id", "heads", "model"],
-                         [[c, " ".join(m["heads"]), m["model"]] for c, m in sorted(models.items())],
-                         "The ground-state models")
-    return {"models": models, "_table": table, "_note": f"{len(models)} models trained"}
-
-
-# A model's errors on structures with reference energies and forces (one head): the root mean
-# square error of the energy per atom (meV/atom) and of the force components (meV/A), or None
-# without structures.
-#   Called by: step_check()
-#   Calls:     Project.mace()
-def model_errors(p, model, head, frames):
-    if not frames:
-        return None
-    calc = p.mace(model, head)
-    de, df = [], []
-    for a in frames:
-        b = a.copy()
-        b.info["charge"] = a.info["total_charge"]
-        b.calc = calc
-        de.append((b.get_potential_energy() - a.info["REF_energy"]) / len(a))
-        df.append((b.get_forces() - a.arrays["REF_forces"]).ravel())
-    return {"E": round(1000 * float(np.sqrt(np.mean(np.square(de)))), 2),
-            "F": round(1000 * float(np.sqrt(np.mean(np.square(np.concatenate(df))))), 2)}
-
-
-# D4: checks each defect's model, in up to model_rounds rounds, in the cell the survivors work in
-# (work_cell: the electronic cell by default). Each round: its errors on the test structures of
-# each head (model_errors), then its minimum in each charge state (its lowest C2/C5 structure,
-# lowest_start, relaxed with the search head, 'hse' when there is one, to search_fmax), and single
-# points there with the hybrid (when the model has an 'hse' head) and at the screening settings
-# (D_states/jobs/check_r<n>): the model's minimum is good if the DFT
-# force on every atom is below model_force_tol (the search head's level). If not, those single
-# points are added to the training data and the model is trained again
-# (D_states/model/check/round_<n>/<defect>). The results give the model each defect's search
-# uses (the last one trained).
-#   Called by: main() (step D4)
-#   Calls:     Project.batch(), Project.file(), Project.host(), Project.production_param(),
-#              build_defect(), carry_over(), castep_frames(), format_table(), load_cell(),
-#              lowest_start(), mace_relaxations(), model_errors(), qtag(), run_training(),
-#              screen_overrides(), start_spin(), train_tasks(), trained_model(), work_cell()
-def step_check(p):
-    if not p.s.model:
-        return {"skipped": True, "_note": "model : false"}
-    import ase.io
-    trained = p.out("train")["models"]
-    hybrid = p.s.model_hybrid and any("hse" in m["heads"] for m in trained.values())
-    head = "hse" if hybrid else "pbe"
-    survivors = {s["cand"]: s for s in p.out("filter")["survivors"]}
-    cands = p.out("generate")["candidates"]
-    models = {cid: p.dir / m["model"] for cid, m in trained.items()}
-    M, tag, end = work_cell(p)
-    rounds, extra = {}, {}
-    for rnd in range(1, p.s.model_rounds + 1):
-        tasks, meta = [], {}
-        for cid, model in sorted(models.items()):
-            for q in survivors[cid]["charges"]:
-                b, Mb = lowest_start(p, survivors[cid], q)
-                if b is None:
-                    continue
-                name = f"{cid}_{qtag(q)}_r{rnd}{end}"
-                atoms = load_cell(p, b["structure"])
-                if not np.array_equal(np.array(Mb), M):        # (its screened structure, C2)
-                    atoms = carry_over(p.host(), cands[cid]["comps"], np.array(Mb), atoms, M,
-                                       label=f"{cid} ({cands[cid]['name']})")[0]
-                tasks.append({"atoms": atoms, "label": name,
-                              "cache": p.phase_dir("D") / "mace" / "check" / f"{name}.json",
-                              "model": str(model), "head": head, "charge": q,
-                              "fmax": p.s.search_fmax, "steps": p.s.search_steps})
-                meta[name] = (cid, q, b.get("spin"))
-        relaxed = mace_relaxations(p, "check", tasks)
-        if relaxed is None:
-            return None
-        jobs = {"pbe": [], "hse": []}
-        for t in tasks:
-            cid, q, spin = meta[t["label"]]
-            atoms = relaxed[str(t["cache"])][0]
-            info = build_defect(p.host(), M, cands[cid]["comps"], cid)[1]
-            S = start_spin(atoms, q, spin)
-            mags = np.zeros(len(atoms))
-            if S and info.get("anchor_index") is not None:
-                mags[info["anchor_index"]] = S
-            atoms.set_initial_magnetic_moments(mags)
-            o = {"charge": q, "spin": S, "spin_polarized": "true"}
-            jobs["pbe"].append({"name": t["label"], "atoms": atoms, "kind": "sp",
-                                "kgrid": [1, 1, 1], "symmetry": False,
-                                "overrides": dict({k: v for k, v in screen_overrides(p).items()
-                                                   if k != "geom_max_iter"}, **o)})
-            if hybrid:
-                jobs["hse"].append(dict(jobs["pbe"][-1], overrides=dict(o)))
-        res = {"pbe": p.batch(f"{PHASE_DIRS['D']}/jobs/check_r{rnd}", jobs["pbe"], "check",
-                              p.production_param())}
-        if hybrid:
-            res["hse"] = p.batch(f"{PHASE_DIRS['D']}/jobs/check_r{rnd}_hse", jobs["hse"],
-                                 "check", p.file("hybrid_param").read_text(),
-                                 cell_text=p.file("hybrid_cell").read_text())
-        if not all(r["complete"] for r in res.values()):
-            return None
-        rows, failed, new = [], set(), {}
-        for t in tasks:
-            cid, q, spin = meta[t["label"]]
-            got = {}
-            for h, r in res.items():
-                rr = r["jobs"][t["label"]]
-                if rr["energy"] is None:
-                    continue
-                fr = castep_frames(r["calcs"][t["label"]].castep, q, spin, t["label"])
-                if fr:
-                    got[h] = fr[-1]
-                    new.setdefault(cid, {}).setdefault(h, []).append(fr[-1])
-            ref = got.get(head)
-            fmax = (None if ref is None else
-                    float(np.linalg.norm(ref.arrays["REF_forces"], axis=1).max()))
-            ok = fmax is not None and fmax <= p.s.model_force_tol
-            if not ok:
-                failed.add(cid)
-            rows.append([rnd, cid, f"{q:+d}", fmax, "yes" if ok else "NO"])
-        errs = {}
-        for cid, model in sorted(models.items()):
-            errs[cid] = {}
-            for h, step in (("pbe", "dataset"), ("hse", "hybrid")):
-                files = ((p.out(step).get("defects") or {}).get(cid) or {}).get("files") or {}
-                if "test" in files and (h == "pbe" or hybrid):
-                    errs[cid][h] = model_errors(p, str(model), h,
-                                                ase.io.read(str(p.dir / files["test"]), ":"))
-        rounds[rnd] = {"errors": errs, "forces": rows, "failed": sorted(failed)}
-        if not failed or rnd == p.s.model_rounds:
-            break
-        for cid in failed:                         # add the new single points, train again
-            for h, frames in new.get(cid, {}).items():
-                extra.setdefault(cid, {}).setdefault(h, []).extend(frames)
-        prev = (p.phase_dir("D") / "model" / "train" if rnd == 1 else
-                p.phase_dir("D") / "model" / "check" / f"round_{rnd}")
-        tasks2 = train_tasks(p, f"check/round_{rnd + 1}", sorted(failed),
-                             {c: extra[c] for c in failed}, base=prev)
-        if not run_training(p, f"D4 round {rnd + 1}", tasks2):
-            return None
-        for t in tasks2:
-            models[t["cid"]] = trained_model(t["dir"])
-    last = rounds[max(rounds)]
-    rows = [r for rd in rounds.values() for r in rd["forces"]]
-    erows = [[rnd, cid, h, e["E"] if e else None, e["F"] if e else None]
-             for rnd, rd in rounds.items() for cid, per in rd["errors"].items()
-             for h, e in per.items()]
-    table = (format_table(["round", "id", "head", "RMSE E/meV per atom", "RMSE F/meV/A"], erows,
-                          "Test errors of each model")
-             + "\n" + format_table(["round", "id", "q", "max DFT force at the model's minimum/eV/A",
-                                    f"below {p.s.model_force_tol:g}"], rows,
-                                   f"Forces at the minima of the '{head}' head"))
-    if last["failed"]:
-        log(f"WARNING: D4: after {max(rounds)} rounds the model of "
-            + ", ".join(last["failed"]) + " still leaves DFT forces above model_force_tol at its "
-            "minima: D5's search uses it anyway, and D7 relaxes its structures with DFT")
-    return {"models": {cid: str(Path(m).relative_to(p.dir)) for cid, m in models.items()},
-            "head": head, "rounds": {str(k): v for k, v in rounds.items()},
-            "failed": last["failed"], "_table": table,
-            "_note": f"{len(models)} models, search head '{head}', {len(rounds)} round(s)"
-                     + (f"; still above model_force_tol: {', '.join(last['failed'])}"
-                        if last["failed"] else "")}
-
-
-# D5: the ground-state search with each defect's model (D4's), in the electronic cell (B4), in
-# every charge state it carries on: from its lowest C2/C5 structure (lowest_start: C5's, already
-# in the electronic cell; with distort_cell : screening, the lowest of C2's and C5's, carried
-# over), every distortion of search_distortions around each point C4 distorts around
-# (distortion_centres, ShakeNBreak's distort_and_rattle, with search_rattles more rattled copies
-# of each), relaxed with the search head (D4's) to search_fmax in at most search_steps
-# (D_states/mace/search; on compute nodes with mace_jobscript); then every distinct minimum of one
-# charge state is relaxed in the others. The lowest search_keep distinct minima of each charge
-# state are saved (D_states/structures/search) for D6.
-#   Called by: main() (step D5)
-#   Calls:     build_defect(), carry_over(), distortion_centres(), format_table(), host_supercell(),
-#              load_cell(), lowest_start(), mace_relaxations(), model_defects(),
-#              neighbours_to_distort(), oxidation_states(), qtag(), same_structures(), save_cell(),
-#              screen_setup(), start_spin()
-def step_search(p):
-    if not p.s.model:
-        return {"skipped": True, "_note": "model : false"}
-    try:
-        from pymatgen.io.ase import AseAtomsAdaptor
-        from shakenbreak.distortions import distort_and_rattle
-    except ImportError as err:
-        die(f"D5 needs ShakeNBreak (pip install shakenbreak): {err}")
-    import warnings
-    warnings.filterwarnings("ignore")
-    cands, prim, P0 = screen_setup(p)
-    Pe = np.array(p.out("electronic")["matrix"])
-    chk = p.out("check")
-    head = chk["head"]
-    survivors = {s["cand"]: s for s in p.out("filter")["survivors"]}
-    ox = oxidation_states(p, prim, cands)
-    host = host_supercell(prim, Pe)
-    bond = float(np.sort(host.get_all_distances(mic=True)[0])[1])
-    stdev, dmin = p.s.rattle_stdev or 0.1 * bond, p.s.rattle_dmin or 0.8 * bond
-    cache = p.phase_dir("D") / "mace" / "search"
-    sdir = p.phase_dir("D") / "structures" / "search"
-
-    # A relaxation task with the defect's model in charge state q.
-    def task(cid, q, atoms, name, source):
-        return {"atoms": atoms, "label": name, "cache": cache / f"{name}.json",
-                "model": str(p.dir / chk["models"][cid]), "head": head, "charge": q,
-                "fmax": p.s.search_fmax, "steps": p.s.search_steps, "source": source,
-                "cid": cid, "q": q}
-
-    tasks = []
-    for cid, qs in sorted(model_defects(p).items()):
-        comps, label = cands[cid]["comps"], f"{cid} ({cands[cid]['name']})"
-        for q in qs:
-            b, M = lowest_start(p, survivors[cid], q)
-            if b is None:
-                continue
-            base = load_cell(p, b["structure"])
-            if np.array_equal(np.array(M), Pe):
-                info, how = build_defect(prim, Pe, comps, label)[1], ""
-            else:
-                base, info = carry_over(prim, comps, np.array(M), base, Pe, label=label)
-                how = " (carried over)"
-            tasks.append(task(cid, q, base, f"{cid}_{qtag(q)}_base",
-                              f"{b['step']} {b['name']}{how}"))
-            nb = neighbours_to_distort(comps, q, ox)
-            struct = AseAtomsAdaptor.get_structure(base)
-            centres = distortion_centres(base, comps, info, p.s.distort_around, bond)
-            factors = [x for x in p.s.search_distortions if abs(x) > 1e-9] if nb else []
-            for k, (where, centre) in enumerate(centres):
-                for fct in factors + ["rattled"]:
-                    for r in range(1 + p.s.search_rattles):
-                        out = distort_and_rattle(struct, 1.0 if fct == "rattled" else 1.0 + fct,
-                                                 nb if fct != "rattled" else 0, stdev=stdev,
-                                                 d_min=dmin, seed=MODEL_SEED + r, **centre)
-                        new = AseAtomsAdaptor.get_atoms(out["distorted_structure"])
-                        tag = "rattled" if fct == "rattled" else \
-                            f"b{'m' if fct < 0 else 'p'}{abs(fct):.2f}"
-                        tasks.append(task(cid, q, new,
-                                          f"{cid}_{qtag(q)}_c{k + 1}_{tag}_r{r}",
-                                          f"{tag} around {where}"))
-    res = mace_relaxations(p, "search", tasks)
-    if res is None:
-        return None
-
-    # The distinct minima of a list of relaxed tasks, lowest first (same_structures).
-    def distinct(items):
-        items = sorted(items, key=lambda x: x["energy"])
-        groups = same_structures([x["atoms"] for x in items])
-        return [items[min(g)] for g in sorted(groups, key=min)]
-
-    found = {}
-    for t in tasks:
-        a, _, e1, steps = res[str(t["cache"])]
-        found.setdefault((t["cid"], t["q"]), []).append(
-            {"name": t["label"], "atoms": a, "energy": e1, "source": t["source"],
-             "steps": steps})
-    share = []
-    for (cid, q), items in found.items():
-        for x in distinct(items)[:p.s.search_keep]:
-            for (c2, q2) in found:
-                if c2 == cid and q2 != q:
-                    share.append(task(cid, q2, x["atoms"], f"{x['name']}_to_{qtag(q2)}",
-                                      f"from {qtag(q)}: {x['source']}"))
-    if share:
-        res2 = mace_relaxations(p, "search", share)
-        if res2 is None:
-            return None
-        for t in share:
-            a, _, e1, steps = res2[str(t["cache"])]
-            found[(t["cid"], t["q"])].append({"name": t["label"], "atoms": a, "energy": e1,
-                                              "source": t["source"], "steps": steps})
-    states, rows = {}, []
-    for (cid, q), items in sorted(found.items()):
-        keep = distinct(items)[:p.s.search_keep]
-        spin = (survivors[cid]["best"].get(str(q)) or {}).get("spin")
-        out = []
-        for x in keep:
-            rel = save_cell(p, sdir / f"{x['name']}.cell", x["atoms"],
-                            f"{x['name']}: {x['source']}, the model's minimum ({head} head)")
-            out.append({"name": x["name"], "energy": round(x["energy"], 5), "source": x["source"],
-                        "structure": rel, "spin": start_spin(x["atoms"], q, spin)})
-        states.setdefault(cid, {})[str(q)] = out
-        base = next((x["energy"] for x in items if x["name"].endswith("_base")), None)
-        rows.append([cid, f"{q:+d}", len(items), len(keep), base, out[0]["energy"],
-                     None if base is None else base - out[0]["energy"], out[0]["source"]])
-    table = format_table(["id", "q", "relaxed", "distinct kept", "start/eV", "lowest/eV",
-                          "gain/eV", "lowest from"], rows,
-                         f"Ground-state search with the model ('{head}' head) in the electronic "
-                         f"cell ({p.out('electronic')['tag']})")
-    return {"states": states, "head": head, "matrix": Pe.tolist(), "_table": table,
-            "_note": f"{len(tasks) + len(share)} model relaxations, "
-                     f"{sum(len(v) for s in states.values() for v in s.values())} distinct "
-                     "minima kept"}
-
-
 # --------------------------------------------------------------------------
-# D6: ground states (with model : true, the minima of D5's search with each defect's model;
-# with model : false, C5's relaxations, distortions shared between charge states)
+# C6: ground states (C5's relaxations, distortions shared between charge states)
 # --------------------------------------------------------------------------
 # The distinct relaxed structures of each candidate and charge state in the cell C4 worked in (cell:
 # its tag, None for the screening cell), lowest energy first: C5's relaxations there with a usable
@@ -5649,45 +5329,19 @@ def distinct_states(p, survivors, results, cell):
     return out
 
 
-# D6 with the ground-state model (D5 ran): keeps the lowest keep_structures distinct minima of the
-# model's search in each charge state (D5's, already merged and sorted by the model's energy), in
-# the electronic cell (their 'matrix', and 'cell' its tag), for D7 to relax with DFT.
-#   Called by: step_rank()
-#   Calls:     format_table()
-def rank_model(p, srch):
-    tag = p.out("electronic")["tag"]
-    keep, rows = [], []
-    for cid, per_q in sorted(srch["states"].items()):
-        for qs, items in sorted(per_q.items(), key=lambda kv: int(kv[0])):
-            q = int(qs)
-            for k, e in enumerate(items[:p.s.keep_structures]):
-                keep.append({"cand": cid, "q": q, "k": k, "energy": e["energy"],
-                             "spin": e["spin"], "structure": e["structure"],
-                             "source": e["source"], "factor": None, "name": e["name"],
-                             "band": None, "matrix": srch["matrix"], "cell": tag})
-            rows.append([cid, f"{q:+d}", items[0]["energy"], items[0]["source"], len(items)])
-    table = format_table(["id", "q", "model E/eV", "lowest from", "distinct"], rows,
-                         f"Ground states from the model's search ('{srch['head']}' head, D5)")
-    return {"structures": keep, "model": True, "_table": table,
-            "_note": f"{len(keep)} structures kept from the model's search"}
-
-
-# D6: ranks the relaxed structures of each survivor and charge state in the cell C4 worked in
+# C6: ranks the relaxed structures of each survivor and charge state in the cell C4 worked in
 # (distinct_states). A distortion counts as found when it beats the start by distortion_min_gain:
 # the screened structure (C2's run; in the electronic cell, its relaxation there, C4's undistorted
 # job). A structure found in one charge state that no other charge state has is then relaxed in
-# those charge states too, in the same cell (a batch per round, D_states/jobs/share_<n>, measured
+# those charge states too, in the same cell (a batch per round, C_screen/jobs/share_<n>, measured
 # against C5's band edges), for up to share_rounds rounds or until nothing new turns up. The lowest
-# keep_structures distinct structures of each charge state go on to D7, and then to phase E, with
-# the run each came from, the electrons or holes it left in the bands (D8 leaves out band states)
+# keep_structures distinct structures of each charge state go on to C7, and then to phase D, with
+# the run each came from, the electrons or holes it left in the bands (C8 leaves out band states)
 # and its cell ('matrix', 'cell').
-#   Called by: main() (step D6)
-#   Calls:     distinct_states(), format_table(), load_cell(), qtag(), rank_model(),
-#              run_screen_jobs(), same_structures(), start_spin()
+#   Called by: main() (step C6)
+#   Calls:     distinct_states(), format_table(), load_cell(), qtag(), run_screen_jobs(),
+#              same_structures(), start_spin()
 def step_rank(p):
-    srch = p.out("search")
-    if not srch.get("skipped"):
-        return rank_model(p, srch)
     survivors = p.out("filter")["survivors"]
     results = dict(p.out("drelax")["runs"])
     choose, c4 = p.out("choose"), p.out("distort")
@@ -5730,7 +5384,7 @@ def step_rank(p):
                                  **({"matrix": matrix, "cell": cell} if cell else {})))
         if not todo:
             break
-        log(f"D6 round {rnd}: trying {len(todo)} structures found in one charge state in the "
+        log(f"C6 round {rnd}: trying {len(todo)} structures found in one charge state in the "
             "others")
         out, _ = run_screen_jobs(p, "rank", f"share_{rnd}", todo, "share",
                                  edges=p.out("drelax").get("edges"))
@@ -5767,17 +5421,17 @@ def step_rank(p):
 
 
 # --------------------------------------------------------------------------
-# D7: excited states
+# C7: excited states
 # --------------------------------------------------------------------------
 # Whether a candidate is a native defect: every element it adds or removes is one of the host's
-# (vacancies, antisites, self-interstitials and complexes of them). D7 always passes these on to
-# E, because F's formation energies and Fermi level need them, bright or not.
+# (vacancies, antisites, self-interstitials and complexes of them). C7 always passes these on to
+# D, because E's formation energies and Fermi level need them, bright or not.
 #   Called by: step_excite(), step_filter()
 def is_native(cand, host_elements):
     return all(el in host_elements for el in cand["delta"])
 
 
-# The defect levels of a ground state at one k-point (Gamma in D7): every band within reach (eV)
+# The defect levels of a ground state at one k-point (Gamma in C7): every band within reach (eV)
 # of the host's band edges (vbm, cbm: a pristine run at the same settings) whose participation
 # number (participation, P) is at most fraction x nat (the cell's atoms): localised on the defect,
 # whether inside the gap or inside a band (a resonance, where a semilocal gap can push a level).
@@ -5799,7 +5453,7 @@ def defect_levels(b, P, nat, vbm, cbm, reach, fraction, k=0):
     return out
 
 
-# The excitations D7 and E2 try, from a ground state's defect levels (defect_levels): in each spin
+# The excitations C7 and D2 try, from a ground state's defect levels (defect_levels): in each spin
 # channel (spin-conserving, so a triplet stays a triplet), from its highest occupied defect level to
 # its lowest empty one at least KS_STEP_MIN higher (which skips a degenerate partner). The
 # Kohn-Sham step only picks the bands: what counts is the ΔSCF energy. Each: {spin, from_band,
@@ -5837,7 +5491,7 @@ def deltascf_block(ex, nspin):
             + "\n%endblock deltascf_constraints\n")
 
 
-# A D7 job for one structure in charge state q, starting with spin S: a screening job (screen_job:
+# A C7 job for one structure in charge state q, starting with spin S: a screening job (screen_job:
 # Gamma point, no symmetry, the screening keywords) with metals_method : dm (CASTEP's excitation
 # constraints need density mixing), %block excite_overrides, then extra. kind: 'sp' or 'geom'.
 #   Called by: step_excite()
@@ -5870,8 +5524,8 @@ def dscf_job(gs_job, gs, name, jobdir, ex, nspin, kind, param):
     return job
 
 
-# The settings every ΔSCF calculation of the production phases and its ground state share (E2,
-# G1), as D7's (excite_job): metals_method : dm (CASTEP's excitation constraints need density
+# The settings every ΔSCF calculation of the production phases and its ground state share (D2,
+# F1), as C7's (excite_job): metals_method : dm (CASTEP's excitation constraints need density
 # mixing), then %block excite_overrides. Changes the job's overrides in place; returns the job.
 #   Called by: step_ccd(), step_zpl()
 def dscf_settings(p, job):
@@ -5972,7 +5626,7 @@ def dscf_result(p, r, calc, ex, e_gs, gs_atoms, nat, relaxed, structdir, emin, w
     return out
 
 
-# A D6 structure t as a structure of the electronic cell Pe (B4): as it is when it is already in
+# A C6 structure t as a structure of the electronic cell Pe (B4): as it is when it is already in
 # that cell (its 'matrix'; without one, the screening cell's), else carried over (carry_over).
 # Returns (Atoms, info: where its defect is, build_defect's).
 #   Called by: step_excite(), step_relaxations()
@@ -5986,14 +5640,13 @@ def into_cell(p, t, prim, cands, Pe):
     return carry_over(prim, comps, src, atoms, Pe, label=label)
 
 
-# D7: the screen of the excited states, in the electronic cell (B4) at the screening settings
-# (Gamma, screen_cutoff), in three batches (D_states/jobs/excite_relax, excite_gs, excite):
-#  1. the pristine cell (its band edges), and every structure D6 kept, relaxed: the lowest that
-#     relaxes is the ground state (D6's order may change); it is flagged if it slid more than
-#     BASIN_TOL from where it started (same_basin: from the model's minimum, a structure the
-#     semilocal functional doesn't keep). A band state (in_band) is 'pending': it can't be judged
-#     here (a hybrid can). With excite_spin (2, a triplet; 'any' for every spin), a ground state
-#     whose final spin is further than spin_tol from it goes no further ('spin').
+# C7: the screen of the excited states, in the electronic cell (B4) at the screening settings
+# (Gamma, screen_cutoff), in three batches (C_screen/jobs/excite_relax, excite_gs, excite):
+#  1. the pristine cell (its band edges), and every structure C6 kept, relaxed: the lowest that
+#     relaxes is the ground state (C6's order may change); it is flagged if it slid more than
+#     BASIN_TOL from where it started (same_basin). A band state (in_band) is 'pending': it can't
+#     be judged here (a hybrid can). With excite_spin (2, a triplet; 'any' for every spin), a
+#     ground state whose final spin is further than spin_tol from it goes no further ('spin').
 #  2. a single point of each remaining ground state with the bands' weights on the atoms
 #     (pdos_calculate_weights; its .check is kept): its defect levels are the bands localised on
 #     the defect (defect_levels: a participation number of at most local_fraction of the atoms),
@@ -6004,11 +5657,11 @@ def into_cell(p, t, prim, cands, Pe):
 #     Debye-Waller estimates (coupling_1d), and whether the promoted electron stayed on the
 #     defect (dscf_result).
 # A charge state passes if one of its excitations does (dscf_result's verdicts; a failed run is
-# 'unknown' and counts as a pass, with a warning). A defect goes on to E with all its charge
+# 'unknown' and counts as a pass, with a warning). A defect goes on to D with all its charge
 # states (their relaxed ground states here) if one passes, and every native defect (is_native)
-# goes on anyway (its ground states, for F). With excite : false, every structure D6 kept as its
-# lowest goes on to E as it is.
-#   Called by: main() (step D7)
+# goes on anyway (its ground states, for E). With excite : false, every structure C6 kept as its
+# lowest goes on to D as it is.
+#   Called by: main() (step C7)
 #   Calls:     Project.batch(), Project.host(), Project.production_param(), band_edges(),
 #              carriers_text(), defect_levels(), dscf_job(), dscf_result(), excite_job(),
 #              format_table(), host_supercell(), in_band(), into_cell(), is_native(), job_summary(),
@@ -6019,9 +5672,9 @@ def step_excite(p):
     if not p.s.excite:
         out = [dict(t) for t in structures if t["k"] == 0]
         return {"structures": out, "states": {}, "kept": sorted({t["cand"] for t in out}),
-                "native": [], "_note": "excite is off: the lowest structure D6 kept of every "
-                                       "charge state goes on to E"}
-    d = p.phase_dir("D")
+                "native": [], "_note": "excite is off: the lowest structure C6 kept of every "
+                                       "charge state goes on to D"}
+    d = p.phase_dir("C")
     cands, prim = p.out("generate")["candidates"], p.host()
     Pe = np.array(p.out("electronic")["matrix"])
     host = host_supercell(prim, Pe)
@@ -6036,12 +5689,12 @@ def step_excite(p):
         atoms, info = into_cell(p, t, prim, cands, Pe)
         jobs.append(screen_job(p, name, atoms, info, t["q"], t["spin"]))
         starts[name] = (t, atoms, info)
-    res = p.batch(f"{PHASE_DIRS['D']}/jobs/excite_relax", jobs, "excite", p.production_param())
+    res = p.batch(f"{PHASE_DIRS['C']}/jobs/excite_relax", jobs, "excite", p.production_param())
     if not res["complete"]:
         return None
     hc = res["calcs"]["host"]
     if res["jobs"]["host"]["status"] != "done" or not (hc.dir / f"{hc.seed}.bands").exists():
-        die(f"D7: the pristine electronic cell did not finish ({hc.dir}); the band edges come "
+        die(f"C7: the pristine electronic cell did not finish ({hc.dir}); the band edges come "
             "from it")
     vbm, cbm = band_edges(read_bands(hc.dir / f"{hc.seed}.bands"))
     states, infos = {}, {}
@@ -6080,7 +5733,7 @@ def step_excite(p):
                                             {"pdos_calculate_weights": "true"}))
     ex_jobs, plan = [], {}
     if sp_jobs:
-        res2 = p.batch(f"{PHASE_DIRS['D']}/jobs/excite_gs", [x[2] for x in sp_jobs.values()],
+        res2 = p.batch(f"{PHASE_DIRS['C']}/jobs/excite_gs", [x[2] for x in sp_jobs.values()],
                        "excite", p.production_param(), keep_check=True)
         if not res2["complete"]:
             return None
@@ -6112,7 +5765,7 @@ def step_excite(p):
                                         p.production_param()))
                 plan[xname] = (cid, q, ex, b["nspin"])
     if ex_jobs:
-        res3 = p.batch(f"{PHASE_DIRS['D']}/jobs/excite", ex_jobs, "excite",
+        res3 = p.batch(f"{PHASE_DIRS['C']}/jobs/excite", ex_jobs, "excite",
                        p.production_param())
         if not res3["complete"]:
             return None
@@ -6136,7 +5789,7 @@ def step_excite(p):
     for (cid, q), e in sorted(states.items()):
         goes = ("yes (native)" if cid in native else "yes") if cid in keep else "no"
         if e["verdict"] == "unknown":
-            log(f"WARNING: D7: {cid} {cands[cid]['name']} q {q:+d}: {e['why']} - kept")
+            log(f"WARNING: C7: {cid} {cands[cid]['name']} q {q:+d}: {e['why']} - kept")
         flags = ", ".join(x for x in (
             f"slid {e['moved']:.2f} A" if e.get("moved") and e["moved"] > BASIN_TOL else "",
             "reordered" if e.get("reordered") else "") if x)
@@ -6158,16 +5811,16 @@ def step_excite(p):
                          goes if i == 0 else ""])
         if cid in keep and e.get("structure"):
             out.append({"cand": cid, "q": q, "k": 0, "structure": e["structure"],
-                        "matrix": Pe.tolist(), "spin": e["spin"], "source": "D7",
+                        "matrix": Pe.tolist(), "spin": e["spin"], "source": "C7",
                         "excite": [{k: ex[k] for k in ("spin", "from_band", "to_band")}
                                    for ex in e["transitions"] if ex.get("verdict") == "pass"]})
-        elif cid in keep:                         # its relaxation failed: D6's structure
+        elif cid in keep:                         # its relaxation failed: C6's structure
             t0 = next(t for t in structures if t["cand"] == cid and t["q"] == q and t["k"] == 0)
             out.append(dict(t0, excite=[]))
     what = "ZPL" if p.s.excite_relax else "vertical E"
     table = format_table(["id", "defect", "q", "spin", "flags", "spin: bands", "KS step/eV",
                           "P from/to", f"{what}/eV", "E_abs/eV", "dQ/amu^0.5 A", "S (1D)",
-                          "DW (1D)", "verdict", "on to E"], rows,
+                          "DW (1D)", "verdict", "on to D"], rows,
                          f"Excited states in the electronic cell ({p.out('electronic')['tag']}) at "
                          "the screening settings: defect levels are bands on at most "
                          f"{p.s.local_fraction:g} of the {nat} atoms (P: the atoms each spreads "
@@ -6184,12 +5837,12 @@ def step_excite(p):
             "pending": sorted(f"{cid} q {q:+d}" for (cid, q), e in states.items()
                               if e["verdict"] == "pending"),
             "relaxed": p.s.excite_relax, "edges": {"vbm": vbm, "cbm": cbm}, "_table": table,
-            "_note": f"{npass} charge states pass; {len(keep)} defects go on to E "
+            "_note": f"{npass} charge states pass; {len(keep)} defects go on to D "
                      f"({len(native)} native)"}
 
 
 # --------------------------------------------------------------------------
-# D8: the finite-size check (optional)
+# C8: the finite-size check (optional)
 # --------------------------------------------------------------------------
 # The line E = E_inf + b/N (least squares) through some sizes' E (dicts with N and E). Returns
 # (E_inf, b, the largest distance of a point from the line), or for one size (its E, None, 0).
@@ -6204,13 +5857,13 @@ def tail_fit(points):
     return float(e_inf), float(b), float(np.abs(A @ [e_inf, b] - y).max())
 
 
-# D8 (optional, validate : true): whether the screening cell, with its corrections, gives the
-# formation energies and transition levels of much bigger cells, so that phase E's size series can
-# be left out in later projects. For the lowest structure D6 kept of each defect (those in
-# validate_defects, or every one D6 kept) in each charge state that isn't a band state: a
+# C8 (optional, validate : true): whether the screening cell, with its corrections, gives the
+# formation energies and transition levels of much bigger cells, so that a size series can be
+# left out in later projects. For the lowest structure C6 kept of each defect (those in
+# validate_defects, or every one C6 kept) in each charge state that isn't a band state: a
 # relaxation at the production settings (production_job, but without freeze_radius, so the far
 # field relaxes too) in the screening cell and in the next validate_sizes sizes of the ladder up
-# that fit it (D6's structure carried over, carry_over), with the pristine cell's single point in
+# that fit it (C6's structure carried over, carry_over), with the pristine cell's single point in
 # each size; all with calculate_stress. In each size, E = E_D - E_host + E_corr (the charge
 # correction, in that cell's shape); the reference E_inf is the line E_inf + b/N through the sizes
 # above the screening cell (tail_fit; N, the host cell's atoms, as in B2), and b is the tail the
@@ -6220,13 +5873,13 @@ def tail_fit(points):
 # stress less the host's in the same size, so the Pulay stress of the basis cancels; S, the
 # compliance from elastic_constants), each charge state's own. The transition levels between the
 # charge states checked are compared the same way. A defect passes with an estimate when every
-# error is within validate_tol. The jobs run in D_states/jobs/validate with the runner settings of
-# runner_production (or runner_validate); the relaxed structures go to D_states/structures/validate.
-# D6's structure is carried from the cell it is in (its 'matrix': the screening cell, or the
-# electronic cell when D5's model found it). With validate_gamma (true), the same relaxed
+# error is within validate_tol. The jobs run in C_screen/jobs/validate with the runner settings of
+# runner_production (or runner_validate); the relaxed structures go to C_screen/structures/validate.
+# C6's structure is carried from the cell it is in (its 'matrix': the screening cell, or the
+# electronic cell, distort_cell's). With validate_gamma (true), the same relaxed
 # structures also get Gamma-only single points (validate_gamma), to show what Gamma-only sampling
 # would change in each size. Nothing later uses the results: they are a test of the method.
-#   Called by: main() (step D8)
+#   Called by: main() (step C8)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              build_defect(), carry_over(), compliance(), correction(), elastic_energy(), fits(),
 #              format_table(), host_supercell(), in_band(), load_cell(), production_job(),
@@ -6234,14 +5887,14 @@ def tail_fit(points):
 def step_validate(p):
     if not p.s.validate:
         return {"skipped": True, "_note": "validate : false"}
-    d = p.phase_dir("D")
+    d = p.phase_dir("C")
     cands, prim = p.out("generate")["candidates"], p.host()
     choose = p.out("choose")
     ladder, idx, P0 = choose["ladder"], choose["index"], np.array(choose["matrix"])
     eps = p.out("dielectric").get("eps0")
     S = compliance(p.s.elastic_constants)
     if S is None:
-        log("D8: no %block elastic_constants, so the stress estimate is left out")
+        log("C8: no %block elastic_constants, so the stress estimate is left out")
     mace_c = {cid: (x.get("fit") or {}).get("c")
               for cid, x in p.out("scan").get("candidates", {}).items()}
     ground, skipped, sizes = {}, [], {}
@@ -6254,20 +5907,20 @@ def step_validate(p):
             ground.setdefault(t["cand"], {})[t["q"]] = t
     for x in p.s.validate_defects:
         if x not in ground:
-            log(f"WARNING: D8: {x} is in validate_defects but D6 kept no bound structure of it")
+            log(f"WARNING: C8: {x} is in validate_defects but C6 kept no bound structure of it")
     if skipped:
-        log("D8: left out (a band state, so there is no defect level to check): "
+        log("C8: left out (a band state, so there is no defect level to check): "
             + ", ".join(skipped))
     for cid in sorted(ground):
         up = [i for i in range(idx + 1, len(ladder)) if fits(cands[cid], ladder[i]["L"])]
         if not up:
-            log(f"WARNING: D8: {cid} not checked: no size of the ladder above the screening cell "
+            log(f"WARNING: C8: {cid} not checked: no size of the ladder above the screening cell "
                 "fits it (longer scan_lengths add sizes)")
             del ground[cid]
         else:
             sizes[cid] = [idx] + up[:p.s.validate_sizes]
     if not ground:
-        log("WARNING: D8: nothing to check (see above)")
+        log("WARNING: C8: nothing to check (see above)")
         return {"defects": {}, "runs": {}, "hosts": {}, "skipped": skipped,
                 "tol": p.s.validate_tol, "_note": "nothing to check"}
     extra = {"calculate_stress": "true"}
@@ -6278,7 +5931,7 @@ def step_validate(p):
             Q = np.array(ladder[i]["matrix"])
             for q, t in sorted(states.items()):
                 name = f"{cid}_{qtag(q)}_{ladder[i]['tag']}"
-                start = load_cell(p, t["structure"])          # D6's, in its own cell
+                start = load_cell(p, t["structure"])          # C6's, in its own cell
                 src = np.array(t.get("matrix") or P0)
                 atoms, info = ((start, build_defect(prim, Q, comps, label)[1])
                                if np.array_equal(src, Q) else
@@ -6294,7 +5947,7 @@ def step_validate(p):
         jobs.append({"name": f"host_{ladder[i]['tag']}",
                      "atoms": host_supercell(prim, np.array(ladder[i]["matrix"])), "kind": "sp",
                      "symmetry": True, "overrides": dict(p.s.production_overrides, **extra)})
-    res = p.batch(f"{PHASE_DIRS['D']}/jobs/validate", jobs, "validate", p.production_param(),
+    res = p.batch(f"{PHASE_DIRS['C']}/jobs/validate", jobs, "validate", p.production_param(),
                   spacing=p.kspacing())
     if not res["complete"]:
         return None
@@ -6303,7 +5956,7 @@ def step_validate(p):
         name = f"host_{ladder[i]['tag']}"
         r = res["jobs"][name]
         if r["status"] != "done" or r["energy"] is None:
-            die(f"D8: the pristine {ladder[i]['tag']} single point did not finish ({r['dir']})")
+            die(f"C8: the pristine {ladder[i]['tag']} single point did not finish ({r['dir']})")
         s, pr = read_stress(res["calcs"][name].output())
         hosts[i] = {"energy": r["energy"], "stress": None if s is None else s.tolist(),
                     "pressure": pr}
@@ -6317,7 +5970,7 @@ def step_validate(p):
         runs[name] = dict(r, cand=cid, q=q, cell=ladder[i]["tag"],
                           stress=None if s is None else s.tolist(), pressure=pr)
     if nostress:
-        log(f"WARNING: D8: no stress tensor in {len(nostress)} runs (e.g. {nostress[0]}): does "
+        log(f"WARNING: C8: no stress tensor in {len(nostress)} runs (e.g. {nostress[0]}): does "
             "this CASTEP honour calculate_stress, or print it in a unit other than GPa, MPa, Pa, "
             "bar or atm (pressure_unit)? The stress estimate is left out there")
     gamma = validate_gamma(p, prim, ladder, used, meta, infos, runs, hosts) \
@@ -6352,7 +6005,7 @@ def step_validate(p):
             if here is None or not above:
                 why = ("its screening-cell run failed" if here is None else
                        "no bigger size to compare with (the runs failed, or none fits)")
-                log(f"WARNING: D8: {cid} q {q:+d} not checked: {why}")
+                log(f"WARNING: C8: {cid} q {q:+d} not checked: {why}")
                 per_q[q] = {"checked": False, "why": why}
                 continue
             e_inf, b, worst = tail_fit(above)
@@ -6432,9 +6085,9 @@ def step_validate(p):
                         if gamma["worst"] else "")}
 
 
-# D8's check of Gamma-only sampling (validate_gamma : true): a single point at the production
-# cut-off with only the Gamma point, of every structure D8 relaxed at the production k-points and
-# of the pristine cell in each size used (D_states/jobs/validate_gamma). E = E_D - E_host with
+# C8's check of Gamma-only sampling (validate_gamma : true): a single point at the production
+# cut-off with only the Gamma point, of every structure C8 relaxed at the production k-points and
+# of the pristine cell in each size used (C_screen/jobs/validate_gamma). E = E_D - E_host with
 # each, and the difference: how far Gamma-only would move a formation energy (the charge correction
 # is the same in both, and cancels). Returns {'rows' (for the table), 'worst': {size tag: largest
 # |difference|}, 'runs': {name: difference}}, or None while the jobs run.
@@ -6458,7 +6111,7 @@ def validate_gamma(p, prim, ladder, used, meta, infos, runs, hosts):
         job.update(kind="sp", kgrid=[1, 1, 1])
         jobs.append(job)
         plan[f"{name}_G"] = name
-    res = p.batch(f"{PHASE_DIRS['D']}/jobs/validate_gamma", jobs, "validate",
+    res = p.batch(f"{PHASE_DIRS['C']}/jobs/validate_gamma", jobs, "validate",
                   p.production_param())
     if not res["complete"]:
         return None
@@ -6482,12 +6135,12 @@ def validate_gamma(p, prim, ladder, used, meta, infos, runs, hosts):
 
 
 SCREEN_KEYS = ("screen_cutoff", "screen_max_steps", "screen_overrides", "level_margin", "energy")
-MODEL_KEYS = ("model", "model_command", "model_device", "model_epochs", "model_r_max",
-              "model_channels", "model_max_L", "model_batch", "model_train_args", "mace_device")
+MODEL_KEYS = ("model_command", "model_device", "model_epochs", "model_r_max", "model_channels",
+              "model_max_L", "model_batch", "model_train_args", "mace_device")
 
 
 # ==========================================================================================
-# PHASE E: PRODUCTION GROUND AND EXCITED STATES (flowchart E1-E2)
+# PHASE D: PRODUCTION GROUND AND EXCITED STATES (flowchart D1-D2)
 # ==========================================================================================
 # The %block ionic_constraints that holds still every atom further than radius (Ang) from all of
 # the defect's components (points: their positions; three constraints per atom: x, y and z).
@@ -6563,22 +6216,22 @@ def production_summary(p, res, name, structdir, frozen=0):
             "final": path, "frozen": frozen}, atoms
 
 
-# E1: the production relaxations, in the electronic cell (B4): every charge state of each defect
-# phase D passes on (D7's relaxed ground states there; with excite : false, the lowest structure D6
+# D1: the production relaxations, in the electronic cell (B4): every charge state of each defect
+# phase C passes on (C7's relaxed ground states there; with excite : false, the lowest structure C6
 # kept of each charge state, carried in: into_cell), relaxed at the production settings
 # (production_job: A1's cut-off and k-point spacing, %block production_overrides, freeze_radius),
-# with the pristine electronic cell's single point, whose band edges E2 measures levels against
-# (E_production/jobs/relaxations; the relaxed structures in E_production/structures/relaxations).
-# Runner group 'production'. F takes its energies from here, E2 its ground states.
-#   Called by: main() (step E1)
+# with the pristine electronic cell's single point, whose band edges D2 measures levels against
+# (D_production/jobs/relaxations; the relaxed structures in D_production/structures/relaxations).
+# Runner group 'production'. E takes its energies from here, D2 its ground states.
+#   Called by: main() (step D1)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              band_edges(), format_table(), host_supercell(), into_cell(), production_job(),
 #              production_summary(), qtag(), read_bands(), start_spin()
 def step_relaxations(p):
-    d = p.phase_dir("E")
+    d = p.phase_dir("D")
     todo = p.out("excite")["structures"]
     if not todo:
-        die("phase D passed no structures on, so there is nothing to relax")
+        die("phase C passed no structures on, so there is nothing to relax")
     cands, prim = p.out("generate")["candidates"], p.host()
     el = p.out("electronic")
     Pe = np.array(el["matrix"])
@@ -6595,13 +6248,13 @@ def step_relaxations(p):
     if any(frozen.values()):
         log(f"freeze_radius {p.s.freeze_radius:g} A holds {min(frozen.values())}-"
             f"{max(frozen.values())} atoms fixed in each relaxation (untested idea)")
-    res = p.batch(f"{PHASE_DIRS['E']}/jobs/relaxations", jobs, "relaxations",
+    res = p.batch(f"{PHASE_DIRS['D']}/jobs/relaxations", jobs, "relaxations",
                   p.production_param(), spacing=p.kspacing())
     if not res["complete"]:
         return None
     hr, hc = res["jobs"]["host"], res["calcs"]["host"]
     if hr["status"] != "done" or hr["energy"] is None:
-        die(f"E1: the pristine electronic cell's single point did not finish ({hr['dir']}): the "
+        die(f"D1: the pristine electronic cell's single point did not finish ({hr['dir']}): the "
             "formation energies need it")
     edges = None
     if (hc.dir / f"{hc.seed}.bands").exists():
@@ -6651,32 +6304,32 @@ def zpl_bands_ok(p, b, pw, nat, vbm, cbm, ex):
     return True, ""
 
 
-# E2: the production ΔSCF of every excitation D7 passed, in E1's relaxed ground state:
+# D2: the production ΔSCF of every excitation C7 passed, in D1's relaxed ground state:
 #  1. a single point at the production settings with the bands' weights (pdos_calculate_weights;
 #     its .check kept; metals_method : dm and %block excite_overrides, dscf_settings), against
-#     E1's pristine band edges: the excitation is found again in the same spin channel
+#     D1's pristine band edges: the excitation is found again in the same spin channel
 #     (defect_levels, transitions), and the band-number check (zpl_bands_ok);
 #  2. where that fails, a Gamma-only single point at the production cut-off instead (the
 #     excitation found again there);
 #  3. the ΔSCF (dscf_job) from whichever single point, relaxed with excite_relax : true: ZPL, the
 #     vertical absorption, dQ, the 1D Huang-Rhys and Debye-Waller estimates and whether the
-#     promoted electron stayed on the defect (dscf_result; its verdict uses D7's thresholds).
-# The relaxed excited structures go to E_production/structures/zpl, for G.
-#   Called by: main() (step E2)
+#     promoted electron stayed on the defect (dscf_result; its verdict uses C7's thresholds).
+# The relaxed excited structures go to D_production/structures/zpl, for F.
+#   Called by: main() (step D2)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              build_defect(), defect_levels(), dscf_job(), dscf_result(), dscf_settings(),
 #              format_table(), host_supercell(), load_cell(), participation(), production_job(),
 #              qtag(), read_bands(), read_pdos_weights(), start_spin(), transitions(),
 #              zpl_bands_ok()
 def step_zpl(p):
-    d = p.phase_dir("E")
+    d = p.phase_dir("D")
     e1 = p.out("relaxations")
     todo = [r for r in e1["runs"].values() if r["excite"] and r["energy"] is not None
             and r["final"]]
     if not todo:
-        return {"states": {}, "_note": "no excitation passed D7, so there is no ΔSCF to run"}
+        return {"states": {}, "_note": "no excitation passed C7, so there is no ΔSCF to run"}
     if not e1["edges"]:
-        die("E2: E1's pristine single point wrote no .bands, so the defect levels can't be found")
+        die("D2: D1's pristine single point wrote no .bands, so the defect levels can't be found")
     cands, prim = p.out("generate")["candidates"], p.host()
     Pe = np.array(e1["cell"]["matrix"])
     nat = len(host_supercell(prim, Pe))
@@ -6699,7 +6352,7 @@ def step_zpl(p):
         infos[name] = r
         return job
 
-    # The excitations of a ground-state single point in the spin channels D7 passed, at its first
+    # The excitations of a ground-state single point in the spin channels C7 passed, at its first
     # k-point: [(ex, nspin)], with the .bands and .pdos_weights read (b, pw), or why there are none.
     def found(r, calc):
         bands = calc.dir / f"{calc.seed}.bands"
@@ -6715,7 +6368,7 @@ def step_zpl(p):
 
     first = [gs_job(r, False) for r in todo]
     jobs1 = {j["name"]: (r, j) for r, j in zip(todo, first)}
-    res1 = p.batch(f"{PHASE_DIRS['E']}/jobs/zpl_gs", first, "zpl", p.production_param(),
+    res1 = p.batch(f"{PHASE_DIRS['D']}/jobs/zpl_gs", first, "zpl", p.production_param(),
                    spacing=p.kspacing(), keep_check=True)
     if not res1["complete"]:
         return None
@@ -6741,7 +6394,7 @@ def step_zpl(p):
             st.update(sampling="k-points", gs_energy=rr["energy"])
             plan += [(st, name, calc, ex, b["nspin"], job) for ex in exs]
     if gamma_todo:
-        res2 = p.batch(f"{PHASE_DIRS['E']}/jobs/zpl_gs_gamma",
+        res2 = p.batch(f"{PHASE_DIRS['D']}/jobs/zpl_gs_gamma",
                        [gs_job(r, True) for r in gamma_todo], "zpl", p.production_param(),
                        keep_check=True)
         if not res2["complete"]:
@@ -6768,7 +6421,7 @@ def step_zpl(p):
             jobs3.append(dscf_job(gjob, calc, xname, exdir, ex, nspin,
                                   "geom" if p.s.excite_relax else "sp", p.production_param()))
             keys.append((st, xname, ex, gname))
-        res3 = p.batch(f"{PHASE_DIRS['E']}/jobs/zpl", jobs3, "zpl", p.production_param(),
+        res3 = p.batch(f"{PHASE_DIRS['D']}/jobs/zpl", jobs3, "zpl", p.production_param(),
                        spacing=p.kspacing())
         if not res3["complete"]:
             return None
@@ -6793,7 +6446,7 @@ def step_zpl(p):
     what = "ZPL" if p.s.excite_relax else "vertical E"
     table = format_table(["id", "defect", "q", "k-points", "spin: bands", f"{what}/eV",
                           "E_abs/eV", "dQ/amu^0.5 A", "S (1D)", "DW (1D)", "verdict"], rows,
-                         "Production ΔSCF (A1's settings) in E1's ground states; k-points: the "
+                         "Production ΔSCF (A1's settings) in D1's ground states; k-points: the "
                          "production grid, or Gamma where the band-number check failed")
     js = {}
     for (cid, q), st in states.items():
@@ -6805,7 +6458,7 @@ def step_zpl(p):
 
 
 # ==========================================================================================
-# PHASE F: THERMODYNAMICS (flowchart F1-F3)
+# PHASE E: THERMODYNAMICS (flowchart E1-E3)
 # ==========================================================================================
 KB = 8.617333262e-5                # eV/K
 # chart colours (reference palette: light surface, categorical slots in their fixed order)
@@ -6813,7 +6466,7 @@ SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 
 
-# The production results (E1) of the runs that finished, by candidate and charge state (the run,
+# The production results (D1) of the runs that finished, by candidate and charge state (the run,
 # with the electronic cell's tag and its pristine energy, host_energy).
 #   Called by: step_corrections(), step_formation()
 def best_production(p):
@@ -6826,10 +6479,10 @@ def best_production(p):
     return best
 
 
-# F1: the finite-size correction (charge_correction, with the static dielectric constant from
-# A2.3) for every charge state that reached phase E, in the electronic cell (E1's). Returns
+# E1: the finite-size correction (charge_correction, with the static dielectric constant from
+# A2.3) for every charge state that reached phase D, in the electronic cell (D1's). Returns
 # {defect: {q: E_corr}}.
-#   Called by: main() (step F1)
+#   Called by: main() (step E1)
 #   Calls:     Project.host(), best_production(), correction(), format_table()
 def step_corrections(p):
     best = best_production(p)
@@ -6978,11 +6631,11 @@ def plot(path, curves, gap, title):
     return path
 
 
-# The sets of defects F2 finds a Fermi level for, each as if only those dopants were in the crystal
+# The sets of defects E2 finds a Fermi level for, each as if only those dopants were in the crystal
 # (so Sb's defects never set the Fermi level of a Bi-doped sample): 'native' (the native defects
 # alone), each dopant X (the native defects and those that add only X), and each mix of dopants
 # that one defect adds together, e.g. 'Bi+Sb' (with every defect whose dopants are among them).
-# ids: the defects that reached phase E. Returns {name: [defect ids]}.
+# ids: the defects that reached phase D. Returns {name: [defect ids]}.
 #   Called by: step_formation()
 def dopant_sets(cands, ids, host_el):
     dop = {cid: frozenset(el for el, n in cands[cid]["delta"].items()
@@ -6993,19 +6646,19 @@ def dopant_sets(cands, ids, host_el):
     return sets
 
 
-# F2: formation energies, transition levels and (with fermi_temperature) the Fermi level.
-# For each defect that reached phase E, its energy in each charge state (E1, the electronic cell)
+# E2: formation energies, transition levels and (with fermi_temperature) the Fermi level.
+# For each defect that reached phase D, its energy in each charge state (D1, the electronic cell)
 # gives E_f(q, E_F=0) = E_D - E_host - sum n_i mu_i + q E_VBM + E_corr at every limit, and its
 # thermodynamic transition levels in the gap (transition_levels; the same at every limit); the
-# plot goes to F_thermo/formation.png. With fermi_temperature, fermi_level finds the
+# plot goes to E_thermo/formation.png. With fermi_temperature, fermi_level finds the
 # self-consistent Fermi level at each limit for each set of dopants on its own (dopant_sets), from
 # their defects and the host's free carriers (quench_temperature: concentrations frozen at
 # fermi_temperature, then charges redistributed).
-#   Called by: main() (step F2)
+#   Called by: main() (step E2)
 #   Calls:     Project.host(), band_gap(), best_production(), dopant_sets(), fermi_level(),
 #              format_table(), mu_limits(), plot(), read_bands(), transition_levels()
 def step_formation(p):
-    d = p.phase_dir("F")
+    d = p.phase_dir("E")
     best = best_production(p)
     if not best:
         die("no production run finished, so there are no formation energies")
@@ -7089,8 +6742,8 @@ def step_formation(p):
                                    "Self-consistent Fermi level for each set of dopants on its "
                                    "own (native: the native defects alone; X: the native "
                                    "defects and those of X alone; X+Y: also the defects with "
-                                   "both), from the defects that reached phase E"))
-        log("note: the Fermi level includes only the defects that reached phase E; defects "
+                                   "both), from the defects that reached phase D"))
+        log("note: the Fermi level includes only the defects that reached phase D; defects "
             "left out (e.g. native defects dropped in C) may change it")
     return {"vbm": vbm, "gap": gap, "limits": lims, "defects": results, "fermi": fermi,
             "dopant_sets": sets,
@@ -7099,7 +6752,7 @@ def step_formation(p):
 
 
 # The Fermi-level range (eV above the VBM, within [0, gap]) where each charge state of a defect is
-# its lowest (F2's formation energies at one limit, {q: E_f at E_F = 0}; the ranges are the same at
+# its lowest (E2's formation energies at one limit, {q: E_f at E_F = 0}; the ranges are the same at
 # every limit), from its transition levels (transition_levels). Returns {q: (lo, hi)} for the
 # charge states that are lowest somewhere.
 #   Called by: step_interest()
@@ -7116,14 +6769,14 @@ def stable_windows(ef0, gap):
     return out
 
 
-# F3: the decision before phase G. A charge state goes on to the lineshape if its excitation
-# passed at the production settings (E2) and it is the defect's lowest charge state for some Fermi
-# level inside the gap (stable_windows, from F2): an excitation of a charge state that never
-# forms can't be seen. The table also gives, for each set of dopants F2 found a Fermi level for
+# E3: the decision before phase F. A charge state goes on to the lineshape if its excitation
+# passed at the production settings (D2) and it is the defect's lowest charge state for some Fermi
+# level inside the gap (stable_windows, from E2): an excitation of a charge state that never
+# forms can't be seen. The table also gives, for each set of dopants E2 found a Fermi level for
 # (dopant_sets: the defect's own), whether that Fermi level falls in the range at each limit, the
-# deep levels (more than deep_level_margin from both band edges), and the band states D7 left
+# deep levels (more than deep_level_margin from both band edges), and the band states C7 left
 # pending (to characterise with a hybrid later).
-#   Called by: main() (step F3)
+#   Called by: main() (step E3)
 #   Calls:     Project.host(), format_table(), stable_windows()
 def step_interest(p):
     form, zpl, d7 = p.out("formation"), p.out("zpl"), p.out("excite")
@@ -7161,26 +6814,26 @@ def step_interest(p):
                               "gs_job": ex["gs_job"], "fermi_inside": inside})
     pending = d7.get("pending") or []
     table = format_table(["id", "defect", "q", "ZPL/eV", "DW (1D)", "lowest for E_F/eV",
-                          "E_F there at", "deep levels/eV", "on to G"], rows,
-                         "Excitations that passed E2, and whether their charge state forms "
+                          "E_F there at", "deep levels/eV", "on to F"], rows,
+                         "Excitations that passed D2, and whether their charge state forms "
                          f"(lowest for some Fermi level in the {gap:.2f} eV gap); E_F there at: "
-                         "the limits whose self-consistent Fermi level (F2, the defect's own "
+                         "the limits whose self-consistent Fermi level (E2, the defect's own "
                          "dopants) falls in that range")
     if pending:
-        table += ("\nBand states D7 left pending (to characterise with a hybrid): "
+        table += ("\nBand states C7 left pending (to characterise with a hybrid): "
                   + ", ".join(pending) + "\n")
-    return {"for_G": picks, "pending": pending, "_table": table,
-            "_note": f"{len(picks)} excitation(s) for the lineshape phase (G)"}
+    return {"for_F": picks, "pending": pending, "_table": table,
+            "_note": f"{len(picks)} excitation(s) for the lineshape phase (F)"}
 
 
 # ==========================================================================================
-# PHASE G: OPTICAL LINESHAPES (flowchart G1-G2)
+# PHASE F: OPTICAL LINESHAPES (flowchart F1-F2)
 # ==========================================================================================
-# The excitations F3 sends on, at the production settings (PBE with A1's cut-off and k-points, or
-# Gamma where E2 fell back to it). G1: the 1D configuration-coordinate diagram, always; G2
+# The excitations E3 sends on, at the production settings (PBE with A1's cut-off and k-points, or
+# Gamma where D2 fell back to it). F1: the 1D configuration-coordinate diagram, always; F2
 # (lineshape : true): the multi-mode lineshape from a PBE model's phonons in a big cell. Both give
 # the luminescence lineshape by the generating-function method (pl_spectrum), in the equal-mode
-# approximation (the excited state vibrates as the ground state does; G1 reports both states'
+# approximation (the excited state vibrates as the ground state does; F1 reports both states'
 # curvatures, which shows how far that holds).
 
 # The energy of a finished CASTEP job (run_batch's results), or None unless it finished with a
@@ -7223,7 +6876,7 @@ def harmonic_fit(Q, E, centre, half):
             "coef": [float(c2), float(c1), float(c0)]}
 
 
-# What G1's points give: xs, where they are along the path (0: the ground state's structure, 1:
+# What F1's points give: xs, where they are along the path (0: the ground state's structure, 1:
 # the excited state's, dq apart, amu^1/2 Ang); eg and ee, the ground and excited states' energies
 # there (None where a job failed). Each state's parabola near its own minimum (harmonic_fit, the
 # points within 0.6 dq), its mode energy hw and its Huang-Rhys factor in the 1D model,
@@ -7324,7 +6977,7 @@ def write_columns(path, header, cols):
     return path
 
 
-# Draws a figure of side-by-side panels (G1, G2), each {'title', 'xlabel', 'ylabel', 'series':
+# Draws a figure of side-by-side panels (F1, F2), each {'title', 'xlabel', 'ylabel', 'series':
 # [{'x', 'y', 'label', 'kind': 'line' or 'points', 'colour': its slot}], 'mark': the x of a dashed
 # line, or None}: each series in its own colour slot of the palette (the same state keeps its
 # colour in every panel), a legend where a panel has more than one named series.
@@ -7369,26 +7022,26 @@ def draw_panels(path, title, panels):
     return path
 
 
-# G1: the 1D configuration-coordinate diagram of each excitation F3 sends on (G_lineshape/jobs/
-# ccd_gs, ccd_ex): the structures along the straight line from E1's relaxed ground state (x = 0)
-# to E2's relaxed excited state (x = 1), at ccd_points; at each, a ground-state single point (its
-# .check kept) and, from it, a ΔSCF single point of the same excitation (dscf_job), both at E2's
-# settings (the production ones with dscf_settings, Gamma where E2 used it); the parabolas, mode
+# F1: the 1D configuration-coordinate diagram of each excitation E3 sends on (F_lineshape/jobs/
+# ccd_gs, ccd_ex): the structures along the straight line from D1's relaxed ground state (x = 0)
+# to D2's relaxed excited state (x = 1), at ccd_points; at each, a ground-state single point (its
+# .check kept) and, from it, a ΔSCF single point of the same excitation (dscf_job), both at D2's
+# settings (the production ones with dscf_settings, Gamma where D2 used it); the parabolas, mode
 # energies and 1D Huang-Rhys factors of both states (ccd_fit) and the 1D luminescence lineshape at
 # lineshape_temperature (pl_spectrum: the ground state's mode, S_g, broadened by lineshape_sigma,
-# the ZPL by lineshape_gamma). Files in G_lineshape/ccd/: <excitation>_ccd.dat (x, Q and both
+# the ZPL by lineshape_gamma). Files in F_lineshape/ccd/: <excitation>_ccd.dat (x, Q and both
 # energies), <excitation>_pl_1d.dat and <excitation>_ccd.png. Runner group 'production'.
-#   Called by: main() (step G1)
+#   Called by: main() (step F1)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              build_defect(), ccd_fit(), delta_q(), draw_panels(), dscf_job(), dscf_settings(),
 #              format_table(), job_energy(), load_cell(), pl_spectrum(), production_job(), qtag(),
 #              start_spin(), write_columns()
 def step_ccd(p):
     from ase.geometry import find_mic
-    picks = p.out("interest")["for_G"]
+    picks = p.out("interest")["for_F"]
     if not picks:
-        return {"lines": {}, "_note": "F3 sent no excitation on to G"}
-    d = p.phase_dir("G")
+        return {"lines": {}, "_note": "E3 sent no excitation on to F"}
+    d = p.phase_dir("F")
     e1, e2 = p.out("relaxations"), p.out("zpl")
     cands, prim = p.out("generate")["candidates"], p.host()
     Pe = np.array(e1["cell"]["matrix"])
@@ -7425,7 +7078,7 @@ def step_ccd(p):
     if not paths:
         return {"lines": {}, "skipped": skipped,
                 "_note": "no excitation has a relaxed excited state to draw a path to"}
-    res1 = p.batch(f"{PHASE_DIRS['G']}/jobs/ccd_gs", gs_jobs, "ccd", p.production_param(),
+    res1 = p.batch(f"{PHASE_DIRS['F']}/jobs/ccd_gs", gs_jobs, "ccd", p.production_param(),
                    spacing=p.kspacing(), keep_check=True)
     if not res1["complete"]:
         return None
@@ -7443,7 +7096,7 @@ def step_ccd(p):
             ex_jobs.append(xj)
     res2 = {"complete": True, "jobs": {}, "calcs": {}}
     if ex_jobs:
-        res2 = p.batch(f"{PHASE_DIRS['G']}/jobs/ccd_ex", ex_jobs, "ccd", p.production_param(),
+        res2 = p.batch(f"{PHASE_DIRS['F']}/jobs/ccd_ex", ex_jobs, "ccd", p.production_param(),
                        spacing=p.kspacing())
         if not res2["complete"]:
             return None
@@ -7495,7 +7148,7 @@ def step_ccd(p):
                      line["E_abs"], line["E_em"], line["dq"], line["hw_g"], line["hw_e"],
                      line["S_g"], line["S_e"], line["DW"]] + ([line["DW_T"]] if T > 0 else [])
                     + [line["misfit"]])
-    table = format_table(["excitation", "defect", "k-points", "ZPL/eV", "ZPL E2", "E_abs",
+    table = format_table(["excitation", "defect", "k-points", "ZPL/eV", "ZPL D2", "E_abs",
                           "E_em", "dQ", "hw_g/eV", "hw_e/eV", "S_g", "S_e", "DW 0K"]
                          + ([f"DW {T:g}K"] if T > 0 else []) + ["misfit/eV"], rows,
                          "1D configuration-coordinate diagrams (ground-state and ΔSCF single "
@@ -7507,7 +7160,7 @@ def step_ccd(p):
             "_note": f"{len(lines)} configuration-coordinate diagram(s)"}
 
 
-# A defect's relaxed structure in the electronic cell (Pe) as G2's big cell (Pbig): carried over
+# A defect's relaxed structure in the electronic cell (Pe) as F2's big cell (Pbig): carried over
 # (carry_over) or, when the big cell is the electronic cell, itself; either way with its atoms in
 # the order of the defect built there (build_defect), and with each atom's ideal position relative
 # to the defect's centre (for common_atoms). Returns (Atoms, those positions).
@@ -7524,26 +7177,26 @@ def big_cell(prim, comps, Pe, relaxed, Pbig, label):
     return big, v
 
 
-# The vector G2 projects onto the phonons, on the big cell's atoms (big_v: their ideal positions
+# The vector F2 projects onto the phonons, on the big cell's atoms (big_v: their ideal positions
 # relative to the defect's centre; big_syms: their elements): with lineshape_method forces, ΔF,
-# the excited state's forces at the ground state's structure (the first step of E2's ΔSCF) less
-# the ground state's there (E2's ground-state single point; zero if it printed none: the structure
-# is relaxed), eV/Ang; with displacements, ΔR, the displacement of E2's relaxed excited structure
-# from E1's relaxed ground state, Ang. Each atom's value goes to the same atom of the big cell
+# the excited state's forces at the ground state's structure (the first step of D2's ΔSCF) less
+# the ground state's there (D2's ground-state single point; zero if it printed none: the structure
+# is relaxed), eV/Ang; with displacements, ΔR, the displacement of D2's relaxed excited structure
+# from D1's relaxed ground state, Ang. Each atom's value goes to the same atom of the big cell
 # (match_ideal, common_atoms), out to just under half the electronic cell's shortest image
 # distance (the region that cell describes); zero further out. Returns (N x 3 array or None, the
 # atoms that carry it, why None).
 #   Called by: step_lineshape()
 #   Calls:     common_atoms(), load_cell(), match_ideal(), min_image(), read_trajectory()
 def lineshape_vector(p, pk, run, prim, comps, Pe, big_v, big_syms, label):
-    jobs = p.dir / PHASE_DIRS["E"] / "jobs"
+    jobs = p.dir / PHASE_DIRS["D"] / "jobs"
     if p.s.lineshape_method == "forces":
         xf = jobs / "zpl" / pk["ex_job"] / f"{pk['ex_job']}.castep"
         sub = "zpl_gs_gamma" if pk["gs_job"].endswith("_G") else "zpl_gs"
         gf = jobs / sub / pk["gs_job"] / f"{pk['gs_job']}.castep"
         xs = read_trajectory(xf.read_text(errors="replace"), "free") if xf.exists() else []
         if not xs:
-            return None, 0, f"no forces in E2's ΔSCF output ({xf.name})"
+            return None, 0, f"no forces in D2's ΔSCF output ({xf.name})"
         atoms, _, fx = xs[0]
         gs = read_trajectory(gf.read_text(errors="replace"), "free") if gf.exists() else []
         fg = gs[0][2] if gs and gs[0][2].shape == fx.shape else np.zeros_like(fx)
@@ -7566,7 +7219,7 @@ def lineshape_vector(p, pk, run, prim, comps, Pe, big_v, big_syms, label):
 # its data files and its command (cmd, less --device: where it runs doesn't change the model),
 # fingerprinted in inputs.md5 (a folder without one keeps its model), so a changed training set or
 # setting is never answered with the old model.
-#   Called by: step_lineshape(), train_tasks()
+#   Called by: step_lineshape()
 def check_training(d, cmd):
     h = hashlib.md5(re.sub(r"--device=\S+", "", cmd).encode())
     for f in sorted(d.glob("*_train.xyz")) + sorted(d.glob("*_test.xyz")):
@@ -7582,24 +7235,24 @@ def check_training(d, cmd):
     stamp.write_text(h.hexdigest() + "\n")
 
 
-# G2 (lineshape : true): the multi-mode luminescence lineshape of each excitation F3 sends on.
-#  1. Single points at the production settings (G_lineshape/jobs/lineshape_data): lineshape_host
-#     pristine electronic cells and lineshape_displacements copies of each charge state's E1
+# F2 (lineshape : true): the multi-mode luminescence lineshape of each excitation E3 sends on.
+#  1. Single points at the production settings (F_lineshape/jobs/lineshape_data): lineshape_host
+#     pristine electronic cells and lineshape_displacements copies of each charge state's D1
 #     ground state, every atom displaced at random (normal, lineshape_amplitude Ang a component).
-#  2. A PBE model of each defect (G_lineshape/model/<defect>: train_command's MACE, one 'pbe'
-#     head, the total-charge embedding): trained on those, E1's relaxations of all its charge
+#  2. A PBE model of each defect (F_lineshape/model/<defect>: train_command's MACE, one 'pbe'
+#     head, the total-charge embedding): trained on those, D1's relaxations of all its charge
 #     states (filter_frames) and the pristine cells, a fifth kept for testing; with
 #     model_jobscript, run_training's jobs.
 #  3. The phonons of each excitation's ground state with its model (phonon_worker: a job with
-#     model_jobscript, else here; G_lineshape/phonons/<excitation>) in a big cell, the smallest with
+#     model_jobscript, else here; F_lineshape/phonons/<excitation>) in a big cell, the smallest with
 #     images at least lineshape_length apart (size_matrix; the electronic cell when that is longer
 #     already), the relaxed structure carried into it (big_cell), its force constants by finite
 #     differences (lineshape_delta), each mode's part in the excitation (lineshape_vector:
 #     lineshape_method forces, ΔF, or displacements, ΔR) and partial Huang-Rhys factor.
-#  4. The lineshape (pl_spectrum) at lineshape_temperature, with G1's 1D one for comparison:
-#     G_lineshape/lineshape/<excitation>_S.dat (the spectral function), _pl.dat and .png.
+#  4. The lineshape (pl_spectrum) at lineshape_temperature, with F1's 1D one for comparison:
+#     F_lineshape/lineshape/<excitation>_S.dat (the spectral function), _pl.dat and .png.
 # Runner group 'production' (the single points).
-#   Called by: main() (step G2)
+#   Called by: main() (step F2)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              atoms_to_dict(), big_cell(), build_defect(), castep_frames(), check_training(),
 #              draw_panels(), filter_frames(), format_table(), host_supercell(), job_energy(),
@@ -7608,12 +7261,12 @@ def check_training(d, cmd):
 #              train_command(), trained_model(), write_columns()
 def step_lineshape(p):
     if not p.s.lineshape:
-        return {"skipped": True, "_note": "lineshape : false (G1's 1D lineshapes only)"}
+        return {"skipped": True, "_note": "lineshape : false (F1's 1D lineshapes only)"}
     import ase.io
-    picks = p.out("interest")["for_G"]
+    picks = p.out("interest")["for_F"]
     if not picks:
-        return {"lines": {}, "_note": "F3 sent no excitation on to G"}
-    d = p.phase_dir("G")
+        return {"lines": {}, "_note": "E3 sent no excitation on to F"}
+    d = p.phase_dir("F")
     e1, ccd = p.out("relaxations"), p.out("ccd")
     cands, prim = p.out("generate")["candidates"], p.host()
     Pe = np.array(e1["cell"]["matrix"])
@@ -7643,7 +7296,7 @@ def step_lineshape(p):
             job["kind"] = "sp"
             jobs.append(job)
             meta[name] = (cid, q, S)
-    res = p.batch(f"{PHASE_DIRS['G']}/jobs/lineshape_data", jobs, "lineshape",
+    res = p.batch(f"{PHASE_DIRS['F']}/jobs/lineshape_data", jobs, "lineshape",
                   p.production_param(), spacing=p.kspacing())
     if not res["complete"]:
         return None
@@ -7658,7 +7311,7 @@ def step_lineshape(p):
             if c == cid and job_energy(res, name) is not None:
                 frames += castep_frames(res["calcs"][name].castep, q, S, name)
         for name, r in sorted(e1["runs"].items()):
-            f = p.dir / PHASE_DIRS["E"] / "jobs" / "relaxations" / name / f"{name}.castep"
+            f = p.dir / PHASE_DIRS["D"] / "jobs" / "relaxations" / name / f"{name}.castep"
             if r["cand"] == cid and r["energy"] is not None and f.exists():
                 frames += castep_frames(f, r["q"], r["spin_final"], name)
         kept = filter_frames(frames) + hosts
@@ -7674,14 +7327,14 @@ def step_lineshape(p):
             elif (folder / f"pbe_{s}.xyz").exists():
                 (folder / f"pbe_{s}.xyz").unlink()
         if not split["train"]:
-            die(f"G2: no training data for the model of {cid} (did its single points finish?)")
+            die(f"F2: no training data for the model of {cid} (did its single points finish?)")
         cmd = train_command(p, [("pbe", bool(split["test"]), False)])
         (folder / "train.sh").write_text(f"#!/bin/bash\n# The PBE model of {cid} for its "
-                                         f"phonons (dwf.py G2)\n{cmd}\n")
+                                         f"phonons (dwf.py F2)\n{cmd}\n")
         check_training(folder, cmd)
         tasks.append({"cid": cid, "dir": folder, "command": cmd, "heads": ["pbe"]})
         data[cid] = {"structures": len(kept), "host": len(hosts), "test": len(split["test"])}
-    if not run_training(p, "G2", tasks):
+    if not run_training(p, "F2", tasks):
         return None
     models = {t["cid"]: trained_model(t["dir"]) for t in tasks}
     Pbig = (Pe if p.s.lineshape_length <= e1["cell"]["L"] else
@@ -7722,7 +7375,7 @@ def step_lineshape(p):
         ph.append({"cid": tag, "dir": folder, "command": cmd, "done": folder / "result.json",
                    "what": "phonon calculation", "log": "phonons.log", "job": "phonons"})
         plan[tag] = (pk, n, len(big))
-    if not run_training(p, "G2", ph):
+    if not run_training(p, "F2", ph):
         return None
     T, sig, gam = p.s.lineshape_temperature, p.s.lineshape_sigma, p.s.lineshape_gamma
     lines, rows = {}, []
@@ -7742,7 +7395,7 @@ def step_lineshape(p):
         if one.get("hw_g") and one.get("S_g"):
             s1 = pl_spectrum([one["hw_g"]], [one["S_g"]], pk["zpl"], T, sig, gam)
             w1 = (s1["E"] >= sp["E"][win].min()) & (s1["E"] <= sp["E"][win].max())
-            series.append({"x": s1["E"][w1], "y": s1["PL"][w1], "label": "1D (G1)",
+            series.append({"x": s1["E"][w1], "y": s1["PL"][w1], "label": "1D (F1)",
                            "colour": 1})
         wsel = sp["w"] <= max(r["hw"] + [0.05]) + 5 * sig
         png = draw_panels(out / f"{tag}_lineshape.png", f"{tag}: {pk['name']} q {pk['q']:+d}",
@@ -7766,20 +7419,20 @@ def step_lineshape(p):
                     + [round(dq, 3), pk["dq"]])
     table = format_table(["excitation", "defect", "atoms", "test F/meV/A", "imag.", "S",
                           "S (1D)", "hw_eff/eV", "DW 0K"] + ([f"DW {T:g}K"] if T > 0 else [])
-                         + ["dQ", "dQ E2"], rows,
+                         + ["dQ", "dQ D2"], rows,
                          "Multi-mode lineshapes (the model's phonons in the big cell, "
                          f"lineshape_method {p.s.lineshape_method}; dQ in amu^0.5 A)")
     if skipped:
         table += "\nNot computed: " + "; ".join(f"{t} ({w})" for t, w in skipped.items()) + "\n"
     if any(x["imaginary"] for x in lines.values()):
-        log("WARNING: G2: some big cells have imaginary modes (see the table): the model's "
+        log("WARNING: F2: some big cells have imaginary modes (see the table): the model's "
             "minimum is not a minimum there; they are left out of the lineshape")
     return {"data": data, "big_cell": np.asarray(Pbig).tolist(), "lines": lines,
             "skipped": skipped, "_table": table,
             "_note": f"{len(lines)} multi-mode lineshape(s)"}
 
 
-# What a G2 phonon job runs (python3 dwf.py --phonon-worker spec.json in its folder, written by
+# What a F2 phonon job runs (python3 dwf.py --phonon-worker spec.json in its folder, written by
 # step_lineshape), with the defect's model (MACECalculator, its 'pbe' head, the total charge in
 # atoms.info): (1) its errors on the model's test structures (energy meV/atom, force components
 # meV/Ang); (2) the big cell relaxed (mace_run, to LINESHAPE_FMAX; kept in relaxed.json); (3) its
@@ -7906,7 +7559,7 @@ STEPS = [
          step_electronic, keys=("electronic_cell", "electronic_depth", "transform",
                                 "decay_length_multiple"),
          needs=("choose", "bands", "relax")),
-    # C: screening
+    # C: screening, ground and excited states
     Step("prerelax", "C1", "build the candidates and pre-relax them with MACE", step_prerelax,
          keys=("mace", "mace_model", "mace_fmax", "mace_steps", "configuration_margin"),
          needs=("generate", "choose", "relax"),
@@ -7932,111 +7585,80 @@ STEPS = [
          keys=SCREEN_KEYS + ("distortion_min_gain",), needs=("distort", "filter", "generate"),
          owns=("C_screen/jobs/drelax", "C_screen/structures/drelax"),
          version=2),                         # 2: the ranking in summary.txt (the same results)
-    # D: ground and excited states
-    Step("dataset", "D1", "training data for the ground-state model (C2/C5 steps, rattled host)",
-         step_dataset, keys=SCREEN_KEYS + ("model", "model_rattles", "model_rattle_stdev"),
-         needs=("screen", "distort", "drelax", "filter", "choose", "generate", "relax",
-                "converge"),
-         owns=("D_states/jobs/dataset", "D_states/model/data"),
-         version=1),                         # 1: in the cell the survivors work in
-    Step("hybrid", "D2", "hybrid single points for the model's 'hse' head", step_hybrid,
-         keys=("model", "model_hybrid", "model_hybrid_points"),
-         files=("hybrid_cell", "hybrid_param"), needs=("dataset", "distort", "choose"),
-         owns=("D_states/jobs/hybrid", "D_states/model/hybrid"),
-         version=3),                         # 3: a fixed number per defect, all for training
-    Step("train", "D3", "train each defect's model (MACE: pbe/hse heads, charge embedding)",
-         step_train, keys=MODEL_KEYS, needs=("dataset", "hybrid"),
-         owns=("D_states/model/train",)),
-    Step("check", "D4", "check the models (test errors, DFT forces at their minima), retrain",
-         step_check, keys=SCREEN_KEYS + MODEL_KEYS + ("model_hybrid", "model_force_tol",
-                                                      "model_rounds", "search_fmax",
-                                                      "search_steps"),
-         files=("hybrid_cell", "hybrid_param"),
-         needs=("train", "dataset", "hybrid", "filter", "distort", "drelax", "choose",
-                "generate", "relax", "converge"),
-         owns=("D_states/jobs/check_r*", "D_states/model/check", "D_states/mace/check"),
-         version=1),                         # 1: in the cell the survivors work in
-    Step("search", "D5", "the ground-state search with the model, in the electronic cell",
-         step_search, keys=("model", "search_distortions", "search_rattles", "search_fmax",
-                            "search_steps", "search_keep", "distort_around", "rattle_stdev",
-                            "rattle_dmin", "oxidation_states"),
-         needs=("check", "filter", "distort", "drelax", "electronic", "choose", "generate",
-                "relax"),
-         owns=("D_states/mace/search", "D_states/structures/search")),
-    Step("rank", "D6", "rank the ground states (the model's, or C5's with sharing)", step_rank,
+    Step("rank", "C6", "rank the ground states (C5's relaxations, with sharing)", step_rank,
          keys=SCREEN_KEYS + ("distortion_min_gain", "share_rounds", "keep_structures"),
-         needs=("distort", "drelax", "search", "choose"),
-         owns=("D_states/jobs/share_*", "D_states/structures/share"),
+         needs=("distort", "drelax", "choose"),
+         owns=("C_screen/jobs/share_*", "C_screen/structures/share"),
          version=4),        # 1: each kept structure's run and band carriers; 2: its cell's
                             # matrix; 3: its cell's tag; 4: in C4's cell (distort_cell)
-    Step("excite", "D7", "triplet ground states and their excitations (ΔSCF) in the electronic "
+    Step("excite", "C7", "triplet ground states and their excitations (ΔSCF) in the electronic "
          "cell", step_excite,
          keys=SCREEN_KEYS + ("excite", "excite_window", "excite_min", "excite_relax",
                              "excite_overrides", "excite_spin", "spin_tol", "local_fraction",
                              "excite_reach", "excite_min_dw"),
          needs=("rank", "electronic", "choose", "generate", "relax", "converge"),
-         owns=("D_states/jobs/excite_relax", "D_states/jobs/excite_gs", "D_states/jobs/excite",
-               "D_states/structures/excite_relax", "D_states/structures/excite"),
+         owns=("C_screen/jobs/excite_relax", "C_screen/jobs/excite_gs", "C_screen/jobs/excite",
+               "C_screen/structures/excite_relax", "C_screen/structures/excite"),
          version=1),                         # 1: the electronic cell, localised levels, triplets
-    Step("validate", "D8", "finite-size check of the screening cell's corrections (optional)",
+    Step("validate", "C8", "finite-size check of the screening cell's corrections (optional)",
          step_validate, keys=("validate", "validate_tol", "validate_defects", "validate_sizes",
                               "validate_gamma", "elastic_constants", "production_overrides",
                               "charge_correction", "energy"),
          needs=("rank", "choose", "converge", "relax", "dielectric", "generate", "scan"),
-         owns=("D_states/jobs/validate", "D_states/jobs/validate_gamma",
-               "D_states/structures/validate")),
-    # E: production cells and relaxations
-    Step("relaxations", "E1", "production relaxations of every charge state, electronic cell",
+         owns=("C_screen/jobs/validate", "C_screen/jobs/validate_gamma",
+               "C_screen/structures/validate")),
+    # D: production cells and relaxations
+    Step("relaxations", "D1", "production relaxations of every charge state, electronic cell",
          step_relaxations, keys=("production_overrides", "freeze_radius", "energy"),
          needs=("excite", "electronic", "choose", "converge", "relax", "generate"),
-         owns=("E_production/jobs/relaxations", "E_production/structures/relaxations")),
-    Step("zpl", "E2", "production ΔSCF of the excitations D7 passed (ZPL, dQ)", step_zpl,
+         owns=("D_production/jobs/relaxations", "D_production/structures/relaxations")),
+    Step("zpl", "D2", "production ΔSCF of the excitations C7 passed (ZPL, dQ)", step_zpl,
          keys=("production_overrides", "excite_overrides", "excite_relax", "excite_min",
                "excite_window", "excite_min_dw", "excite_reach", "local_fraction",
                "band_spread_tol", "energy"),
          needs=("relaxations", "generate", "relax", "converge"),
-         owns=("E_production/jobs/zpl_gs", "E_production/jobs/zpl_gs_gamma",
-               "E_production/jobs/zpl", "E_production/structures/zpl")),
-    # F: thermodynamics
-    Step("corrections", "F1", "finite-size corrections", step_corrections,
+         owns=("D_production/jobs/zpl_gs", "D_production/jobs/zpl_gs_gamma",
+               "D_production/jobs/zpl", "D_production/structures/zpl")),
+    # E: thermodynamics
+    Step("corrections", "E1", "finite-size corrections", step_corrections,
          keys=("charge_correction",), needs=("relaxations", "dielectric")),
-    Step("formation", "F2", "formation energies, levels, Fermi level per dopant set",
+    Step("formation", "E2", "formation energies, levels, Fermi level per dopant set",
          step_formation, keys=("gap", "fermi_temperature", "quench_temperature", "dopants"),
          needs=("corrections", "relaxations", "bands", "limits", "generate"),
-         owns=("F_thermo/formation.png",)),
-    Step("interest", "F3", "which excitations go on to the lineshape (G)", step_interest,
+         owns=("E_thermo/formation.png",)),
+    Step("interest", "E3", "which excitations go on to the lineshape (F)", step_interest,
          keys=("deep_level_margin",), needs=("formation", "zpl", "excite")),
-    # G: optical lineshapes
-    Step("ccd", "G1", "1D configuration-coordinate diagrams and lineshapes", step_ccd,
+    # F: optical lineshapes
+    Step("ccd", "F1", "1D configuration-coordinate diagrams and lineshapes", step_ccd,
          keys=("ccd_points", "production_overrides", "excite_overrides", "lineshape_temperature",
                "lineshape_sigma", "lineshape_gamma", "energy"),
          needs=("interest", "zpl", "relaxations", "generate", "relax", "converge"),
-         owns=("G_lineshape/jobs/ccd_gs", "G_lineshape/jobs/ccd_ex", "G_lineshape/ccd")),
-    Step("lineshape", "G2", "multi-mode lineshapes (a PBE model's phonons in a big cell)",
+         owns=("F_lineshape/jobs/ccd_gs", "F_lineshape/jobs/ccd_ex", "F_lineshape/ccd")),
+    Step("lineshape", "F2", "multi-mode lineshapes (a PBE model's phonons in a big cell)",
          step_lineshape,
          keys=("lineshape", "lineshape_displacements", "lineshape_amplitude", "lineshape_host",
                "lineshape_length", "lineshape_method", "lineshape_delta",
                "lineshape_temperature", "lineshape_sigma", "lineshape_gamma",
-               "production_overrides", "energy") + tuple(k for k in MODEL_KEYS if k != "model"),
+               "production_overrides", "energy") + MODEL_KEYS,
          needs=("ccd", "interest", "zpl", "relaxations", "generate", "relax", "converge"),
-         owns=("G_lineshape/jobs/lineshape_data", "G_lineshape/model", "G_lineshape/phonons",
-               "G_lineshape/lineshape")),
+         owns=("F_lineshape/jobs/lineshape_data", "F_lineshape/model", "F_lineshape/phonons",
+               "F_lineshape/lineshape")),
 ]
 STEP_INDEX = {s.name: s for s in STEPS}
 
 
-EXAMPLE_PROJECT = """\
-# Defect workflow project file    run:  nohup python3 dwf.py <this file> > run.log 2>&1 &
+EXAMPLE_PARAMETERS = """\
+# Defect workflow project: the science of it (NAME.parameters). How its jobs run is in NAME.run,
+# beside it, and dwf.py reads both:  nohup python3 dwf.py NAME > run.log 2>&1 &
 # Written like a CASTEP .param/.cell file: "keyword : value", %block ... %endblock, keywords
 # in any case, # or ! starts a comment. Lines starting with ! are optional settings with an
 # example value: delete the ! to use one. File names are relative to this file: the example
-# inputs (CaO:Sb on Cirrus) are in example_CaO_Sb/, this file and every file it names.
+# inputs (CaO:Sb on Cirrus) are in example_CaO_Sb/, these two files and every file they name.
 
 # ======================================================================= general
 host_cell : CaO_prim.cell      # host primitive cell: species_pot, symmetry_generate, k-points
 param     : CaO.param          # production settings (functional, cut-off, ...); dwf.py
                                #   sets task, charge and spin, and A1 sets cut_off_energy
-!workdir  : dwf_CaO_Sb         # where everything goes (default dwf_<file name>)
 # Supercell sizes are lengths (scan_lengths, B2): each is the most compact supercell of the host
 # with every periodic image at least that far away (found by doped). To use n x transform x
 # (primitive cell) instead, the smallest n for each length, give a transform; this one gives
@@ -8048,76 +7670,6 @@ param     : CaO.param          # production settings (functional, cut-off, ...);
 !%endblock transform
 mace         : true            # MACE for the size scan (B2) and the pre-relaxations (C1)
 !mace_model  : medium-mpa-0    # a mace_mp foundation model, or your own .model file
-mace_threads : 8               # threads per MACE relaxation
-# The MACE relaxations run where dwf.py runs, unless mace_jobscript is given: then as jobs on
-# compute nodes, each running up to mace_pack relaxations side by side (default
-# cores_per_node / mace_threads, 36 here) and asking for their cores ({NCORES} in the
-# template: 8 per relaxation), in at most mace_max_jobs jobs at a time.
-mace_jobscript : cirrus_mace.sh    # a Slurm template with a {COMMAND} line
-!mace_max_jobs : 4
-!mace_python   : /work/<project>/<project>/<you>/venv/bin/python   # the Python the jobs run
-                               #   (default: the one running dwf.py; it must be on /work,
-                               #   as the compute nodes can't see /home)
-
-# ======================================================================= runner settings
-# How the CASTEP jobs run: any supercell_convergence.py runner keyword (see its --example).
-# These are for Cirrus, whose nodes (288 cores) are shared between jobs, charged by the core:
-jobscript      : cirrus.sh     # template with {SEED}, {NODES}, {TASKS_PER_NODE}, {CPUS_PER_TASK}
-cores_per_node : 288
-charging       : core          # a job asks for just the cores it needs (node: whole nodes)
-max_cores      : 64            # most MPI processes per job (more or fewer for some steps: below)
-!max_walltime  : 12:00:00      # the longest a job may run (default: the template's --time)
-%block partitions              # memory comes with the cores (GB per core): each job goes on
-standard   2.66                #   the first where one core holds a process, else gets more
-highmem    5.33                #   cores per process where that takes the fewest
-%endblock partitions
-dryrun_time : 0:20:00          # dry runs: small jobs (one process, cores for 4 GB)
-!dryrun_on  : login            # ... or run them where dwf.py runs (dryrun_cmd)
-max_jobs  : 16                 # most jobs of one step queued at once
-!array    : 500                # jobs planned alike as Slurm job arrays of up to this many
-                               #   tasks (each still counts in max_jobs; with pack, a pack each)
-max_restarts : 20              # a relaxation that runs out of time carries on this many times
-poll      : 300
-delete_check : true            # delete each .check once its calculation has finished
-# ... and for some steps only, in a runner block: runner_host for all of phase A's CASTEP
-# steps (A1 to A3.1), runner_screen for those at the screening settings (C2, C3's single
-# points, C5, D1's pristine cells, D6, D7), runner_hybrid for the hybrid single points (D2, D4)
-# and runner_production for those at the production settings (D8, E1, E2, G1, G2's single
-# points); for one step: runner_converge (A1), runner_relax (A2.1), runner_bands (A2.2),
-# runner_dielectric (A2.3), runner_phases (A3.1), runner_filter (C3), runner_drelax (C5),
-# runner_dataset (D1), runner_check (D4), runner_rank
-# (D6), runner_excite (D7), runner_validate (D8), runner_relaxations (E1), runner_zpl (E2),
-# runner_ccd (G1), runner_lineshape (G2). A step's own block wins over its group's, and that
-# wins over the settings above, for the keywords they give (a %block partitions in one replaces
-# the whole list).
-# Starting points for CaO:Sb on Cirrus - set your own:
-%block runner_host             # A1 to A3.1: the primitive cell and the competing phases
-max_cores    : 32
-max_walltime : 4:00:00
-%endblock runner_host
-%block runner_converge         # A1: single points of the 2-atom primitive cell
-max_cores    : 16
-max_walltime : 0:20:00
-%endblock runner_converge
-%block runner_screen           # C2, C3, C5, D1, D6, D7: Gamma-only screening jobs
-max_restarts : 0               # (the default for screening: a job that fails is flagged)
-%endblock runner_screen
-%block runner_drelax           # C5: relaxations in the electronic cell, phase C's biggest
-max_cores    : 288
-max_walltime : 24:00:00
-%endblock runner_drelax
-%block runner_hybrid           # D2, D4: HSE06 single points at Gamma in the electronic cell,
-max_cores    : 576             #   by far the dearest jobs of the workflow
-max_walltime : 24:00:00
-%endblock runner_hybrid
-%block runner_production       # D8, E1, E2, G1, G2: the production settings, electronic cell
-max_cores    : 288             # up to a node (more: whole nodes, e.g. 576 for two)
-%endblock runner_production
-# On a machine that charges whole nodes, such as ARCHER2: jobscript : archer2.sh,
-# cores_per_node : 128, charging : node (the default) with max_nodes (nodes per job) in place
-# of max_cores, %block partitions with standard 2 --qos=standard and highmem 4 --qos=highmem,
-# and dryrun_on : login with dryrun_cmd : castep.serial --dryrun {seed} (ARCHER2's serial
-# partition rejects whole-node jobs); pack : N then runs N small jobs side by side on a node.
 
 # ======================================================================= A: host
 converge : true                # A1: converge the k-point grid, then the cut-off
@@ -8183,7 +7735,7 @@ scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this
 # deep level (deep_level_margin, below), from the band edges' effective masses (A2.2).
 !screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate
 !supercell : 14 ang            # fix the screening cell (a length, or n: n x transform)
-# B4: the electronic cell, where everything after C3 runs (but D8's test of the screening cell):
+# B4: the electronic cell, where everything after C3 runs (but C8's test of the screening cell):
 # the smallest size at least as big as the screening cell that folds every band-edge k-point
 # (each valley's symmetry-equivalent copies too) onto Gamma, so a Gamma-point run sees the real
 # gap, and is above the Gamma-only floor for a level electronic_depth from a band edge.
@@ -8195,7 +7747,7 @@ electronic_depth : 0.25 eV
 # less. The cells' atoms go as its cube: 3 needs under half those of 4 (CaO's B4: n320, not n728).
 decay_length_multiple : 4
 
-# ======================================================================= C: screening
+# =============================================== C: screening, ground and excited states
 screen_charges   : -1 0 1
 screen_spins     : triplet     # the starting spin: triplet (a doublet for an odd electron
                                #   count) | low (0 or 1) | both (low, and low + 2)
@@ -8229,59 +7781,27 @@ distort_around  : auto         # auto: a single defect's site, a nearest-neighbo
                                #   anchor (the first component, e.g. the dopant) | vacancy
 distort_cell    : electronic   # where everything after C3 works: electronic (B4's cell;
                                #   C1-C3 screen every candidate in the smaller screening
-                               #   cell) | screening (C4-C5 and D1-D4 stay there)
+                               #   cell) | screening (C4-C6 stay there)
 !%block oxidation_states       # for the number of neighbours to distort
 !Ca +2
 !O  -2
 !Sb +3
 !%endblock oxidation_states
-
-# ================================================================ D: ground and excited states
-# D1-D5 (model : true): a MACE model of each defect C3 keeps (after Wang, Mosquera-Lois and
-# Walsh, arXiv:2603.05238): a 'pbe' head trained on its C5 runs (D1, with model_rattles rattled
-# pristine cells) and an 'hse' head on hybrid single points of model_hybrid_points of them (D2:
-# shared out over the charge states, each one's lowest structure first, then those most unlike the
-# ones picked; and one rattled pristine cell), weighted in the training like a tenth of the PBE
-# data, as in the paper; the total charge embedded so that one model covers every charge state
-# (D3). D4 checks it: its test errors, and the hybrid's forces at the model's minima (at most
-# model_force_tol, else those points join the data and it is trained again, up to model_rounds
-# times). D5 searches with it: ShakeNBreak distortions (search_distortions) and rattles of every
-# charge state, and each distinct minimum of one charge state tried in the others. All of it in
-# the electronic cell, like everything after C3. With model : false, D6 ranks C5's relaxations
-# instead.
-model           : true
-model_hybrid    : true         # false: the 'pbe' head only, no hybrid single points
-hybrid_param    : CaO_hse.param    # D2, D4: xc_functional : HSE06 (single points at Gamma)
-hybrid_cell     : CaO_ncp.cell     # its species_pot: CASTEP's hybrids need norm-conserving
-model_jobscript : cirrus_gpu.sh    # the trainings (and G2's phonons) as GPU jobs; without
-model_device    : cuda             #   it, they run where dwf.py runs
-!model_hybrid_points : 6       # D2's hybrid single points per defect (the paper took about 40
-                               #   for one charge state); D4 adds more where the model is off
-!model_rattles  : 10
-!model_epochs   : 300
-!model_channels : 64           # the model's size (with model_r_max 5 ang, model_max_L 1,
-                               #   model_batch 4)
-!model_train_args : --swa      # anything else for mace_run_train
-!model_force_tol : 0.1 eV/ang
-!model_rounds   : 2
-!search_distortions : -0.7 -0.6 -0.5 -0.4 -0.3 -0.2 -0.1 0.1 0.2 0.3 0.4 0.5 0.6 0.7
-!search_rattles : 2            # rattled copies of each distortion
-!search_keep    : 10           # distinct minima per charge state for D6
-# D6: the ground states: D5's minima ranked by the model (model : true), or C5's relaxations,
-# a winning distortion tried in the other charge states (model : false).
+# C6: the ground states: C5's relaxations, with a winning distortion tried in the other charge
+# states.
 distortion_min_gain : 0.05 eV  # a distortion counts if it beats the unperturbed by this
-share_rounds    : 2            # (model : false) rounds of sharing distortions
-keep_structures : 1            # per charge state, on to D7
-# D7: in the electronic cell, at the screening settings. Each charge state's ground state is
+share_rounds    : 2            # rounds of sharing distortions
+keep_structures : 1            # per charge state, on to C7
+# C7: in the electronic cell, at the screening settings. Each charge state's ground state is
 # relaxed: a triplet (spin within spin_tol of excite_spin) goes on, a band state is left
-# 'pending' (PBE can't place it), any other only to F. Its defect levels are the bands localised
+# 'pending' (PBE can't place it), any other only to E. Its defect levels are the bands localised
 # on the defect (participation number at most local_fraction of the atoms), in the gap or up to
 # excite_reach inside a band; in each spin channel the highest occupied one to the lowest empty
 # one is excited (CASTEP's ΔSCF) and relaxed. It passes if its ZPL is at least excite_min (and
 # inside excite_window), the promoted electron stays on the defect and the 1D Debye-Waller
-# estimate is at least excite_min_dw. Defects that pass go on to E with all their charge states,
-# and so does every native defect (for F). Test CASTEP's ΔSCF on one defect first.
-excite         : true          # false: everything D6 kept goes on to E as it is
+# estimate is at least excite_min_dw. Defects that pass go on to D with all their charge states,
+# and so does every native defect (for E). Test CASTEP's ΔSCF on one defect first.
+excite         : true          # false: everything C6 kept goes on to D as it is
 excite_spin    : 2             # CASTEP's spin: 2 = triplet; any: every spin state
 !spin_tol      : 0.3
 !local_fraction : 0.2
@@ -8290,11 +7810,11 @@ excite_min     : 0.4 eV
 !excite_window : 0.3 3.5 eV    # pass only if the ZPL is in this window
 !excite_min_dw : 0.05          # pass only if the 1D Debye-Waller estimate is at least this
 excite_relax   : true          # relax the excited state (the ZPL); false: vertical energy
-!%block excite_overrides       # any other .param keywords for D7's runs
+!%block excite_overrides       # any other .param keywords for C7's runs
 !deltascf_smearing : 0.01
 !%endblock excite_overrides
-# D8 (optional): a test of the screening cell's finite-size error, which C3's hull rests on.
-# Each defect named here is relaxed in each charge state D6 kept (its lowest structure; band
+# C8 (optional): a test of the screening cell's finite-size error, which C3's hull rests on.
+# Each defect named here is relaxed in each charge state C6 kept (its lowest structure; band
 # states left out) at the production settings (production_overrides, with the stress on) in the
 # screening cell and in the next validate_sizes sizes up. The line E_inf + b/N through the bigger
 # sizes is the reference for three estimates from the screening cell: its E as it is, less
@@ -8302,7 +7822,7 @@ excite_relax   : true          # relax the excited state (the ZPL); false: verti
 # validate_gamma, Gamma-point single points of the same structures show the Gamma-only error.
 # Costly: the ladder's biggest cells, so name two or three defects.
 !validate : true
-!validate_defects : d001 d002  # B1's ids (default: every defect D6 kept)
+!validate_defects : d001 d002  # B1's ids (default: every defect C6 kept)
 !validate_sizes   : 3          # how many sizes above the screening cell
 !validate_tol     : 0.05 eV    # how close each estimate must come (levels too)
 !validate_gamma   : true
@@ -8310,10 +7830,10 @@ excite_relax   : true          # relax the excited state (the ZPL); false: verti
 !226.2 62.4 80.6               #   CaO at 298 K (Drago & Spain 1977); your functional's own
 !%endblock elastic_constants   #   (e.g. PBE's) are better, as the stress comes from it
 
-# ======================================================================= E: production
-# E1: every charge state of each defect D7 passes (and of every native defect) relaxed at the
+# ======================================================================= D: production
+# D1: every charge state of each defect C7 passes (and of every native defect) relaxed at the
 # production settings (A1's cut-off and k-points), in the electronic cell, with the pristine
-# cell's single point. E2: the production ΔSCF of D7's excitations. A single point with the
+# cell's single point. D2: the production ΔSCF of C7's excitations. A single point with the
 # bands' weights first checks that each constrained band keeps its number at every k-point
 # (inside the gap, spread less than band_spread_tol); where it doesn't, the ΔSCF runs at Gamma.
 %block production_overrides
@@ -8323,42 +7843,137 @@ geom_max_iter   : 100
 %endblock production_overrides
 !band_spread_tol : 0.05 eV
 freeze_radius : 0              # (untested idea) fix the atoms further than this (Ang) from
-                               #   every component of the defect, in E1
+                               #   every component of the defect, in D1
 
-# ======================================================================= F: thermodynamics
+# ======================================================================= E: thermodynamics
 charge_correction : lz         # lz | mp | none
-gap : 7.09 eV                  # band gap for the Fermi-level range of C3, F2 and F3 (default:
-                               #   the screening cell's in C3, A2.2's in F): CaO's measured one
+gap : 7.09 eV                  # band gap for the Fermi-level range of C3, E2 and E3 (default:
+                               #   the screening cell's in C3, A2.2's in E): CaO's measured one
 !fermi_temperature  : 1000 K   # self-consistent Fermi level at this temperature
 !quench_temperature : 300 K    # ... with the defects frozen in, then at this one
-deep_level_margin : 0.5 eV     # F3: a level this far from both band edges is "deep" (B3's
+deep_level_margin : 0.5 eV     # E3: a level this far from both band edges is "deep" (B3's
                                #   Gamma-only floor is for a level this deep)
-# F2 finds the Fermi level of each set of dopants on its own (the native defects alone, with
-# each dopant, and with each mix that one defect brings), and F3 sends on to G each excitation
-# that passed E2 whose charge state is the lowest for some Fermi level in the gap.
+# E2 finds the Fermi level of each set of dopants on its own (the native defects alone, with
+# each dopant, and with each mix that one defect brings), and E3 sends on to F each excitation
+# that passed D2 whose charge state is the lowest for some Fermi level in the gap.
 
-# ======================================================================= G: lineshapes
-# G1: the 1D configuration-coordinate diagram of each excitation F3 sends on: ground-state and
+# ======================================================================= F: lineshapes
+# F1: the 1D configuration-coordinate diagram of each excitation E3 sends on: ground-state and
 # ΔSCF single points along the line from the relaxed ground state (0) to the relaxed excited
-# state (1), at E2's settings; parabolas give each state's phonon energy and Huang-Rhys factor,
+# state (1), at D2's settings; parabolas give each state's phonon energy and Huang-Rhys factor,
 # and the 1D luminescence lineshape.
 !ccd_points : -0.4 -0.2 0 0.2 0.4 0.6 0.8 1 1.2 1.4
 lineshape_temperature : 10 K   # the temperature of both lineshapes
 !lineshape_sigma : 0.006 eV    # Gaussian width of each phonon line
 !lineshape_gamma : 0.002 eV    # Lorentzian half-width of the ZPL
-# G2 (optional): the multi-mode lineshape. A PBE model of each defect (one head, the charge
+# F2 (optional): the multi-mode lineshape. A PBE model of each defect (one head, the charge
 # embedded), trained on lineshape_displacements displaced copies of its ground state (normal,
-# lineshape_amplitude a component), its E1 relaxations and lineshape_host rattled pristine
+# lineshape_amplitude a component), its D1 relaxations and lineshape_host rattled pristine
 # cells, all at the production settings; its phonons in a cell lineshape_length across (finite
 # differences, lineshape_delta), projected onto the excited state's forces at the ground
 # state's structure (lineshape_method forces) or onto the displacement between the relaxed
-# states (displacements). The trainings and phonons run with model_jobscript.
+# states (displacements). The trainings and phonons run with model_jobscript (in NAME.run),
+# the model's size and training set here:
 !lineshape : true
 !lineshape_displacements : 30
 !lineshape_amplitude : 0.02 ang
 !lineshape_host   : 5
 !lineshape_length : 30 ang     # CaO: about 1900 atoms, 11,500 model force evaluations
 !lineshape_method : forces     # forces | displacements
+!model_epochs   : 300
+!model_channels : 64           # the model's size (with model_r_max 5 ang, model_max_L 1,
+                               #   model_batch 4)
+!model_train_args : --swa      # anything else for mace_run_train
+"""
+
+EXAMPLE_RUN = """\
+# Defect workflow project: how its jobs run (NAME.run), here on Cirrus. The science is in
+# NAME.parameters, beside it, and dwf.py reads both:  nohup python3 dwf.py NAME > run.log 2>&1 &
+# Written like a CASTEP .param/.cell file: "keyword : value", %block ... %endblock, keywords
+# in any case, # or ! starts a comment. Lines starting with ! are optional settings with an
+# example value: delete the ! to use one. File names are relative to this file.
+
+!workdir  : dwf_CaO_Sb         # where everything goes (default dwf_<name>, beside these files)
+
+# ======================================================================= CASTEP jobs
+# How the CASTEP jobs run: any supercell_convergence.py runner keyword (see its --example).
+# These are for Cirrus, whose nodes (288 cores) are shared between jobs, charged by the core:
+jobscript      : cirrus.sh     # template with {SEED}, {NODES}, {TASKS_PER_NODE}, {CPUS_PER_TASK}
+cores_per_node : 288
+charging       : core          # a job asks for just the cores it needs (node: whole nodes)
+max_cores      : 64            # most MPI processes per job (more or fewer for some steps: below)
+!max_walltime  : 12:00:00      # the longest a job may run (default: the template's --time)
+%block partitions              # memory comes with the cores (GB per core): each job goes on
+standard   2.66                #   the first where one core holds a process, else gets more
+highmem    5.33                #   cores per process where that takes the fewest
+%endblock partitions
+dryrun_time : 0:20:00          # dry runs: small jobs (one process, cores for 4 GB)
+!dryrun_on  : login            # ... or run them where dwf.py runs (dryrun_cmd)
+max_jobs  : 16                 # most jobs of one step queued at once
+!array    : 500                # jobs planned alike as Slurm job arrays of up to this many
+                               #   tasks (each still counts in max_jobs; with pack, a pack each)
+max_restarts : 20              # a relaxation that runs out of time carries on this many times
+poll      : 300
+delete_check : true            # delete each .check once its calculation has finished
+# ... and for some steps only, in a runner block: runner_host for all of phase A's CASTEP
+# steps (A1 to A3.1), runner_screen for those at the screening settings (C2, C3's single
+# points, C5, C6, C7) and runner_production for those at the production settings (C8, D1, D2,
+# F1, F2's single points); for one step: runner_converge (A1), runner_relax (A2.1),
+# runner_bands (A2.2), runner_dielectric (A2.3), runner_phases (A3.1), runner_filter (C3),
+# runner_drelax (C5), runner_rank (C6), runner_excite (C7), runner_validate (C8),
+# runner_relaxations (D1), runner_zpl (D2), runner_ccd (F1), runner_lineshape (F2); the MACE
+# jobs have blocks of their own (below). A step's own block wins over its group's, and that
+# wins over the settings above, for the keywords they give (a %block partitions in one replaces
+# the whole list).
+# Starting points for CaO:Sb on Cirrus - set your own:
+%block runner_host             # A1 to A3.1: the primitive cell and the competing phases
+max_cores    : 32
+max_walltime : 4:00:00
+%endblock runner_host
+%block runner_converge         # A1: single points of the 2-atom primitive cell
+max_cores    : 16
+max_walltime : 0:20:00
+%endblock runner_converge
+%block runner_screen           # C2, C3, C5, C6, C7: Gamma-only screening jobs
+max_restarts : 0               # (the default for screening: a job that fails is flagged)
+%endblock runner_screen
+%block runner_drelax           # C5: relaxations in the electronic cell, phase C's biggest
+max_cores    : 288
+max_walltime : 24:00:00
+%endblock runner_drelax
+%block runner_production       # C8, D1, D2, F1, F2: the production settings, electronic cell
+max_cores    : 288             # up to a node (more: whole nodes, e.g. 576 for two)
+%endblock runner_production
+# On a machine that charges whole nodes, such as ARCHER2: jobscript : archer2.sh,
+# cores_per_node : 128, charging : node (the default) with max_nodes (nodes per job) in place
+# of max_cores, %block partitions with standard 2 --qos=standard and highmem 4 --qos=highmem,
+# and dryrun_on : login with dryrun_cmd : castep.serial --dryrun {seed} (ARCHER2's serial
+# partition rejects whole-node jobs); pack : N then runs N small jobs side by side on a node.
+
+# ======================================================================= MACE jobs
+mace_threads : 8               # threads per MACE relaxation
+# The MACE relaxations run where dwf.py runs, unless mace_jobscript is given: then as jobs on
+# compute nodes, each running up to mace_pack relaxations side by side (default
+# cores_per_node / mace_threads, 36 here) and asking for their cores ({NCORES} in the
+# template: 8 per relaxation), in at most mace_max_jobs jobs at a time.
+mace_jobscript : cirrus_mace.sh    # a Slurm template with a {COMMAND} line
+!mace_max_jobs : 4
+!mace_python   : /work/<project>/<project>/<you>/venv/bin/python   # the Python the jobs run
+                               #   (default: the one running dwf.py; it must be on /work,
+                               #   as the compute nodes can't see /home)
+# B2 relaxes every candidate in every size it fits, which for a big screen is thousands of
+# relaxations, shared out over at most mace_max_jobs jobs: give it more jobs, and the time they
+# need, in its own block (runner_prerelax does the same for C1). Such a block may give
+# mace_jobscript, mace_pack, mace_max_jobs, mace_threads, mace_python, mace_device and
+# max_walltime, each job's --time (default: the template's):
+!%block runner_scan
+!mace_max_jobs : 40
+!max_walltime  : 12:00:00
+!%endblock runner_scan
+
+# ======================================================================= F2's model jobs
+model_jobscript : cirrus_gpu.sh    # F2's training and phonons as GPU jobs; without
+model_device    : cuda             #   it, they run where dwf.py runs
 """
 
 
