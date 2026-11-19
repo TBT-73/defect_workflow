@@ -564,7 +564,8 @@ directory, then `srun --nodes=1 --ntasks=n --cpus-per-task=c --exact --mem=...M`
 the template's CASTEP line - and `wait`. Each job's output, including `slurm-<job id>.out`, stays
 in its own directory, and its `job_info.json` records the pack. When fewer than N jobs are left
 they share the node evenly; a job left on its own is planned for whole nodes. A job that needs a
-restart runs on its own. The template's CASTEP line must use `srun`.
+restart runs on its own. The template's CASTEP line must use `srun`. With `array` as well, the
+packs go as job arrays, one pack a task (below).
 
 **Job arrays (`array : N`).** For thousands of jobs, on Slurm: the jobs waiting to go are
 submitted as job arrays of up to N tasks, instead of one `sbatch` each. Each job is planned as
@@ -583,8 +584,28 @@ smaller; capped at N and `max_jobs`), or room for all the jobs left. A bigger `a
 fewer, bigger arrays, but the queue runs lower while the script waits for the places. The
 queue is then read once a poll for all the jobs, with `squeue -h -r -u $USER -o '%i %T'`
 (`status_cmd` isn't used). Sites cap an array's size (Slurm's default `MaxArraySize` allows 1,000
-tasks; `scontrol show config | grep -i maxarray` shows yours): keep N within it. Not with `pack`.
-The template's CASTEP line needn't use `srun`.
+tasks; `scontrol show config | grep -i maxarray` shows yours): keep N within it. The template's
+CASTEP line needn't use `srun` (with `pack` too, it must).
+
+**Arrays of packs (`array` and `pack` together).** With both, each task of an array is a pack: a
+node (with `charging : core`, its jobs' cores of a shared node) running M jobs side by side
+(`pack : M`), each with its own `srun --exact`, cores and memory as in a pack. With `pack : 40` on
+40-core nodes that is one job a core, and an array of 50 tasks runs 2,000 such jobs on 50 nodes
+from one `sbatch`. Jobs planned to share a node that run alike there (the same processes, cores
+per process, threads, memory and partition) go M to a task (with `charging : core`, as many as a
+node's cores hold, up to M) in one array, `packs/pack_array_NNN/job.sh`: the pack's `#SBATCH`
+lines with `--array=0-<packs - 1>` and the longest of all its jobs' walltimes, and in place of the
+CASTEP line a loop over the task's M jobs - lines task × M + 1 to (task + 1) × M of `tasks.txt`
+beside it (the directory, a tab, the seed) - that starts each in its own directory in the
+background, with its output in `slurm-<array job id>_<task>.out` there, and then waits for them
+all. Every task is a full pack: the jobs left over, fewer than M, go as a pack of their own, each
+planned for more of the node as with `pack` alone (one left alone gets whole nodes), and a group
+too small for two full packs goes as packs. Jobs too big to share a node go in plain arrays, as
+above. `max_jobs` and `array_min` count tasks (Slurm jobs), so `max_jobs : 500` queues up to
+500 × M jobs at once. Each job is recorded with its task's job id, so `squeue`, `sacct`, timings
+and restarts work as for a job of its own; a restart runs on its own. Without `mem_per_core` or
+`%block partitions` the script can't know a node's memory, so jobs that differ only in what their
+dry runs ask for share an array, each given the most any of them needs.
 
 **Dry runs in one job (`dryrun_pack : N`).** With `dryrun_on : compute`, each dry run is otherwise a
 job of its own. `dryrun_pack : N` runs up to N of them side by side in one job
@@ -678,7 +699,7 @@ Defaults in brackets.
 - `max_jobs` [no limit]: the most jobs queued at once.
 - `tolerate_failures` [false]: a job that fails is marked failed and the others carry on.
 - `pack` [1]: run up to N jobs side by side on one node, in one job (needs `cores_per_node`; with `charging : core`, jobs on part of a node, as many as one node holds).
-- `array` [1]: submit the jobs as Slurm job arrays of up to N tasks, those planned alike in one (each task still counts in `max_jobs`; not with `pack`).
+- `array` [1]: submit the jobs as Slurm job arrays of up to N tasks, those planned alike in one (each task still counts in `max_jobs`; with `pack`, each task is a pack of jobs side by side on one node).
 - `array_min` [a quarter of `array`, or of `max_jobs` if smaller]: with `array`, the free places in the queue (of `max_jobs`) the script waits for before it sends another array, so the fewest tasks such an array has (unless fewer jobs are left); capped at `array` and `max_jobs`.
 - `dryrun_pack` [1]: run up to N dry runs side by side in one job (`dryrun_on : compute`).
 - `%block jobs`, plus `param`, `geom_param`, `cell`, `kspacing`, `energy`, `workdir`: see [Batch mode](#batch-mode).

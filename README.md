@@ -304,6 +304,30 @@ pack         : 4
 - It needs `cores_per_node` and a jobscript whose CASTEP line uses `srun` (each job of a pack is
   started with its own `srun --exact`).
 
+With `array` as well, the packs go as Slurm job arrays, one pack a task: each task is a node
+running N jobs side by side, so a step of thousands of small jobs needs only a few submissions.
+With `pack` at `cores_per_node` (40 on young-ng, 128 on ARCHER2), each job has one core. E.g.:
+
+```
+%block runner_screen           # C2, C3, C5, D1, D6, D7: the screening jobs
+max_nodes : 1
+pack      : 4                  # four jobs side by side on a node (40 for one core each)
+array     : 500                # the packs as job arrays of up to 500 tasks, one node each
+max_jobs  : 500                # at most 500 tasks (nodes) queued at once: 2,000 jobs
+%endblock runner_screen
+```
+
+- The jobs planned alike (the same processes, cores per process, memory and partition) go N to a
+  task, in one array. A job too big for its share is planned on whole nodes, and goes in a plain
+  array with the jobs planned like it.
+- Every task is a full pack. The jobs left over, fewer than N, go as a pack of their own, each
+  given more of the node, as above.
+- `max_jobs` and `array_min` count tasks, each a node of N jobs.
+- The array's job script is `jobs/<step>/packs/pack_array_NNN/job.sh`, with its jobs listed in
+  `tasks.txt` beside it; each job's output, `slurm-<array job id>_<task>.out`, is in its own folder.
+- With one core a job, each job's share of a node's memory is small (3.4 GB on young-ng), and a job
+  takes up to N times as long as on N cores: it suits small cells, with `max_walltime` in mind.
+
 The dry runs can be packed too, which matters with `dryrun_on : compute`, where each dry run is
 otherwise a job of its own that waits in the queue and, on ARCHER2's standard partition, takes a
 whole node. `dryrun_pack : N` (e.g. 32, for every step) runs up to N of a step's dry runs side
@@ -1553,10 +1577,10 @@ here, and `cores_per_node` for the default `mace_pack` ([MACE](#mace) has their 
 | `submit_cmd` | `sbatch` | The command that submits a job. |
 | `status_cmd` | `squeue` or `qstat` | The command that lists queued and running jobs. |
 | `poll` | `120 s` | Seconds between checks of the queue. |
-| `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once (with `array`, each task of an array counts). |
+| `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once (with `array`, each task of an array counts; with `pack` too, each task is a node of N jobs). |
 | `tolerate_failures` | `false` (`true` for C2, C3, C5, D1, D2, D4, D6, D7, D8, E1, E2, G1 and G2) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
-| `pack` | `1` | Run up to N of a step's jobs side by side on one node, in one job: with `charging : node`, each on `cores_per_node`/N cores and its share of the node's memory; with `charging : core`, each with its own cores, the pack asking for them all, as many as one node holds ([How a run works](#how-a-run-works)). Needs `cores_per_node` and a jobscript whose CASTEP line uses `srun`. |
-| `array` | `1` | With Slurm: send a step's jobs as job arrays of up to N tasks instead of one `sbatch` each, the jobs planned alike in one array (others in arrays of their own). `max_jobs` still counts every task, and the queue is topped up with a new array once `array_min` places are free; the queue is read with one `squeue -r` a poll. For steps of thousands of jobs, such as C2 of a big screen; keep N within the site's array limit. Not with `pack`. |
+| `pack` | `1` | Run up to N of a step's jobs side by side on one node, in one job: with `charging : node`, each on `cores_per_node`/N cores and its share of the node's memory; with `charging : core`, each with its own cores, the pack asking for them all, as many as one node holds ([How a run works](#how-a-run-works)). With `array`, the packs go as job arrays, one pack a task. Needs `cores_per_node` and a jobscript whose CASTEP line uses `srun`. |
+| `array` | `1` | With Slurm: send a step's jobs as job arrays of up to N tasks instead of one `sbatch` each, the jobs planned alike in one array (others in arrays of their own). `max_jobs` still counts every task, and the queue is topped up with a new array once `array_min` places are free; the queue is read with one `squeue -r` a poll. For steps of thousands of jobs, such as C2 of a big screen; keep N within the site's array limit. With `pack`, each task is a pack, a node running N jobs side by side ([How a run works](#how-a-run-works)). |
 | `array_min` | a quarter of `array` (or of `max_jobs`, if smaller) | With `array`: how many places in the queue (of `max_jobs`) must be free before another array goes, so the fewest tasks such an array has (unless fewer jobs are left). Bigger: fewer, bigger arrays, but the queue runs lower meanwhile. Capped at `array` and `max_jobs` (so a step whose own block lowers `max_jobs` still tops up); ignored without `array`. |
 
 `--prepare-only`, `--no-wait`, `--resubmit-failed` and `--force` are command-line switches
@@ -2091,19 +2115,35 @@ runs an array's tasks one after another: seven single points planned alike with 
 its own job's directory with its output there and its job id `<array job id>_<task>`; a group of one
 went as a plain job; 8- and 64-atom jobs, planned on different numbers of processes, went in arrays
 of their own; two relaxations of one array that stopped at `run_time` each carried on from its
-`.check` in a job of its own; `array` with `pack`, without `sbatch` or at 0 is refused; `squeue -r`
+`.check` in a job of its own; `array` without `sbatch` or at 0 is refused; `squeue -r`
 is read once a poll; with `array_min : 3` the top-up of 2 waits, giving arrays of 3 and 3 and the
 last job on its own. With `array : 1` nothing changes. The runner now keeps each job's
 `job_info.json` in memory and doesn't read a finished job's output again: 1,000 mock jobs took about
 110 s of the runner's own work before and 9 s after, and 10,000 about a minute.
+
+Then arrays of packs (`array` with `pack`), on the same mock Slurm (40-core nodes, `pack : 4`):
+nine single points went as one array of two tasks, each a node running four jobs side by side on
+10 cores each (the template's `#SBATCH` lines for one whole node, a loop over the task's four lines
+of `tasks.txt`, `--exact` and a quarter of three quarters of the node's memory each), with the ninth
+on its own on the whole node; each job ran in its own folder, with its id `<array job id>_<task>`
+and its output there. Ten jobs gave the array and a pack of the last two (half a node each); six,
+too few for two full packs, two packs of three (a third each); twenty with `max_jobs : 3` arrays of
+three and then two tasks. Relaxations of an array of packs that stopped at `run_time` carried on
+from their `.check` in jobs of their own. The array's script ran under `dash` as well as `bash`.
+With `charging : core`, four 8-core jobs went to a task that asked for their 32 cores of a shared
+node, each job with `--mem-per-cpu`; without `mem_per_core`, 8- and 16-atom jobs on 10 cores each
+shared one array, each asking for the most memory any needed. `pack` without `array` gave the same
+job scripts as before, byte for byte, in eight cases (whole nodes and `charging : core`, OpenMP
+threads, partitions with options, relaxations, `dryrun_pack`). 10,000 mock single points with
+`pack : 40` went as one array of 250 tasks, with about a minute of the runner's own work, as before.
 
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), real `mace_run_train` trainings with two heads and the charge embedding (D3, D4, G2: the
 command was checked, not run), real hybrid single points (D2, D4; they need CASTEP to print the
 forces of a single point), real CASTEP ΔSCF (D7, E2, G1) and `.pdos_weights` files (C3, D7; their
 layout is taken from CASTEP's source), real CASTEP stress tensors (D8), real Slurm for the MACE and
-model jobs and for job arrays (`array`), a phonon job on a real GPU, and real CASTEP output for the
-DFPT permittivity and the `.bands` of spin-polarised runs.
+model jobs and for job arrays (`array`, with `pack` too), a phonon job on a real GPU, and real
+CASTEP output for the DFPT permittivity and the `.bands` of spin-polarised runs.
 
 On the first real runs, check:
 
@@ -2204,4 +2244,8 @@ On the first real runs, check:
    queued as `<array job id>_<task>`, and afterwards that each task's
    `slurm-<array job id>_<task>.out` and `.castep` are in its own job's folder. If `sbatch` refuses
    the array (a limit on the jobs you may queue, or an array bigger than the site allows), lower
-   `array` and `max_jobs`.
+   `array` and `max_jobs`. With `pack` too, the script is `packs/pack_array_NNN/job.sh`: check
+   that each task ran its jobs side by side on one node, each within its memory
+   (`sacct -j <array job id>_<task> -o JobID,NodeList,NCPUS,MaxRSS,Elapsed` lists a step for each
+   job), and that each job's `slurm-<array job id>_<task>.out` in its folder shows no `srun`
+   errors.

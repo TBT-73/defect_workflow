@@ -1008,7 +1008,7 @@ class Calc:
 # Replaces each placeholder ({SEED}, {NCORES}, {MEM_GB}, ...) in a template with its value.
 # Used for job.sh, dryrun.sh, and the placeholders allowed in partition and dry-run #SBATCH
 # options.
-#   Called by: dryrun_script(), finalize()
+#   Called by: dryrun_sbatch(), dryrun_script(), finalize(), pack_script(), submit_dryrun_pack()
 def fill(template, subs):
     for key, val in subs.items():
         template = template.replace(key, str(val))
@@ -1019,8 +1019,8 @@ def fill(template, subs):
 # Replaces the option wherever it already appears, in either spelling (-p/--partition, -t/--time,
 # ...: SBATCH_SHORT), removing duplicates; otherwise adds it after the last #SBATCH line. A memory
 # request (--mem, --mem-per-cpu, ...) replaces any other memory request.
-#   Called by: dryrun_sbatch(), finalize(), restart(), set_exclusive(), set_threads(),
-#              submit_array(), submit_pack()
+#   Called by: dryrun_sbatch(), finalize(), pack_script(), restart(), set_exclusive(),
+#              set_threads(), submit_array(), submit_pack(), submit_pack_array()
 def add_sbatch_option(text, option):
     """Set '#SBATCH <option>' (e.g. '--qos=highmem' or '-C icelake') in a jobscript,
     replacing that option if it is already there in either spelling (-p / --partition;
@@ -1090,7 +1090,7 @@ def set_threads(script, threads, cpus):
 # bigger than a node must have its nodes to itself (and is charged for all their cores), while a
 # smaller one shares its node, and is charged only for its own cores. Takes out any --exclusive
 # the template has, then adds it back for whole nodes.
-#   Called by: dryrun_script(), finalize(), submit_dryrun_pack(), submit_pack()
+#   Called by: dryrun_script(), finalize(), pack_script(), submit_dryrun_pack()
 #   Calls:     add_sbatch_option()
 def set_exclusive(script, whole):
     lines = [ln for ln in script.splitlines() if not re.match(r"#SBATCH\s+--exclusive\b", ln)]
@@ -1114,8 +1114,8 @@ def sbatch_value(text, flag):
 
 # Converts a Slurm time (min, min:s, h:min:s, d-h, d-h:min, d-h:min:s) to seconds.
 # Returns None if the text isn't a Slurm time.
-#   Called by: _slurm_time(), job_timing(), plan_walltime(), restart(), submit_array(),
-#              submit_pack()
+#   Called by: _slurm_time(), job_timing(), plan_walltime(), restart(), share_walltime(),
+#              submit_array(), submit_pack(), submit_pack_array()
 def slurm_seconds(spec):
     """A Slurm time (min, min:s, h:min:s, d-h, d-h:min, d-h:min:s) in seconds, or None."""
     m = re.fullmatch(r"(?:(\d+)-)?(\d+)(?::(\d+))?(?::(\d+))?", spec.strip())
@@ -1132,7 +1132,7 @@ def slurm_seconds(spec):
 
 
 # The reverse of slurm_seconds: seconds to Slurm's [d-]h:mm:ss.
-#   Called by: plan_walltime(), submit_array(), submit_pack()
+#   Called by: plan_walltime(), submit_array(), submit_pack(), submit_pack_array()
 def slurm_time(seconds):
     d, rest = divmod(int(math.ceil(seconds)), 86400)
     h, rest = divmod(rest, 3600)
@@ -1599,7 +1599,7 @@ def plan_walltime(calc, script, dr, procs, ctx, args):
 # before Slurm stops the job. The margin is the larger of 900 s and 1.5 x the time of one SCF (5%
 # of the walltime while the SCF time isn't known), times a factor that restart doubles after a job
 # is killed anyway, and never more than half the walltime.
-#   Called by: finalize(), restart(), submit_array(), submit_pack()
+#   Called by: finalize(), restart(), share_walltime()
 def run_time_for(walltime, per_scf=None, factor=1.0):
     """CASTEP run_time (s) for a job with this walltime (s): early enough to finish the SCF
     under way and write the .check before the scheduler stops the job."""
@@ -1612,7 +1612,7 @@ def run_time_for(walltime, per_scf=None, factor=1.0):
 # removes the keyword). Everything else in the file is left as it is, so changes you make by hand
 # to a calculation's .param survive restarts. Either spelling of a keyword with two
 # (canonical_key: spin_polarised, spin_polarized) replaces both.
-#   Called by: finalize(), restart(), submit_array(), submit_pack(), write_inputs()
+#   Called by: finalize(), restart(), share_walltime(), write_inputs()
 #   Calls:     canonical_key(), strip_comment()
 def set_param(calc, **values):
     """Set keywords in the calc's .param (None removes the keyword)."""
@@ -2255,7 +2255,8 @@ def prepare_sp(sp, geom, ctx, args):
 
 # Submits a jobscript with submit_cmd, from its own directory, and returns the job id. Stops if the
 # submission fails. dwf.py submits its MACE jobs with it too.
-#   Called by: submit(), submit_array(), submit_dryrun_pack(), submit_pack(), dwf.py
+#   Called by: submit(), submit_array(), submit_dryrun_pack(), submit_pack(),
+#              submit_pack_array(), dwf.py
 def send_job(directory, script, args):
     res = subprocess.run(shlex.split(args.submit_cmd) + [script], cwd=directory,
                          capture_output=True, text=True)
@@ -2271,7 +2272,7 @@ def send_job(directory, script, args):
 # .castep (start: the file's size before the job), its walltime and number of processes; this is
 # what run_segments, job_timing, last_peak and Calc.run_text work from - and the pack or job array
 # it runs in (pack : N, array : N), if any.
-#   Called by: submit(), submit_array(), submit_dryrun_pack(), submit_pack()
+#   Called by: submit(), submit_array(), submit_dryrun_pack(), submit_pack(), submit_pack_array()
 def record_job(calc, jobid, start, wall, key="jobid", pack=None):
     info = calc.info()
     info[key] = jobid
@@ -2324,7 +2325,7 @@ def submit(calc, args, script=JOBSCRIPT, key="jobid"):
 # (the dry-run template, rx DRYRUN_RUN). There must be exactly one, and it must start CASTEP with
 # srun: a pack starts each of its jobs with its own srun. Returns the line; stops with what to
 # change otherwise.
-#   Called by: batch_args(), run_batch(), submit_dryrun_pack(), submit_pack()
+#   Called by: batch_args(), run_batch(), submit_dryrun_pack(), submit_pack(), submit_pack_array()
 def pack_castep_line(template, name="the runner settings", rx=CASTEP_RUN, what="pack"):
     runs = [line for line in template.splitlines()
             if rx.search(line) and not line.lstrip().startswith("#")]
@@ -2340,24 +2341,24 @@ def pack_castep_line(template, name="the runner settings", rx=CASTEP_RUN, what="
 
 
 # One line of a pack's job script: the template's line that runs CASTEP (run, matched by rx), made
-# to run one calculation in its own directory, in the background - with env set and srun given
-# the calculation's own options (own) in place of the template's ones of that kind (SRUN_OWN) -
-# with its output in slurm-<job id>.out there.
-#   Called by: submit_dryrun_pack(), submit_pack()
-def pack_line(run, rx, calc, own, env):
+# to run one calculation, seed, in its own directory, where (both shell words: a name, quoted, or a
+# variable such as "$SEED"), in the background - with env set and srun given the calculation's own
+# options (own) in place of the template's ones of that kind (SRUN_OWN) - with its output in out
+# there: slurm-<job id>.out, or for a task of a job array slurm-<array job id>_<task>.out.
+#   Called by: submit_dryrun_pack(), submit_pack(), submit_pack_array()
+def pack_line(run, rx, seed, where, own, env, out="slurm-${SLURM_JOB_ID}.out"):
     m = rx.search(run)
     head, exe, tail = run[:m.start()], m.group(1), run[m.end():]
     s = re.search(r"(?<![\w/.\-])srun\b", head)
     rest = SRUN_OWN.sub("", " " + head[s.end():]).split()
     cmd = (f"{head[:s.start()]}{env}srun {own}" + (" " + " ".join(rest) if rest else "")
-           + f" {exe}{calc.seed}{tail}").replace("{SEED}", calc.seed).strip()
-    where = shlex.quote(str(calc.dir.resolve()))
-    return f"( cd {where} && {cmd} ) > {where}/slurm-${{SLURM_JOB_ID}}.out 2>&1 &"
+           + f" {exe}{seed}{tail}").replace("{SEED}", seed).strip()
+    return f"( cd {where} && {cmd} ) > {where}/{out} 2>&1 &"
 
 
 # A new directory for a pack's job script: <workdir>/packs/<prefix>_NNN, numbered on from those
 # already there.
-#   Called by: submit_array(), submit_dryrun_pack(), submit_pack()
+#   Called by: submit_array(), submit_dryrun_pack(), submit_pack(), submit_pack_array()
 def new_pack_dir(workdir, prefix):
     packs = workdir / PACK_DIR
     packs.mkdir(exist_ok=True)
@@ -2370,102 +2371,202 @@ def new_pack_dir(workdir, prefix):
 
 
 # Splits a list into as few groups of at most size as possible, as evenly as possible, in order.
-#   Called by: prepare_all()
+#   Called by: prepare_all(), run_batch()
 def even_groups(items, size):
     n = math.ceil(len(items) / size) if items else 0
     bounds = [round(i * len(items) / n) for i in range(n + 1)] if n else [0]
     return [items[a:b] for a, b in zip(bounds, bounds[1:])]
 
 
-# Runs several planned calculations side by side on one node, as one job (pack : N).
-# Writes <workdir>/packs/pack_NNN/job.sh from the jobscript template: its #SBATCH lines for one
-# whole node (with --exclusive, and without --ntasks-per-node, --ntasks or --cpus-per-task, which
-# each calculation sets for itself), the partition and its options, and the longest walltime the
-# calculations were given. In place of the line that runs CASTEP comes one line per calculation
-# (pack_line), which runs it in its own directory in the background - srun with its own processes
-# and cores per process, --exact, and --mem for its share of PACK_MEM of the node's memory, with
-# the output in slurm-<job id>.out there - and then wait. A relaxation's run_time is set for the
-# pack's walltime. The job is submitted from the pack's directory (send_job) and recorded for each
-# calculation (record_job), so waiting, timings and restarts work as for a job of its own (a
-# restart runs on its own: restart plans it with finalize(..., pack=1)).
-# With charging : core the pack asks for the cores of its jobs on one node, which it shares with
-# other jobs (no --exclusive): the template's --ntasks-per-node (or --ntasks) is their sum, with one
-# CPU per task. Each job's srun asks for its own processes and cores per process, with
-# --mem-per-cpu for the memory each core brings: SLURM_MEM_PER_CPU, which Slurm sets in the job,
-# so that the jobs' memory adds up to the pack's (or, if it isn't set, the partition's GB per
-# core). Cirrus takes no --mem for a job, and a job step that asks for no memory may be given all
-# of the job's, which would hold the others back.
-#   Called by: run_batch()
-#   Calls:     add_sbatch_option(), fill(), new_pack_dir(), pack_castep_line(), pack_line(),
-#              record_job(), run_time_for(), send_job(), set_exclusive(), set_param(),
-#              slurm_seconds(), slurm_time()
-def submit_pack(group, ctx, args, workdir):
-    cpn, infos = args.cores_per_node, [c.info() for c in group]
+# How each job of a pack (pack : N) runs on its node, from its job_info (infos, one per job): the
+# options its srun gets in place of the template's ones of that kind (SRUN_OWN) - its processes
+# and cores per process, --exact, and its memory - the environment it starts with
+# (OMP_NUM_THREADS, SRUN_CPUS_PER_TASK and, with threads, OMP_PLACES=cores) and the MB of memory
+# that gives it. The memory is its share of PACK_MEM of the node's memory (--mem), or with
+# charging : core what its cores bring, asked for with --mem-per-cpu: SLURM_MEM_PER_CPU, which
+# Slurm sets in the job, so that the jobs' memory adds up to the pack's (or, if it isn't set, the
+# partition's GB per core). Cirrus takes no --mem for a job, and a job step that asks for no
+# memory may be given all of the job's, which would hold the others back. Returns ([(own options,
+# env, MB), ...], the cores the pack asks for - a whole node's, or with charging : core the sum of
+# its jobs' - and its partition: the %block partitions row, or None).
+#   Called by: run_batch(), submit_pack(), submit_pack_array()
+def pack_parts(infos, args):
     core = args.charging == "core"
     part = next((p for p in args.partitions or [] if p["name"] == infos[0].get("partition")), None)
     gb = part["mem_per_core"] if part else args.mem_per_core
-    if core:                                    # the cores of its jobs, and the memory they bring
-        mems = [math.ceil(i["charged_cores"] * gb * 1024) for i in infos]
-        ncores = sum(i["charged_cores"] for i in infos)
-    else:
-        mems = [math.ceil(i["share"] * gb * 1024 * PACK_MEM) if gb else
-                math.ceil(i["ncores"] * i["mem_per_core_gb"] * 1024 * 1.25) for i in infos]
-        ncores = cpn
-    walls = [slurm_seconds(i["walltime"]) for i in infos if i.get("walltime")]
-    wall = slurm_time(max(walls)) if walls else None
-    pdir = new_pack_dir(workdir, "pack")
-    total = sum(mems)
+    jobs = []
+    for i in infos:
+        n, threads = i["ncores"], i.get("omp_threads") or 1
+        if core:                                # its cores, and the memory they bring
+            mb = math.ceil(i["charged_cores"] * gb * 1024)
+            cpus = i.get("cpus_per_task") or 1
+            memory = f"--mem-per-cpu=${{SLURM_MEM_PER_CPU:-{math.floor(gb * 1024)}}}M"
+        else:
+            mb = (math.ceil(i["share"] * gb * 1024 * PACK_MEM) if gb else
+                  math.ceil(i["ncores"] * i["mem_per_core_gb"] * 1024 * 1.25))
+            cpus = max(1, i["share"] // n)
+            memory = f"--mem={mb}M"
+        env = (f"OMP_NUM_THREADS={threads} SRUN_CPUS_PER_TASK={cpus} "
+               + ("OMP_PLACES=cores " if threads > 1 else ""))
+        jobs.append((f"--nodes=1 --ntasks={n} --ntasks-per-node={n} --cpus-per-task={cpus} "
+                     f"--exact {memory}", env, mb))
+    ncores = sum(i["charged_cores"] for i in infos) if core else args.cores_per_node
+    return jobs, ncores, part
+
+
+# A pack's job script (pack : N) from the jobscript template: its #SBATCH lines for one whole node
+# (with --exclusive, and without --ntasks-per-node, --ntasks or --cpus-per-task, which each job
+# sets for itself) - with charging : core, for its jobs' cores (ncores) of a node it shares with
+# other jobs (no --exclusive): the template's --ntasks-per-node (or --ntasks) is their sum, with
+# one CPU per task - the partition (part) and its options, and the lines of body in place of the
+# line that runs CASTEP (run). The placeholders are filled in for the pack: ncores, its memory
+# (total, MB), the most k-points of its jobs (nkpts), seed and job name (name).
+#   Called by: submit_pack(), submit_pack_array()
+#   Calls:     add_sbatch_option(), fill(), set_exclusive()
+def pack_script(template, run, body, part, ncores, total, nkpts, seed, name, args):
+    core = args.charging == "core"
     subs = {"{NCORES}": ncores, "{NODES}": 1, "{TASKS_PER_NODE}": ncores, "{CPUS_PER_TASK}": 1,
-            "{SEED}": pdir.name, "{JOBNAME}": f"{group[0].name}+{len(group) - 1}",
-            "{NKPTS}": max(i["nkpts"] for i in infos), "{MEM_MB}": total,
+            "{SEED}": seed, "{JOBNAME}": name, "{NKPTS}": nkpts, "{MEM_MB}": total,
             "{MEM_GB}": math.ceil(total / 1024), "{MEM_PER_NODE_GB}": math.ceil(total / 1024),
             "{MEM_PER_CORE_MB}": math.ceil(total / ncores),
             "{MEM_PER_CORE_GB}": math.ceil(total / ncores / 1024),
             "{PARTITION}": part["name"] if part else ""}
-    template = ctx["job_template"]
-    run = pack_castep_line(template)
     lines = []
     for line in template.splitlines():
         if not core and re.match(r"#SBATCH\s+((--ntasks-per-node|--ntasks|--cpus-per-task)(=|\s)"
                                  r"|-[nc](\s|\d))", line.strip()):
             continue                            # each job of the pack sets these for itself
-        if line != run:
-            lines.append(line)
-            continue
-        for c, i, mb in zip(group, infos, mems):
-            n, threads = i["ncores"], i.get("omp_threads") or 1
-            cpus = (i.get("cpus_per_task") or 1) if core else max(1, i["share"] // n)
-            env = (f"OMP_NUM_THREADS={threads} SRUN_CPUS_PER_TASK={cpus} "
-                   + ("OMP_PLACES=cores " if threads > 1 else ""))
-            memory = (f"--mem-per-cpu=${{SLURM_MEM_PER_CPU:-{math.floor(gb * 1024)}}}M" if core
-                      else f"--mem={mb}M")
-            lines.append(pack_line(run, CASTEP_RUN, c, f"--nodes=1 --ntasks={n} --ntasks-per-node="
-                                   f"{n} --cpus-per-task={cpus} --exact {memory}", env))
-        lines.append("wait")
+        lines += body if line == run else [line]
     script = fill("\n".join(lines) + "\n", subs)
     script = set_exclusive(script, False) if core else add_sbatch_option(script, "--exclusive")
     if part:                                    # the partition and its extra #SBATCH options
         script = add_sbatch_option(script, f"--partition={part['name']}")
         for option in part["options"]:
             script = add_sbatch_option(script, fill(option, subs))
-    if wall:
-        script = add_sbatch_option(script, f"--time={wall}")
-    (pdir / JOBSCRIPT).write_text(script)
-    (pdir / JOBSCRIPT).chmod(0o755)
+    return script
+
+
+# Gives the jobs of a pack or a job array the walltime they all run with (wall: the longest of
+# theirs) in their job_info.json, and each relaxation a run_time for it in its .param
+# (run_time_for), so that it stops cleanly before the end - except with max_restarts : 0 and
+# tolerate_failures (screening), where nothing would carry it on (as in finalize).
+#   Called by: submit_array(), submit_pack(), submit_pack_array()
+#   Calls:     run_time_for(), set_param(), slurm_seconds()
+def share_walltime(group, infos, wall, args):
     for c, i in zip(group, infos):              # each relaxation stops cleanly before the end
         c.save(dict(c.info(), walltime=wall))
         if c.kind == "geom" and wall and not (args.max_restarts == 0
                                               and getattr(args, "tolerate_failures", False)):
             set_param(c, run_time=run_time_for(slurm_seconds(wall), i.get("scf_seconds")))
+
+
+# Runs several planned calculations side by side on one node, as one job (pack : N).
+# Writes <workdir>/packs/pack_NNN/job.sh from the jobscript template (pack_script): its #SBATCH
+# lines for one whole node, the partition and its options, and the longest walltime the
+# calculations were given. In place of the line that runs CASTEP comes one line per calculation
+# (pack_line), which runs it in its own directory in the background - srun with its own processes
+# and cores per process, --exact, and --mem for its share of PACK_MEM of the node's memory
+# (pack_parts), with the output in slurm-<job id>.out there - and then wait. A relaxation's
+# run_time is set for the pack's walltime (share_walltime). The job is submitted from the pack's
+# directory (send_job) and recorded for each calculation (record_job), so waiting, timings and
+# restarts work as for a job of its own (a restart runs on its own: restart plans it with
+# finalize(..., pack=1)).
+# With charging : core the pack asks for the cores of its jobs on one node, which it shares with
+# other jobs (no --exclusive), and each job's srun asks for its own processes and cores per
+# process, with --mem-per-cpu for the memory each core brings (pack_parts).
+#   Called by: run_batch()
+#   Calls:     add_sbatch_option(), new_pack_dir(), pack_castep_line(), pack_line(), pack_parts(),
+#              pack_script(), record_job(), send_job(), share_walltime(), slurm_seconds(),
+#              slurm_time()
+def submit_pack(group, ctx, args, workdir):
+    infos = [c.info() for c in group]
+    jobs, ncores, part = pack_parts(infos, args)
+    walls = [slurm_seconds(i["walltime"]) for i in infos if i.get("walltime")]
+    wall = slurm_time(max(walls)) if walls else None
+    pdir = new_pack_dir(workdir, "pack")
+    run = pack_castep_line(ctx["job_template"])
+    body = [pack_line(run, CASTEP_RUN, c.seed, shlex.quote(str(c.dir.resolve())), own, env)
+            for c, (own, env, _) in zip(group, jobs)] + ["wait"]
+    script = pack_script(ctx["job_template"], run, body, part, ncores, sum(j[2] for j in jobs),
+                         max(i["nkpts"] for i in infos), pdir.name,
+                         f"{group[0].name}+{len(group) - 1}", args)
+    if wall:
+        script = add_sbatch_option(script, f"--time={wall}")
+    (pdir / JOBSCRIPT).write_text(script)
+    (pdir / JOBSCRIPT).chmod(0o755)
+    share_walltime(group, infos, wall, args)
     starts = [c.castep.stat().st_size if c.castep.exists() else 0 for c in group]
     jobid = send_job(pdir, JOBSCRIPT, args)
     rel = str(pdir.relative_to(workdir))
     for c, start in zip(group, starts):
         record_job(c, jobid, start, wall, pack=rel)
-    where = f"{ncores} cores of a shared node" if core else "1 node"
+    where = f"{ncores} cores of a shared node" if args.charging == "core" else "1 node"
     log(f"submitted {rel}: job {jobid} on {where}" + (f" ({part['name']})" if part else "")
         + (f", walltime {wall}" if wall else "") + ": "
         + ", ".join(f"{c.name} ({i['ncores']} processes)" for c, i in zip(group, infos)))
+
+
+# Runs packs of planned jobs as one Slurm job array (array : N with pack : N): each task is one
+# pack - a node (with charging : core, its jobs' cores of a node shared with other jobs) running
+# its jobs side by side, each with its own srun, as submit_pack's job does. run_batch gives it
+# packs of one size whose jobs all run alike in a pack (pack_parts; if no mem_per_core or
+# partition gives the node's memory, each job gets the most any of them needs), so one script
+# serves every task: <workdir>/packs/pack_array_NNN/job.sh, made as a pack's is (pack_script),
+# with --array=0-<packs-1> and the longest walltime of all the jobs. In place of the line that
+# runs CASTEP comes a loop over the task's jobs - lines task x size + 1 to (task + 1) x size of
+# tasks.txt beside it, which lists the packs' jobs in order (directory, a tab, seed) - that starts
+# each in its own directory in the background (pack_line), with its output in
+# slurm-<array job id>_<task>.out there, then waits for them all. A relaxation's run_time is set
+# for the array's walltime (share_walltime). The array is submitted from its directory
+# (send_job), and each job is recorded (record_job) with its task's job id, <array job id>_<task>
+# as squeue and sacct give it, so waiting, timings and restarts work as for a job of its own (a
+# restart runs on its own).
+#   Called by: run_batch()
+#   Calls:     add_sbatch_option(), new_pack_dir(), pack_castep_line(), pack_line(), pack_parts(),
+#              pack_script(), record_job(), send_job(), share_walltime(), slurm_seconds(),
+#              slurm_time()
+def submit_pack_array(packs, ctx, args, workdir):
+    group, size = [c for p in packs for c in p], len(packs[0])
+    infos = [c.info() for c in group]
+    _, ncores, part = pack_parts(infos[:size], args)                # one task's pack
+    own, env, mb = max(pack_parts(infos, args)[0], key=lambda j: j[2])  # each job's srun
+    walls = [slurm_seconds(i["walltime"]) for i in infos if i.get("walltime")]
+    wall = slurm_time(max(walls)) if walls else None
+    adir = new_pack_dir(workdir, "pack_array")
+    tasks = adir / ARRAY_TASKS
+    tasks.write_text("".join(f"{c.dir.resolve()}\t{c.seed}\n" for c in group))
+    pick = ("awk -F '\\t' -v n=\"$LINE\" 'NR == n {print $%d}' "
+            + shlex.quote(str(tasks.resolve())))
+    run = pack_castep_line(ctx["job_template"])
+    body = ["SLOT=0",
+            f'while [ "$SLOT" -lt {size} ]; do',
+            f"    LINE=$((SLURM_ARRAY_TASK_ID * {size} + SLOT + 1))",
+            "    TASK_DIR=$(" + pick % 1 + ")",
+            "    SEED=$(" + pick % 2 + ")",
+            "    " + pack_line(run, CASTEP_RUN, '"$SEED"', '"$TASK_DIR"', own, env,
+                               "slurm-${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.out"),
+            "    SLOT=$((SLOT + 1))",
+            "done",
+            "wait"]
+    script = pack_script(ctx["job_template"], run, body, part, ncores, size * mb,
+                         max(i["nkpts"] for i in infos), adir.name,
+                         f"{group[0].name}+{len(group) - 1}", args)
+    if wall:
+        script = add_sbatch_option(script, f"--time={wall}")
+    script = add_sbatch_option(script, f"--array=0-{len(packs) - 1}")
+    (adir / JOBSCRIPT).write_text(script)
+    (adir / JOBSCRIPT).chmod(0o755)
+    share_walltime(group, infos, wall, args)
+    starts = [c.castep.stat().st_size if c.castep.exists() else 0 for c in group]
+    jobid = send_job(adir, JOBSCRIPT, args)
+    rel = str(adir.relative_to(workdir))
+    for k, (c, start) in enumerate(zip(group, starts)):
+        record_job(c, f"{jobid}_{k // size}", start, wall, pack=rel)
+    where = f"{ncores} cores of a shared node" if args.charging == "core" else "1 node"
+    log(f"submitted {rel}: job array {jobid} of {len(packs)} packs of {size} jobs "
+        f"({group[0].name} ... {group[-1].name}), each pack on {where}"
+        + (f" ({part['name']})" if part else "") + (f", walltime {wall}" if wall else "")
+        + f"; each job {infos[0]['ncores']} processes")
 
 
 # The line of a jobscript template that runs CASTEP on {SEED}, for array : N. There must be
@@ -2501,12 +2602,14 @@ def array_key(calc):
 # place of the line that runs CASTEP, lines that read the task's directory and seed from tasks.txt
 # beside it (line SLURM_ARRAY_TASK_ID + 1: directory, a tab, seed), go there and run CASTEP on that
 # seed, with its output in slurm-<array job id>_<task>.out there. A relaxation's run_time is set
-# for the array's walltime. The array is submitted from its directory (send_job), and each job is
-# recorded (record_job) with its task's job id, <array job id>_<task> as squeue and sacct give it,
-# so waiting, timings and restarts work as for a job of its own (a restart runs on its own).
+# for the array's walltime (share_walltime). The array is submitted from its directory
+# (send_job), and each job is recorded (record_job) with its task's job id, <array job id>_<task>
+# as squeue and sacct give it, so waiting, timings and restarts work as for a job of its own (a
+# restart runs on its own). With pack : N, jobs planned to share a node go as job arrays of packs
+# instead (submit_pack_array).
 #   Called by: run_batch()
 #   Calls:     add_sbatch_option(), array_castep_line(), array_key(), job_size(), new_pack_dir(),
-#              record_job(), run_time_for(), send_job(), set_param(), slurm_seconds(), slurm_time()
+#              record_job(), send_job(), share_walltime(), slurm_seconds(), slurm_time()
 def submit_array(group, ctx, args, workdir):
     infos = [c.info() for c in group]
     walls = [slurm_seconds(i["walltime"]) for i in infos if i.get("walltime")]
@@ -2536,11 +2639,7 @@ def submit_array(group, ctx, args, workdir):
     script = add_sbatch_option(script, f"--array=0-{len(group) - 1}")
     (adir / JOBSCRIPT).write_text(script)
     (adir / JOBSCRIPT).chmod(0o755)
-    for c, i in zip(group, infos):              # each relaxation stops cleanly before the end
-        c.save(dict(c.info(), walltime=wall))
-        if c.kind == "geom" and wall and not (args.max_restarts == 0
-                                              and getattr(args, "tolerate_failures", False)):
-            set_param(c, run_time=run_time_for(slurm_seconds(wall), i.get("scf_seconds")))
+    share_walltime(group, infos, wall, args)
     starts = [c.castep.stat().st_size if c.castep.exists() else 0 for c in group]
     jobid = send_job(adir, JOBSCRIPT, args)
     rel = str(adir.relative_to(workdir))
@@ -2582,7 +2681,7 @@ def submit_dryrun_pack(group, ctx, args):
                   f"--mem={mb}M")
         own = (f"--nodes=1 --ntasks=1 --ntasks-per-node=1 --cpus-per-task={cpus} --exact "
                + memory)
-        lines += [pack_line(run, DRYRUN_RUN, c, own,
+        lines += [pack_line(run, DRYRUN_RUN, c.seed, shlex.quote(str(c.dir.resolve())), own,
                             f"OMP_NUM_THREADS=1 SRUN_CPUS_PER_TASK={cpus} ") for c in group]
         lines.append("wait")
     script = dryrun_sbatch(fill("\n".join(lines) + "\n", subs), subs, args)
@@ -3283,7 +3382,11 @@ def job_spec(job, base):
 # (array_key) in one array; max_jobs still counts each task as a job, and the queue is topped up
 # once array_min places are free (default: a quarter of array, or of max_jobs if that is smaller;
 # at most that array or max_jobs, so a step whose own runner block lowers max_jobs still tops up),
-# or all the jobs left fit. With
+# or all the jobs left fit. With array and pack : N both, each task is a pack: jobs planned to
+# share a node that run alike in a pack (pack_parts) go N to a task (with charging : core, as many
+# as a node's cores hold) in job arrays of packs (submit_pack_array), each task counting once in
+# max_jobs; those left over, fewer than N, go as a pack of their own, and a group too small for
+# two full packs as packs (send_pack). With
 # tolerate_failures, a job that fails is marked failed (mark_failed) and the others carry on;
 # --resubmit-failed starts failed jobs again from the beginning. A job whose inputs changed since it
 # was set up (job_spec) is set up again if it never ran; one that has run stops the script, unless
@@ -3293,9 +3396,10 @@ def job_spec(job, base):
 # jobs are still queued.
 #   Called by: batch_main(), dwf.py
 #   Calls:     Calc(), Calc.done(), Calc.err_files(), array_castep_line(), array_key(), calibrate(),
-#              check_templates(), finalize(), job_result(), job_spec(), measure_times(),
-#              pack_castep_line(), parse_castep_input(), prepare_all(), remove_check(), submit(),
-#              submit_array(), submit_pack(), wait_for()
+#              check_templates(), even_groups(), finalize(), job_result(), job_spec(),
+#              measure_times(), pack_castep_line(), pack_parts(), parse_castep_input(),
+#              prepare_all(), remove_check(), submit(), submit_array(), submit_pack(),
+#              submit_pack_array(), wait_for()
 def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, spacing=None,
               energy="auto", share_dryruns=True, stop_file=None):
     workdir = Path(workdir)
@@ -3411,6 +3515,65 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
                  pack=pack)
         return c.info().get("packed")
 
+    # Sends one pack (pack : N) of jobs planned to share a node, as one job (submit_pack): with
+    # fewer than N, each is planned again for more of the node (with charging : core, as they
+    # are), unless that changes the partition. A job on its own goes as a job of its own, planned
+    # again for the node to itself if it was planned to share one.
+    def send_pack(group):
+        if 1 < len(group) < args.pack and args.charging != "core":
+            if not all(plan(d, len(group)) for d in group) or len(
+                    {d.info()["partition"] for d in group}) > 1:
+                for d in group:                    # (unless that changes the partition)
+                    plan(d)
+        if len(group) > 1:
+            submit_pack(group, ctx, args, workdir)
+        else:
+            if group[0].info().get("packed"):      # nothing to share a node with: all of it
+                plan(group[0], 1)
+            submit(group[0], args)
+
+    # How a job goes in a job array (array : N), planned now with what is known so far: (key, jobs
+    # to a task); jobs with the same key go in one array. A job planned on whole nodes is a task
+    # of its own, keyed by its job.sh (array_key). With pack : N a job planned to share a node
+    # goes N to a task (with charging : core, as many as a node's cores hold, up to N; if that is
+    # one, it is a task of its own), keyed by how it runs in a pack (pack_parts) and where - but
+    # for its memory if no mem_per_core or partition gives the node's (submit_pack_array then
+    # gives each job the most any of them needs).
+    def array_slot(c):
+        if plan(c):
+            info = c.info()
+            jobs, _, part = pack_parts([info], args)
+            (own, env, mb), size = jobs[0], args.pack
+            if args.charging == "core":
+                size = min(args.pack, args.cores_per_node // info["charged_cores"])
+            elif (part["mem_per_core"] if part else args.mem_per_core) is None:
+                own, mb = own.rsplit(" --mem=", 1)[0], None
+            if size > 1:
+                return ("pack", info["partition"], own, env, mb), size
+            plan(c, 1)
+        return ("job", array_key(c)), 1
+
+    # Sends jobs that array_slot keys alike: a job array of them (submit_array), or a job of its
+    # own. With size (jobs to a task) above one, the full packs of size go as a job array of packs
+    # (submit_pack_array) and the jobs left over as a pack of their own (send_pack); with fewer
+    # than two full packs, all go as packs, as evenly as the jobs allow.
+    def send_array(group, size):
+        if size == 1:
+            if len(group) > 1:
+                submit_array(group, ctx, args, workdir)
+            else:
+                submit(group[0], args)
+            return
+        full = len(group) // size
+        if full < 2:
+            for pack in even_groups(group, size):
+                send_pack(pack)
+            return
+        submit_pack_array([group[k:k + size] for k in range(0, full * size, size)], ctx, args,
+                          workdir)
+        if group[full * size:]:
+            send_pack(group[full * size:])
+
     while True:
         calibrate(calcs, keys, args)
         measure_times(calcs, keys)
@@ -3421,21 +3584,22 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
             free = (args.max_jobs - len(running)) if args.max_jobs else len(queue)
             top = min(args.array, args.max_jobs or args.array)
             least = min(getattr(args, "array_min", None) or max(1, top // 4), top)
-            while queue and free > 0 and (not active or free >= min(len(queue), least)):
-                take = queue[:min(free, args.array)]
-                del queue[:len(take)]
-                groups = {}
-                for c in take:                     # planned now, with what is known so far
-                    plan(c)
-                    groups.setdefault(array_key(c), []).append(c)
-                for group in groups.values():
-                    if len(group) > 1:
-                        submit_array(group, ctx, args, workdir)
-                    else:
-                        submit(group[0], args)
+            while queue and free > 0 and (not active or free >= min(
+                    math.ceil(len(queue) / args.pack), least)):   # (the tasks the queue needs)
+                groups, tasks = {}, 0              # at most array tasks, and the places free
+                while queue:
+                    key, size = array_slot(queue[0])
+                    group = groups.setdefault(key, (size, []))[1]
+                    more = math.ceil((len(group) + 1) / size) - math.ceil(len(group) / size)
+                    if tasks + more > min(free, args.array):
+                        break
+                    group.append(queue.pop(0))
+                    tasks += more
+                for size, group in groups.values():
+                    send_array(group, size)
                     running.update(c.info()["jobid"] for c in group)
-                active += take
-                free -= len(take)
+                    active += group
+                free -= tasks
         while queue and getattr(args, "array", 1) == 1 and (not args.max_jobs
                                                            or len(running) < args.max_jobs):
             c = queue.pop(0)
@@ -3459,17 +3623,7 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
                     if plan(d) and d.info()["partition"] == c.info()["partition"]:
                         group.append(d)
                         queue.remove(d)
-                if 1 < len(group) < args.pack:     # fewer than pack: each gets more of the node
-                    if not all(plan(d, len(group)) for d in group) or len(
-                            {d.info()["partition"] for d in group}) > 1:
-                        for d in group:            # (unless that changes the partition)
-                            plan(d)
-            if len(group) > 1:
-                submit_pack(group, ctx, args, workdir)
-            else:
-                if c.info().get("packed"):         # nothing to share a node with: all of it
-                    plan(c, 1)
-                submit(c, args)
+            send_pack(group)                       # (fewer than pack: more of the node each)
             active += group
             running.add(c.info()["jobid"])
         if not active:
@@ -4049,7 +4203,7 @@ def convert_settings(items, name):
 # charging : core with cores_per_node, the memory per core, a dryrun_pack whose dry runs fit on a
 # node, and max_nodes (by default the nodes max_cores or cores need) that holds the job; %block
 # partitions without mem_per_core, and with a partition that can take cores; array (Slurm job
-# arrays) with sbatch and without pack. Starts mem_replicated : auto at R_START.
+# arrays, of packs with pack too) with sbatch. Starts mem_replicated : auto at R_START.
 #   Called by: batch_args(), read_input()
 def check_runner(args, raw_vals, name):
     for key in ("max_cores", "cores", "dryrun_cores", "poll", "dryrun_timeout",
@@ -4086,12 +4240,9 @@ def check_runner(args, raw_vals, name):
                 and args.cores > args.cores_per_node // args.pack):
             die(f"{name}: with pack : {args.pack} each job has {args.cores_per_node // args.pack} "
                 f"cores, so cores : {args.cores} is too many")
-    if args.array > 1:                       # jobs planned alike go as one Slurm job array
-        if args.pack > 1:
-            die(f"{name}: array and pack both put several jobs in one - use one of them")
-        if "sbatch" not in args.submit_cmd:
-            die(f"{name}: array : {args.array} runs jobs as Slurm job arrays (sbatch --array), "
-                f"but submit_cmd is '{args.submit_cmd}'")
+    if args.array > 1 and "sbatch" not in args.submit_cmd:     # Slurm job arrays (of packs,
+        die(f"{name}: array : {args.array} runs jobs as Slurm job arrays (sbatch --array), "
+            f"but submit_cmd is '{args.submit_cmd}'")             # with pack too)
     if args.cores_per_node and args.dryrun_pack > args.cores_per_node:
         die(f"{name}: dryrun_pack : {args.dryrun_pack} is more dry runs than a node has cores "
             f"({args.cores_per_node})")

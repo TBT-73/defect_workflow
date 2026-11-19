@@ -8075,7 +8075,7 @@ dryrun_time : 0:20:00          # dry runs: small jobs (one process, cores for 4 
 !dryrun_on  : login            # ... or run them where dwf.py runs (dryrun_cmd)
 max_jobs  : 16                 # most jobs of one step queued at once
 !array    : 500                # jobs planned alike as Slurm job arrays of up to this many
-                               #   tasks (each still counts in max_jobs; not with pack)
+                               #   tasks (each still counts in max_jobs; with pack, a pack each)
 max_restarts : 20              # a relaxation that runs out of time carries on this many times
 poll      : 300
 delete_check : true            # delete each .check once its calculation has finished
