@@ -450,6 +450,8 @@ dwf_CaO_Sb/
   A_host/                 results.json, summary.txt,
                           production.param (your .param with the converged cut-off),
                           host_relaxed.cell (the relaxed host),
+                          phases_doped.json and materials_project/ (phases_from : doped:
+                          the phases doped chose, and the Materials Project's replies),
                           jobs/ (converge, relax, bands, dielectric, phases)
   B_candidates/           results.json, summary.txt, ladder.json (the sizes),
                           mace/ (every MACE relaxation, B2's and C1's: one file each),
@@ -585,6 +587,16 @@ options such as `molecule`, `metal`, `kspacing=`); `phases_from : doped` (the Ma
 through doped); or none (no limits: E2 then leaves out the μ terms, and only defects of one
 composition can be compared). Solids relax lattice and positions at the production settings;
 molecules relax in their fixed box at Γ.
+
+With `phases_from : doped`, `dwf.py` makes doped's Materials Project queries itself, as the
+Materials Project's tips for large downloads ask: one request for each of doped's queries, for
+the GGA/GGA+U hull only (the entries doped can use), for the materials up to
+`phases_e_above_hull` + 0.1 eV/atom above it (doped picks within `phases_e_above_hull`, and those
+further up don't move the hull), and for the fields doped reads only. Each reply is kept in
+`A_host/materials_project/`, and the phases doped chooses in `A_host/phases_doped.json`, with
+their structures: a later run (the same host, `dopants` and `phases_e_above_hull`) takes them from
+there and asks nothing. Delete `phases_doped.json` to have doped choose again (from the kept
+replies), and the folder too to ask the Materials Project again.
 
 **A3.2 limits.** A pymatgen phase diagram of the host and the phases made of its own elements
 (it needs a phase of each pure element, and stops if the host lies above the hull). Each corner
@@ -1336,7 +1348,7 @@ Details: [Phase A](#phase-a-the-host).
 | `dielectric_param` | — | A2.3 | A `.param` for the DFPT run instead of `production.param`. CASTEP's DFPT needs norm-conserving potentials, fixed occupancies and no spin polarisation. Without this keyword the production settings are used with `fix_occupancy : true` and `spin_polarized : false`; with it, put those in the file, with a cut-off suited to norm-conserving potentials. |
 | `dielectric_cell` | — | A2.3 | A `.cell` whose `species_pot` (and other settings) the DFPT run uses instead of the host `.cell`'s, e.g. `NCP` for CASTEP's norm-conserving library. Its structure is ignored: the run uses the relaxed host. A2.3 warns before submitting if the potentials don't look norm-conserving. |
 | `%block phases` | — | A3.1 | The competing phases, one per line: `name  structure-file  [options]`. Options: `molecule` (positions only, in its fixed box, at Γ, without symmetry); `metal` (`fix_occupancy : false` unless the line says otherwise; add `smearing_width=...`); `kspacing=0.03` (its own k-point spacing); and any other `keyword=value`, a `.param` keyword for that phase only (e.g. `spin=2 spin_polarized=true` for O₂). Solids relax lattice and positions, with symmetry, at the production settings. A3.2 needs a phase of each pure element of the host, and for each dopant at least one phase that contains it. |
-| `phases_from` | `none` | A3.1 | `doped`: when there is no `%block phases`, take the competing phases from the Materials Project through doped (needs doped and `mp_api_key`). |
+| `phases_from` | `none` | A3.1 | `doped`: when there is no `%block phases`, take the competing phases from the Materials Project through doped (needs doped and `mp_api_key`). The phases doped chooses are kept in `A_host/phases_doped.json` for later runs ([A3.1](#phase-a-the-host)). |
 | `mp_api_key` | — | — | Materials Project API key for `phases_from : doped`: the 32 characters on your dashboard, without quotes. Given here, it is used rather than doped's own (`PMG_MAPI_KEY` in `~/.pmgrc.yaml`). It needs doped 3 and pymatgen 2026.9.23 or later (so Python 3.11 or later; older pymatgen can't read the Materials Project's replies): doped 2.x takes only the legacy keys, whose API the Materials Project was closing in September 2025; 3.0 takes the current ones but also needs `mp-api` and `emmet-core`, 3.1 and later nothing more. |
 | `phases_e_above_hull` | `0.05 eV/atom` | A3.1 | `phases_from : doped` takes the Materials Project entries up to this far above the hull. |
 | `%block chemical_potentials` | — | A3.1, A3.2 | The limits themselves, one per line: `name  El=value ...`, in absolute eV per atom on the energy scale of your CASTEP runs, for every element of the host and the dopants. A3.1 then relaxes nothing, and A3.2 records them. It takes precedence over `%block phases` and `phases_from`. |
@@ -2131,6 +2143,23 @@ it needs; a fresh Python 3.11 install (pymatgen 2026.10.24, monty 2026.10.21, do
 passes doped's key check, has a wrong key refused (401), and A3.1 gets both Ca phases, the O2
 molecule, CaO and CaO2. The whole suite passes on that install too. Still not run against the
 Materials Project itself.
+
+Then A3.1 sat for 5-10 minutes in doped's queries, with nothing in the log. pymatgen's
+`get_entries`, which doped uses, asks for every material of the chemical system on every hull
+the Materials Project has (GGA/GGA+U, r2SCAN and their mix), structures and all, then decodes it
+all, corrects it all and throws most of it away, and it does so for the host's elements and again
+for them with each dopant; nothing was kept, so every run asked again. `dwf.py` now makes those
+queries itself (one request each: the GGA/GGA+U hull only, up to `phases_e_above_hull` + 0.1
+eV/atom, the fields doped reads), keeps the replies and the phases doped chose, and logs each
+query (documents, MB, seconds). Tested against a stand-in Materials Project that answers as the
+real one does (thermo documents per hull type, with their entries in its current form; filters,
+fields, both kinds of pages, a summary route, the key), with 25 made-up Ca-O-Sb materials on and
+off the hull: doped through pymatgen's own queries chose 9 phases from 325 kB of thermo
+documents, and through `dwf.py` the same 9 from 63 kB; a second run asked nothing; without
+`phases_doped.json` only doped's key check went out; without dopants, the host's phases came
+from the kept replies; a Materials Project that refuses the short query (400) gets pymatgen's own
+queries, with the same phases; a wrong key still stops, saying so. On Python 3.11 and 3.13
+(pymatgen 2026.10.24); not with the real Materials Project.
 
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), real `mace_run_train` trainings with the charge embedding (F2: the command was checked, not
