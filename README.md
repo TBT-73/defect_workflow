@@ -588,15 +588,20 @@ through doped); or none (no limits: E2 then leaves out the μ terms, and only de
 composition can be compared). Solids relax lattice and positions at the production settings;
 molecules relax in their fixed box at Γ.
 
-With `phases_from : doped`, `dwf.py` makes doped's Materials Project queries itself, as the
-Materials Project's tips for large downloads ask: one request for each of doped's queries, for
-the GGA/GGA+U hull only (the entries doped can use), for the materials up to
-`phases_e_above_hull` + 0.1 eV/atom above it (doped picks within `phases_e_above_hull`, and those
-further up don't move the hull), and for the fields doped reads only. Each reply is kept in
-`A_host/materials_project/`, and the phases doped chooses in `A_host/phases_doped.json`, with
-their structures: a later run (the same host, `dopants` and `phases_e_above_hull`) takes them from
-there and asks nothing. Delete `phases_doped.json` to have doped choose again (from the kept
-replies), and the folder too to ask the Materials Project again.
+With `phases_from : doped`, each dopant gets its phases on its own: doped is given one dopant at a
+time, so each works on the hull of the host's elements and that dopant (Ca-O-Sb, then Ca-O-Bi,
+...), as an Sb compound has nothing to do with doping with Bi. (Given all the dopants at once,
+doped ends by building one phase diagram of every element together, which with many dopants never
+finishes: see the testing log.) `dwf.py` also makes doped's Materials Project queries itself, as
+the Materials Project's tips for large downloads ask: every chemical system the dopants need in
+one request, then the summaries (band gaps) of their materials a few hundred at a time; only the
+GGA/GGA+U hull (the entries doped can use), only the materials up to `phases_e_above_hull` + 0.1
+eV/atom above it (doped picks within `phases_e_above_hull`, and those further up don't move the
+hull), and only the fields doped reads. What comes is kept in `A_host/materials_project/`, so a
+dopant added later costs one request for its own systems; the phases doped chooses are kept in
+`A_host/phases_doped.json`, with their structures, and a later run (the same host, `dopants` and
+`phases_e_above_hull`) takes them from there and asks nothing. Delete `phases_doped.json` to have
+doped choose again (from the kept replies), and the folder too to ask the Materials Project again.
 
 **A3.2 limits.** A pymatgen phase diagram of the host and the phases made of its own elements
 (it needs a phase of each pure element, and stops if the host lies above the hull). Each corner
@@ -2160,6 +2165,23 @@ documents, and through `dwf.py` the same 9 from 63 kB; a second run asked nothin
 from the kept replies; a Materials Project that refuses the short query (400) gets pymatgen's own
 queries, with the same phases; a wrong key still stops, saying so. On Python 3.11 and 3.13
 (pymatgen 2026.10.24); not with the real Materials Project.
+
+Then the same user's 33-dopant screen (CaO with H to Bi): the queries took 41 s (one request for
+the host's systems and one for each dopant's, and a summary request with each), then the run never
+moved again. Given all its dopants at once, doped ends by building a pymatgen phase diagram of
+every element together, here 35, kept for reference only; its convex hull grows about twofold
+with each element (made-up Ca-O-X compounds: 15 elements 1.6 s, 19 elements 8 s, 23 elements 76 s),
+so 35 would take many hours. doped chooses each dopant's phases on their own anyway, from the hull
+of the host's elements and that dopant. `dwf.py` now gives doped one dopant a call, asks for every
+chemical system of every dopant in one request (doped's key check once a run), and keeps the
+documents by chemical system and the summaries by material, so a dopant added later costs one
+request for its systems. Tested on the stand-in Materials Project with Sr as a second dopant (and
+an Sr-Sb oxide neither needs): doped given Sb and Sr at once, through pymatgen's own queries,
+chose 12 phases from 7 requests and 433 kB of thermo documents, building phase diagrams of up to 4
+elements; `dwf.py` chose the same 12 from 3 requests (the key check, every system, the summaries)
+and 61 kB, with none above 3 elements, and never asked for Sr-Sb; Sb alone and no dopants then came
+from the kept replies; a run with Sb, then one with Sb and Sr, asked only for Sr's four systems;
+the fallback and a wrong key as before. The whole suite passes on Python 3.10, 3.11 and 3.13.
 
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), real `mace_run_train` trainings with the charge embedding (F2: the command was checked, not

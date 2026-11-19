@@ -3164,18 +3164,12 @@ MP_HULL_MARGIN = 0.1
 
 # One Materials Project API query (route e.g. "materials/thermo", params as the API takes them),
 # made as the Materials Project's tips for large downloads ask: a list in one request, only the
-# fields asked for, pages of 1000 (_limit and _skip, as the mp-api client pages), and the reply
-# kept in folder, so the same query never goes out twice. Raises pymatgen's MPRestError in
-# pymatgen's words, which doped and doped_phases() read.
+# fields asked for, and pages of 1000 (_limit and _skip, as the mp-api client pages). Logs what
+# came (what: a label). Raises pymatgen's MPRestError in pymatgen's words, which doped and
+# doped_phases() read.
 #   Called by: lean_mp_entries()
-def mp_query(mpr, route, params, folder):
+def mp_query(mpr, route, params, what):
     from pymatgen.ext.matproj import MPRestError
-    tag = hashlib.sha1(json.dumps([route, sorted(params.items())]).encode()).hexdigest()[:16]
-    path = folder / f"{route.rsplit('/', 1)[-1]}_{tag}.json"
-    try:
-        return json.loads(path.read_text())["data"]
-    except (OSError, ValueError, KeyError):
-        pass                                          # not asked before (or a broken copy)
     data, size, start = [], 0, time.time()
     while True:
         q = dict(params, _limit=1000, **({"_skip": len(data)} if data else {}))
@@ -3195,65 +3189,103 @@ def mp_query(mpr, route, params, folder):
         total = (reply.get("meta") or {}).get("total_doc")
         if len(page) < 1000 or (total is not None and len(data) >= total):
             break
-    folder.mkdir(parents=True, exist_ok=True)
-    part = path.with_suffix(".part")
-    part.write_text(json.dumps({"route": route, "params": params, "data": data}))
-    part.replace(path)
-    log(f"  Materials Project: {len(data)} {route.rsplit('/', 1)[-1]} documents, "
-        f"{size / 1e6:.2f} MB in {time.time() - start:.1f} s")
+    log(f"  Materials Project: {len(data)} {what}, {size / 1e6:.2f} MB in "
+        f"{time.time() - start:.1f} s")
     return data
 
 
-# A stand-in for pymatgen's MPRester.get_entries while doped runs (doped_phases), for queries of
-# chemical systems, the large ones (any other query goes to original, pymatgen's own). pymatgen
-# asks for every material of every hull the Materials Project has (GGA/GGA+U, r2SCAN and their
-# mix), structures and all, and decodes it all; this asks only for the GGA/GGA+U hull's documents
-# (thermo_types: the entries MaterialsProject2020Compatibility keeps), only for materials up to
-# eah_max above that hull, and only for the fields doped wants, then treats them as pymatgen does:
-# entries decoded, entry ids as text, the compatibility applied, property_data in data, and the
-# summary's fields (one more query, for all the materials at once) in data["summary"]. A query
-# the Materials Project won't take this way (400, 422) goes to pymatgen's own.
+# A stand-in for pymatgen's MPRester.get_entries while doped runs (doped_phases). pymatgen asks
+# for every material of a chemical system on every hull the Materials Project has (GGA/GGA+U,
+# r2SCAN and their mix), structures and all, and decodes it all. For chemical systems, this asks
+# only for the GGA/GGA+U hull's documents (thermo_types: the entries
+# MaterialsProject2020Compatibility keeps), only up to eah_max above that hull, and only the
+# fields doped wants; its first query also takes the systems in expect (those doped asks for
+# next: the host's and every dopant's), all in one request, and then the summaries of all their
+# materials, a few hundred to a request. What comes is kept in folder (thermo_GGA_GGA+U.json,
+# summary.json), so no system or material is asked for twice, in this run or a later one. The
+# entries are then treated as pymatgen treats them: decoded, entry ids as text,
+# MaterialsProject2020Compatibility applied, property_data in data, the summary's fields in
+# data["summary"]. Any other query (doped's key check) goes to original, pymatgen's own, once a
+# run; so does a chemical system the Materials Project won't take this way (400, 422).
 #   Called by: doped_phases()
 #   Calls:     mp_query()
-def lean_mp_entries(folder, eah_max, original):
+def lean_mp_entries(folder, eah_max, original, expect=()):
     import warnings
     from monty.json import MontyDecoder
+    from pymatgen.core import Composition
     from pymatgen.ext.matproj import MPRestError
     decode = MontyDecoder().process_decoded
+    files = {"thermo": folder / "thermo_GGA_GGA+U.json", "summary": folder / "summary.json"}
+    kept, answered = {}, {}           # the files' items (by kind); pymatgen's own answers
+
+    def held(kind, **meta):           # what is kept of a kind, if it was kept with these settings
+        if kind not in kept:
+            try:
+                got = json.loads(files[kind].read_text())
+                kept[kind] = got["items"] if all(got.get(k) == v for k, v in meta.items()) else {}
+            except (OSError, ValueError, KeyError, TypeError):
+                kept[kind] = {}
+        return kept[kind]
+
+    def keep(kind, **meta):
+        folder.mkdir(parents=True, exist_ok=True)
+        part = files[kind].with_suffix(".part")
+        part.write_text(json.dumps(dict(meta, items=kept[kind])))
+        part.replace(files[kind])
+
+    def system(doc):
+        cs = doc.get("chemsys")
+        if isinstance(cs, str) and cs:
+            return "-".join(sorted(cs.split("-")))
+        return "-".join(sorted(el.symbol for el in Composition(doc["formula_pretty"])))
 
     def get_entries(mpr, criteria, *args, compatible_only=True, property_data=None,
                     summary_data=None, **kw):
         items = criteria.split(",") if isinstance(criteria, str) else list(criteria)
+        own = dict(compatible_only=compatible_only, property_data=property_data,
+                   summary_data=summary_data, **kw)
         if args or not any("-" in c for c in items) or not all(
                 re.fullmatch(r"[A-Z][a-z]?(-[A-Z][a-z]?)*", c) for c in items):
-            return original(mpr, criteria, *args, compatible_only=compatible_only,
-                            property_data=property_data, summary_data=summary_data, **kw)
-        systems = ",".join(dict.fromkeys("-".join(sorted(c.split("-"))) for c in items))
-        fields = ",".join(dict.fromkeys(["material_id", "entries", *(property_data or [])]))
-        try:
-            docs = mp_query(mpr, "materials/thermo", {
-                "chemsys": systems, "thermo_types": "GGA_GGA+U",
-                "energy_above_hull_max": round(eah_max, 4), "_fields": fields,
-                "_all_fields": False}, folder)
-        except MPRestError as err:
-            if "status code 400" not in str(err) and "status code 422" not in str(err):
-                raise
-            log(f"  note: the Materials Project wouldn't take the short query ({str(err)[:200]}),"
-                " so pymatgen asks for everything")
-            return original(mpr, criteria, compatible_only=compatible_only,
-                            property_data=property_data, summary_data=summary_data, **kw)
+            tag = json.dumps([items, [str(a) for a in args], sorted(map(str, own.items()))])
+            if tag not in answered:
+                answered[tag] = original(mpr, criteria, *args, **own)
+            return copy.deepcopy(answered[tag])
+        systems = list(dict.fromkeys("-".join(sorted(c.split("-"))) for c in items))
+        fields = sorted({"material_id", "chemsys", "entries", *(property_data or [])})
+        meta = {"thermo_types": "GGA_GGA+U", "eah_max": round(eah_max, 4), "fields": fields}
+        docs_of = held("thermo", **meta)
+        missing = [s for s in dict.fromkeys([*systems, *expect]) if s not in docs_of]
+        if missing:
+            try:
+                docs = mp_query(mpr, "materials/thermo", {
+                    "chemsys": ",".join(missing), "thermo_types": "GGA_GGA+U",
+                    "energy_above_hull_max": meta["eah_max"], "_fields": ",".join(fields),
+                    "_all_fields": False},
+                    f"thermo documents for {len(missing)} chemical systems")
+            except MPRestError as err:
+                if "status code 400" not in str(err) and "status code 422" not in str(err):
+                    raise
+                log(f"  note: the Materials Project wouldn't take the short query "
+                    f"({str(err)[:200]}), so pymatgen asks for everything")
+                return original(mpr, criteria, *args, **own)
+            for s in missing:
+                docs_of[s] = []
+            for d in docs:
+                docs_of.setdefault(system(d), []).append(d)
+            keep("thermo", **meta)
         entries = []
-        for doc in docs:
-            for raw in (doc.get("entries") or {}).values():
-                e = decode(raw)
-                if isinstance(e.entry_id, dict):      # as pymatgen does from 2026.9.23
-                    i = e.entry_id
-                    e.entry_id = str(i.get("identifier", "")) + (
-                        f"{i.get('separator', '-')}{i['suffix']}" if i.get("suffix") else "")
-                e.data.setdefault("material_id", doc.get("material_id"))
-                for prop in property_data or []:
-                    e.data[prop] = decode(doc.get(prop))
-                entries.append(e)
+        for s in systems:
+            for doc in docs_of.get(s, []):
+                for raw in (doc.get("entries") or {}).values():
+                    e = decode(copy.deepcopy(raw))
+                    if isinstance(e.entry_id, dict):  # as pymatgen does from 2026.9.23
+                        i = e.entry_id
+                        e.entry_id = str(i.get("identifier", "")) + (
+                            f"{i.get('separator', '-')}{i['suffix']}" if i.get("suffix") else "")
+                    e.data.setdefault("material_id", doc.get("material_id"))
+                    for prop in property_data or []:
+                        e.data[prop] = decode(copy.deepcopy(doc.get(prop)))
+                    entries.append(e)
         if compatible_only:
             from pymatgen.entries.compatibility import MaterialsProject2020Compatibility
             with warnings.catch_warnings():
@@ -3261,17 +3293,26 @@ def lean_mp_entries(folder, eah_max, original):
                 entries = MaterialsProject2020Compatibility().process_entries(entries,
                                                                               clean=True)
         if summary_data and entries:
-            ids = list(dict.fromkeys(str(e.data["material_id"]) for e in entries))
-            got = {}
-            for k in range(0, len(ids), 500):
-                for d in mp_query(mpr, "materials/summary", {
-                        "material_ids": ",".join(ids[k:k + 500]),
-                        "_fields": ",".join(dict.fromkeys([*summary_data, "material_id"])),
-                        "_all_fields": False}, folder):
-                    got[str(d["material_id"])] = {f: decode(v) for f, v in d.items()
-                                                  if f != "material_id"}
+            sfields = sorted({*summary_data, "material_id"})
+            sums = held("summary", fields=sfields)
+            ids = [str(e.data["material_id"]) for e in entries]
+            if any(i not in sums for i in ids):           # first time: every kept material
+                every = [i for i in dict.fromkeys(
+                    [*ids, *(str(d.get("material_id")) for ds in docs_of.values() for d in ds)])
+                    if i not in sums]
+                for k in range(0, len(every), 250):
+                    for d in mp_query(mpr, "materials/summary", {
+                            "material_ids": ",".join(every[k:k + 250]),
+                            "_fields": ",".join(sfields), "_all_fields": False},
+                            "summary documents"):
+                        sums[str(d["material_id"])] = {f: v for f, v in d.items()
+                                                       if f != "material_id"}
+                for i in every:
+                    sums.setdefault(i, {})
+                keep("summary", fields=sfields)
             for e in entries:
-                e.data["summary"] = got.get(str(e.data["material_id"]), {})
+                e.data["summary"] = {f: decode(copy.deepcopy(v))
+                                     for f, v in sums.get(str(e.data["material_id"]), {}).items()}
         return list(dict.fromkeys(entries))
     return get_entries
 
@@ -3287,8 +3328,12 @@ def lean_mp_entries(folder, eah_max, original):
 # and named as doped 3 names them (formula_spacegroup_EaH_e), each name once. When doped fails,
 # the error adds what went wrong underneath (doped 3 calls any failed test query an invalid key)
 # and where the key came from, its length and first four characters, never the whole key.
-# doped's Materials Project queries go through lean_mp_entries() (only what doped can use, each
-# reply kept in A_host/materials_project/), and the phases doped chose are kept in
+# doped is given one dopant a call: given them all, it ends by building one phase diagram of
+# every element together (for reference only), whose convex hull takes hours from about 25
+# elements on (a host of two with 33 dopants has 35). It chooses each dopant's phases on their
+# own anyway, so one at a time gives the same phases. doped's Materials Project queries go
+# through lean_mp_entries() (only what doped can use, every system it will ask for in one
+# request, all kept in A_host/materials_project/), and the phases doped chose are kept in
 # A_host/phases_doped.json: a run after that (the same formula, dopants and phases_e_above_hull)
 # takes them from there and asks nothing.
 #   Called by: phase_list()
@@ -3327,25 +3372,41 @@ def doped_phases(p):
             lean = getattr(dcp, "MPRester", None) is matproj.MPRester
         except ImportError:
             lean = False
+        own = sorted(set(p.host().get_chemical_symbols()))     # the systems doped will ask
+        expect = sorted({"-".join(sub) for group in [own, *(sorted({*own, x}) for x in dopants)]
+                         for n in range(1, len(group) + 1)
+                         for sub in itertools.combinations(group, n)})
         if lean:                                         # doped's queries, the lean way
             original = matproj.MPRester.get_entries
             matproj.MPRester.get_entries = lean_mp_entries(
-                p.dir / "A_host" / "materials_project", eah + MP_HULL_MARGIN, original)
+                p.dir / "A_host" / "materials_project", eah + MP_HULL_MARGIN, original, expect)
         log(f"A3.1: asking the Materials Project, through doped {have}, for the competing "
             f"phases of {formula}" + (f" with {', '.join(dopants)}" if dopants else ""))
+        new = "energy_above_hull" in inspect.signature(dcp.CompetingPhases).parameters
+        entries, doing = [], ""
         try:
-            if "energy_above_hull" in inspect.signature(dcp.CompetingPhases).parameters:
-                entries = dcp.CompetingPhases(formula, energy_above_hull=eah,       # 3.1 on
-                                              extrinsic=dopants or None, api_key=key).entries
-            elif dopants:                                # doped 2.x and 3.0
-                cp = dcp.ExtrinsicCompetingPhases(formula, extrinsic_species=dopants,
-                                                  e_above_hull=eah, api_key=key)
-                entries = cp.intrinsic_entries + cp.entries
-            else:
-                entries = dcp.CompetingPhases(formula, e_above_hull=eah, api_key=key).entries
+            for n, x in enumerate(dopants or [None]):    # one dopant a call: see above
+                doing = f" (for {x})" if x else ""
+                if new and x:                            # doped 3.1 on
+                    cp = dcp.CompetingPhases(formula, energy_above_hull=eah, extrinsic=[x],
+                                             api_key=key)
+                    host, extra = cp.intrinsic_entries, cp.extrinsic_entries
+                elif new:
+                    host, extra = dcp.CompetingPhases(formula, energy_above_hull=eah,
+                                                      api_key=key).entries, []
+                elif x:                                  # doped 2.x and 3.0
+                    cp = dcp.ExtrinsicCompetingPhases(formula, extrinsic_species=[x],
+                                                      e_above_hull=eah, api_key=key)
+                    host, extra = cp.intrinsic_entries, cp.entries
+                else:
+                    host, extra = dcp.CompetingPhases(formula, e_above_hull=eah,
+                                                      api_key=key).entries, []
+                entries += (host if n == 0 else []) + extra
+                if len(dopants) > 1:
+                    log(f"  doped: {x} ({n + 1} of {len(dopants)}), {len(extra)} phases")
         except Exception as err:                         # network, API key, ...
             tips = dict.fromkeys(str(w.message) for w in said if "install" in str(w.message))
-            msg = (f"doped {have} could not get the competing phases from the Materials "
+            msg = (f"doped {have} could not get the competing phases{doing} from the Materials "
                    f"Project: {err}" + "".join(f"\n  doped warned: {t}" for t in tips))
             why = err.__cause__ or err.__context__       # what went wrong underneath: doped 3
             if why is not None and str(why) not in msg:  # calls any failed test query a bad key
