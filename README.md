@@ -103,8 +103,8 @@ made is brought up to date by `--migrate` ([Command line](#command-line)).
   0.3.15 or later for F2's models (`mace_run_train` with the total-charge embedding), whose
   jobs want a GPU build (`model_device : cuda`);
 - optional: `pymatgen-analysis-defects` for Voronoi interstitials, a Materials Project API key
-  for `phases_from : doped` (doped 2.x takes only a legacy key; doped 3, on Python 3.10 or later,
-  takes the current ones);
+  for `phases_from : doped`, which needs doped 3 and so Python 3.10 or later (doped 2.x takes
+  only the legacy keys, whose API the Materials Project was closing in September 2025);
 - CASTEP and Slurm (other schedulers through `submit_cmd` / `status_cmd`).
 
 On Cirrus (as on ARCHER2), put the environment on `/work`: the compute nodes, which run the MACE
@@ -1336,7 +1336,7 @@ Details: [Phase A](#phase-a-the-host).
 | `dielectric_cell` | — | A2.3 | A `.cell` whose `species_pot` (and other settings) the DFPT run uses instead of the host `.cell`'s, e.g. `NCP` for CASTEP's norm-conserving library. Its structure is ignored: the run uses the relaxed host. A2.3 warns before submitting if the potentials don't look norm-conserving. |
 | `%block phases` | — | A3.1 | The competing phases, one per line: `name  structure-file  [options]`. Options: `molecule` (positions only, in its fixed box, at Γ, without symmetry); `metal` (`fix_occupancy : false` unless the line says otherwise; add `smearing_width=...`); `kspacing=0.03` (its own k-point spacing); and any other `keyword=value`, a `.param` keyword for that phase only (e.g. `spin=2 spin_polarized=true` for O₂). Solids relax lattice and positions, with symmetry, at the production settings. A3.2 needs a phase of each pure element of the host, and for each dopant at least one phase that contains it. |
 | `phases_from` | `none` | A3.1 | `doped`: when there is no `%block phases`, take the competing phases from the Materials Project through doped (needs doped and `mp_api_key`). |
-| `mp_api_key` | — | — | Materials Project API key for `phases_from : doped` (or set it in doped's configuration). doped 2.x takes only a legacy key; doped 3.0 and later take the current ones (3.0 also needs `mp-api` and `emmet-core`). |
+| `mp_api_key` | — | — | Materials Project API key for `phases_from : doped`: the 32 characters on your dashboard, without quotes. Given here, it is used rather than doped's own (`PMG_MAPI_KEY` in `~/.pmgrc.yaml`). It needs doped 3: doped 2.x takes only the legacy keys, whose API the Materials Project was closing in September 2025; 3.0 takes the current ones but also needs `mp-api` and `emmet-core`, 3.1 and later nothing more. |
 | `phases_e_above_hull` | `0.05 eV/atom` | A3.1 | `phases_from : doped` takes the Materials Project entries up to this far above the hull. |
 | `%block chemical_potentials` | — | A3.1, A3.2 | The limits themselves, one per line: `name  El=value ...`, in absolute eV per atom on the energy scale of your CASTEP runs, for every element of the host and the dopants. A3.1 then relaxes nothing, and A3.2 records them. It takes precedence over `%block phases` and `phases_from`. |
 
@@ -2108,8 +2108,18 @@ stand-ins for doped 2.4.7, 3.0.0 (current and legacy keys) and 3.1 on (3.2.1's n
 that version's signatures and entries (from its source), for made-up phases of CaO with and
 without Sb: each was called its own way, and all gave the same phases, molecules, metals and
 names (two polymorphs named alike get `_2`), and the same CASTEP inputs from A3.1. When doped
-fails, the error names its version and repeats doped's advice on what to install, and with 2.x
-says it takes only a legacy key. Still not run against the Materials Project itself.
+fails, the error names its version and repeats doped's advice on what to install; with 2.x it
+says to update doped (2.x needs the legacy API, which the Materials Project was closing in
+September 2025), and a key in doped's message shows only its first four characters (2.x prints the
+whole key). Then a user's doped 3.2.1 called the key invalid: doped 3 checks a key with a query
+for `mp-1` and calls any failure of it an invalid key, whether the Materials Project refused the
+key or the query never reached it. The error now adds the query's own error, where the key came
+from (`mp_api_key` or `~/.pmgrc.yaml`), its first four characters and its length, and what that
+points to: refused (HTTP 401 or 403), never checked (no connection), or not 32 characters
+(pymatgen's "Invalid or old API key"). Tested with doped 3.2.1's own check, against a refusal
+like the Materials Project's, a closed port and a quoted key, on Python 3.13 and on Python 3.10
+with pymatgen 2025.10.7 (the newest for 3.10), where the whole suite passes too. Still not run
+against the Materials Project itself.
 
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), real `mace_run_train` trainings with the charge embedding (F2: the command was checked, not

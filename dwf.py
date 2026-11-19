@@ -3164,7 +3164,9 @@ def phase_list(p):
 # intrinsic_entries are the host's phases): the keywords doped's CompetingPhases takes tell them
 # apart. Each keeps an entry's band gap in its own place, so the phases are grouped here as
 # doped 3 groups them: molecules, metals (band gap 0 on the Materials Project), then the rest;
-# and named as doped 3 names them (formula_spacegroup_EaH_e), each name once.
+# and named as doped 3 names them (formula_spacegroup_EaH_e), each name once. When doped fails,
+# the error adds what went wrong underneath (doped 3 calls any failed test query an invalid key)
+# and where the key came from, its length and first four characters, never the whole key.
 #   Called by: phase_list()
 #   Calls:     Project.host()
 def doped_phases(p):
@@ -3196,11 +3198,35 @@ def doped_phases(p):
                 entries = dcp.CompetingPhases(formula, e_above_hull=eah, api_key=key).entries
         except Exception as err:                         # network, API key, ...
             tips = dict.fromkeys(str(w.message) for w in said if "install" in str(w.message))
-            die(f"doped {have} could not get the competing phases from the Materials Project: "
-                f"{err}" + "".join(f"\n  doped warned: {t}" for t in tips)
-                + ("\n  doped 2.x takes only a legacy Materials Project API key; doped 3 (pip "
-                   "install -U doped, on Python 3.10 or later) takes the current ones"
-                   if have.startswith("2.") else ""))
+            msg = (f"doped {have} could not get the competing phases from the Materials "
+                   f"Project: {err}" + "".join(f"\n  doped warned: {t}" for t in tips))
+            why = err.__cause__ or err.__context__       # what went wrong underneath: doped 3
+            if why is not None and str(why) not in msg:  # calls any failed test query a bad key
+                msg += f"\n  the query's own error: {str(why)[:500]}"
+            if have.startswith("2."):
+                msg += ("\n  doped 2.x refuses the current Materials Project keys: it uses only "
+                        "the legacy API, which the Materials Project was closing in September "
+                        "2025. Use doped 3 (pip install -U doped, which needs Python 3.10 or "
+                        "later), or give the phases yourself in %block phases")
+            from pymatgen.core import SETTINGS
+            mpkey = str(key or SETTINGS.get("PMG_MAPI_KEY") or "")    # as doped picks it
+            said_why = str(why).lower()
+            if mpkey and not have.startswith("2."):
+                came = f"mp_api_key in {p.path.name}" if key else "PMG_MAPI_KEY in ~/.pmgrc.yaml"
+                msg += f"\n  the key ({came}) starts {mpkey[:4]} and has {len(mpkey)} characters"
+                if len(mpkey) != 32:
+                    msg += "; the Materials Project's keys have 32 (no quotes or spaces)"
+                elif any(s in said_why for s in ("max retries", "timed out", "proxyerror")):
+                    msg += ("; it was never checked: this machine can't reach the Materials "
+                            "Project, so run dwf.py where there is internet (a login node)")
+                elif "status code 401" in said_why or "status code 403" in said_why:
+                    msg += ("; the Materials Project refused it: compare it with the key on your "
+                            "dashboard (materialsproject.org/dashboard; a new key replaces the "
+                            "old one, and mp_api_key comes before ~/.pmgrc.yaml)")
+            for k in {str(k) for k in (key, SETTINGS.get("PMG_MAPI_KEY"),
+                                       os.environ.get("MP_API_KEY")) if k}:
+                msg = msg.replace(k, k[:4] + "...")      # doped prints the whole key
+            die(msg)
         kinds = {"molecule": [], "metal": [], "insulator": []}
         for e in entries:
             gap = e.data.get("band_gap")                 # doped 2.x and 3.0 keep it here,
