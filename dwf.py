@@ -3219,6 +3219,10 @@ def doped_phases(p):
                 elif any(s in said_why for s in ("max retries", "timed out", "proxyerror")):
                     msg += ("; it was never checked: this machine can't reach the Materials "
                             "Project, so run dwf.py where there is internet (a login node)")
+                elif "no module named 'pymatgen" in said_why:   # the reply names a newer one
+                    msg += (f"; it works (the Materials Project answered), but pymatgen "
+                            f"{metadata.version('pymatgen')} can't read the answer: that needs "
+                            "pymatgen 2026.9.23 or later, which needs Python 3.11 or later")
                 elif "status code 401" in said_why or "status code 403" in said_why:
                     msg += ("; the Materials Project refused it: compare it with the key on your "
                             "dashboard (materialsproject.org/dashboard; a new key replaces the "
