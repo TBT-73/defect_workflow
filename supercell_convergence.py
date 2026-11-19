@@ -311,6 +311,8 @@ OMP_AUTO_MAX = 4                       # most OpenMP threads per process with om
 # (each in proportion to its cores; the rest is left for the system), and their job scripts go in
 # <workdir>/packs/
 PACK_MEM, PACK_DIR = 0.75, "packs"
+ARRAY_TASKS = "tasks.txt"      # a job array's tasks (array : N): directory <tab> seed, one a line
+TIMINGS = [0]      # how often a job's timings were saved: estimate_walltime's list of timed jobs
 # srun options a pack sets itself for each job, taken out of the template's CASTEP line
 SRUN_OWN = re.compile(r"\s(--(?:nodes|ntasks|ntasks-per-node|cpus-per-task|mem|mem-per-cpu)"
                       r"(?:=|\s+)\S+|--(?:exact|exclusive)(?:=\S+)?|-[nNc]\s*\S+)(?=\s|$)")
@@ -920,18 +922,35 @@ class Calc:
         self.kpoint_offset, self.fix_cell, self.cell_extra = kpoint_offset, fix_cell, cell_extra
         self.symmetry = kind == "bulk" if symmetry is None else symmetry
         self.param_items, self.group = param_items, group
+        self._info, self._done = None, False       # job_info.json, read once; done() once true
 
-    # Reads job_info.json (an empty dict if it doesn't exist yet).
+    # Reads job_info.json (an empty dict if it doesn't exist yet): a copy the caller may change and
+    # save back. The file is read once and then kept in memory: only save() writes it.
     #   Called by: almost every function that plans, submits or checks a calculation
+    #   Calls:     Calc.peek()
     def info(self):
-        p = self.dir / INFO
-        return json.loads(p.read_text()) if p.exists() else {}
+        return json.loads(json.dumps(self.peek()))
 
-    # Writes job_info.json.
+    # job_info.json itself, as kept in memory, for reading only: the checks that run over every job
+    # of a batch on every poll (run_batch, wait_for, calibrate, measure_times, estimate_walltime),
+    # which with thousands of jobs would otherwise read thousands of files each time.
+    #   Called by: Calc.info(), calibrate(), estimate_walltime(), measure_times(), run_batch(),
+    #              wait_for()
+    def peek(self):
+        if self._info is None:
+            p = self.dir / INFO
+            self._info = json.loads(p.read_text()) if p.exists() else {}
+        return self._info
+
+    # Writes job_info.json, and keeps it in memory for info() and peek(). Saving a job with timings
+    # counts in TIMINGS, so that estimate_walltime makes its list of timed jobs again.
     # Functions read it with info(), change it and save it back.
     #   Called by: every function that records something in job_info.json
     def save(self, info):
+        if "timing" in info or "timing" in (self._info or {}):
+            TIMINGS[0] += 1
         (self.dir / INFO).write_text(json.dumps(info, indent=2))
+        self._info = json.loads(json.dumps(info))
 
     # The whole .castep: every run of the job, since each restart appends to it.
     # Used to see whether the calculation is done, and to read energies, structures and the dry
@@ -966,14 +985,16 @@ class Calc:
     # True when the calculation is complete.
     # CASTEP printed 'Total time' and, for a relaxation, 'Geometry optimization completed
     # successfully'. This is what wait_for waits for; it is also used to skip calculations that are
-    # already done.
+    # already done. Once true it is remembered, so a finished job's .castep isn't read again.
     #   Called by: calibrate(), job_result(), main(), measure_times(), prepare_all(), prepare_sp(),
     #              remove_check(), run_batch(), wait_for()
     #   Calls:     Calc.output()
     def done(self):
         """Finished, and for a geometry optimisation also converged."""
-        out = self.output()
-        return bool(FINISHED.search(out)) and (self.kind != "geom" or GEOM_DONE in out)
+        if not self._done:                     # once done it stays done: not read again
+            out = self.output()
+            self._done = bool(FINISHED.search(out)) and (self.kind != "geom" or GEOM_DONE in out)
+        return self._done
 
     # CASTEP's error files (<seed>*.err), written when CASTEP aborts.
     # wait_for treats their appearance as a failure straight away (handle_failure); restart reads
@@ -999,7 +1020,7 @@ def fill(template, subs):
 # ...: SBATCH_SHORT), removing duplicates; otherwise adds it after the last #SBATCH line. A memory
 # request (--mem, --mem-per-cpu, ...) replaces any other memory request.
 #   Called by: dryrun_sbatch(), finalize(), restart(), set_exclusive(), set_threads(),
-#              submit_pack()
+#              submit_array(), submit_pack()
 def add_sbatch_option(text, option):
     """Set '#SBATCH <option>' (e.g. '--qos=highmem' or '-C icelake') in a jobscript,
     replacing that option if it is already there in either spelling (-p / --partition;
@@ -1093,7 +1114,8 @@ def sbatch_value(text, flag):
 
 # Converts a Slurm time (min, min:s, h:min:s, d-h, d-h:min, d-h:min:s) to seconds.
 # Returns None if the text isn't a Slurm time.
-#   Called by: _slurm_time(), job_timing(), plan_walltime(), restart()
+#   Called by: _slurm_time(), job_timing(), plan_walltime(), restart(), submit_array(),
+#              submit_pack()
 def slurm_seconds(spec):
     """A Slurm time (min, min:s, h:min:s, d-h, d-h:min, d-h:min:s) in seconds, or None."""
     m = re.fullmatch(r"(?:(\d+)-)?(\d+)(?::(\d+))?(?::(\d+))?", spec.strip())
@@ -1110,7 +1132,7 @@ def slurm_seconds(spec):
 
 
 # The reverse of slurm_seconds: seconds to Slurm's [d-]h:mm:ss.
-#   Called by: plan_walltime()
+#   Called by: plan_walltime(), submit_array(), submit_pack()
 def slurm_time(seconds):
     d, rest = divmod(int(math.ceil(seconds)), 86400)
     h, rest = divmod(rest, 3600)
@@ -1366,9 +1388,10 @@ def measured_replicated(calc, args):
 # measured so far (rounded up to 3 decimals), logging any change. Every job planned afterwards uses
 # it (finalize -> choose_resources -> mem_per_core_mb). Notes once if a finished job printed no
 # 'Peak Memory Use'. In batch mode calcs is keyed by (atoms, job number), and the size is the
-# number of atoms.
+# number of atoms. A job measured once it had finished is marked so (peak_final) and not measured
+# again.
 #   Called by: main(), restart(), run_batch()
-#   Calls:     Calc.done(), measured_replicated()
+#   Calls:     Calc.done(), Calc.peek(), measured_replicated()
 def calibrate(calcs, sizes, args):
     """mem_replicated : auto. Work out r from the latest finished run of every job (a
     relaxation that stopped at run_time and is carrying on counts), then use the largest r
@@ -1378,13 +1401,21 @@ def calibrate(calcs, sizes, args):
     found = []
     for n in sizes:
         for c in calcs[n].values():
-            info = c.info()
+            info = c.peek()
             if not info.get("jobid"):
                 continue
-            r, peak, p = measured_replicated(c, args)
-            if [info.get(k) for k in ("r_measured", "peak_mb", "peak_procs")] != [r, peak, p]:
-                info.update(r_measured=r, peak_mb=peak, peak_procs=p)
-                c.save(info)
+            if info.get("peak_final"):             # measured after it finished: final
+                r, peak, p = (info.get(k) for k in ("r_measured", "peak_mb", "peak_procs"))
+            else:
+                r, peak, p = measured_replicated(c, args)
+                final = c.done()
+                if final or [info.get(k) for k in ("r_measured", "peak_mb",
+                                                    "peak_procs")] != [r, peak, p]:
+                    info = c.info()
+                    info.update(r_measured=r, peak_mb=peak, peak_procs=p)
+                    if final:
+                        info["peak_final"] = True
+                    c.save(info)
             if peak is None and c.done() and not args.peak_warned:
                 args.peak_warned = True
                 log(f"note: no 'Peak Memory Use' line in {c.castep}, so mem_replicated "
@@ -1437,14 +1468,15 @@ def job_timing(calc):
 # Saves job_timing() in job_info.json ('timing') and logs how long the job took. estimate_walltime
 # reads these timings to plan later jobs.
 #   Called by: main(), run_batch()
-#   Calls:     Calc.done(), job_timing()
+#   Calls:     Calc.done(), Calc.peek(), job_timing()
 def measure_times(calcs, sizes):
     """Record how long each newly finished job took (for walltime : auto)."""
     for n in sizes:
         for c in calcs[n].values():
-            info = c.info()
+            info = c.peek()
             if "timing" in info or not info.get("jobid") or not c.done():
                 continue
+            info = c.info()
             info["timing"] = t = job_timing(c)
             c.save(info)
             if t:
@@ -1462,7 +1494,8 @@ def measure_times(calcs, sizes):
 # jobs of the same group are used (batch mode: the same kind and task, so e.g. a phonon+efield job
 # is not timed from single points; the size series has one group).
 # Returns (seconds, seconds per SCF, the job it scaled from), or Nones if there is nothing to scale
-# from.
+# from. The list of timed jobs is kept in ctx and made again only when a job's timings were saved
+# (TIMINGS), not for every job planned: a batch of thousands plans thousands of jobs.
 #   Called by: plan_walltime()
 def estimate_walltime(calc, nkpts, nelec, procs, ctx):
     """Run time (s) of calc, from the finished jobs: their time per SCF cycle scaled as
@@ -1473,21 +1506,24 @@ def estimate_walltime(calc, nkpts, nelec, procs, ctx):
     Returns (seconds, seconds per SCF, the job it is scaled from) or Nones."""
     # Whether a calculation has the timings, electrons and processes needed to scale from.
     def ok(c):
-        i = c.info()
+        i = c.peek()
         return (i.get("timing") or {}).get("per_cycle") and i.get("nelec") and i.get("ncores")
 
-    timed = [c for c in ctx["calcs"] if ok(c) and c.group == calc.group]
+    key = (TIMINGS[0], len(ctx["calcs"]))
+    if ctx.get("timed", (None,))[0] != key:
+        ctx["timed"] = (key, [c for c in ctx["calcs"] if ok(c)])
+    timed = [c for c in ctx["timed"][1] if c.group == calc.group]
     pool = [c for c in timed if c.kind == calc.kind] or (
         [c for c in timed if c.kind == "geom"] if calc.kind != "geom" else [])
     if not pool or not nelec:
         return None, None, None
     own = [c for c in timed if c.kind == "geom" and c.label == calc.label]
     if calc.kind == "defect" and own:    # single point on a relaxed cell: same speed per cycle
-        t = own[0].info()["timing"]
+        t = own[0].peek()["timing"]
         sps = [c for c in pool if c.kind == "defect"]
-        cycles = max(c.info()["timing"]["cycles"] for c in sps) if sps else t["first_scf_cycles"]
-        return t["per_cycle"] * own[0].info()["ncores"] / procs * cycles, None, own[0]
-    info = {c.name: c.info() for c in pool}
+        cycles = max(c.peek()["timing"]["cycles"] for c in sps) if sps else t["first_scf_cycles"]
+        return t["per_cycle"] * own[0].peek()["ncores"] / procs * cycles, None, own[0]
+    info = {c.name: c.peek() for c in pool}
 
     # A finished job's time per SCF cycle per k-point on one process, so jobs with different
     # k-points and process counts can be compared.
@@ -1563,7 +1599,7 @@ def plan_walltime(calc, script, dr, procs, ctx, args):
 # before Slurm stops the job. The margin is the larger of 900 s and 1.5 x the time of one SCF (5%
 # of the walltime while the SCF time isn't known), times a factor that restart doubles after a job
 # is killed anyway, and never more than half the walltime.
-#   Called by: finalize(), restart()
+#   Called by: finalize(), restart(), submit_array(), submit_pack()
 def run_time_for(walltime, per_scf=None, factor=1.0):
     """CASTEP run_time (s) for a job with this walltime (s): early enough to finish the SCF
     under way and write the .check before the scheduler stops the job."""
@@ -1576,7 +1612,7 @@ def run_time_for(walltime, per_scf=None, factor=1.0):
 # removes the keyword). Everything else in the file is left as it is, so changes you make by hand
 # to a calculation's .param survive restarts. Either spelling of a keyword with two
 # (canonical_key: spin_polarised, spin_polarized) replaces both.
-#   Called by: finalize(), restart(), write_inputs()
+#   Called by: finalize(), restart(), submit_array(), submit_pack(), write_inputs()
 #   Calls:     canonical_key(), strip_comment()
 def set_param(calc, **values):
     """Set keywords in the calc's .param (None removes the keyword)."""
@@ -2219,7 +2255,7 @@ def prepare_sp(sp, geom, ctx, args):
 
 # Submits a jobscript with submit_cmd, from its own directory, and returns the job id. Stops if the
 # submission fails. dwf.py submits its MACE jobs with it too.
-#   Called by: submit(), submit_dryrun_pack(), submit_pack(), dwf.py
+#   Called by: submit(), submit_array(), submit_dryrun_pack(), submit_pack(), dwf.py
 def send_job(directory, script, args):
     res = subprocess.run(shlex.split(args.submit_cmd) + [script], cwd=directory,
                          capture_output=True, text=True)
@@ -2233,9 +2269,9 @@ def send_job(directory, script, args):
 # Records a job submitted for a calculation in its job_info.json: the job id and submission time.
 # For a real job also a new run in info['runs'] - the job id, where its output will start in the
 # .castep (start: the file's size before the job), its walltime and number of processes; this is
-# what run_segments, job_timing, last_peak and Calc.run_text work from - and the pack it runs in
-# (pack : N), if any.
-#   Called by: submit(), submit_dryrun_pack(), submit_pack()
+# what run_segments, job_timing, last_peak and Calc.run_text work from - and the pack or job array
+# it runs in (pack : N, array : N), if any.
+#   Called by: submit(), submit_array(), submit_dryrun_pack(), submit_pack()
 def record_job(calc, jobid, start, wall, key="jobid", pack=None):
     info = calc.info()
     info[key] = jobid
@@ -2251,10 +2287,26 @@ def record_job(calc, jobid, start, wall, key="jobid", pack=None):
     calc.save(info)
 
 
+# What a planned job runs on, for the log: its nodes and processes (or its cores of a shared node),
+# and its partition.
+#   Called by: submit(), submit_array()
+def job_size(info):
+    nodes, tpn, cpus = info.get("nodes"), info.get("tasks_per_node"), info.get("cpus_per_task")
+    part = f" ({info['partition']})" if info.get("partition") else ""
+    if info.get("charged_cores") and not info.get("exclusive"):     # part of a shared node
+        return (f"{tpn} processes" + (f" x {cpus} cores" if cpus and cpus > 1 else "")
+                + f" ({info['charged_cores']} cores of a shared node"
+                + (f", {info['partition']})" if info.get("partition") else ")"))
+    if nodes:
+        return (f"{nodes} {'whole ' if info.get('exclusive') else ''}"
+                f"node{'s' if nodes > 1 else ''} x {tpn} processes{part}")
+    return f"{info.get('ncores')} cores{part}"
+
+
 # Submits job.sh (or dryrun.sh) with submit_cmd and records the job in job_info.json (record_job).
 # Stops if the submission fails.
 #   Called by: handle_failure(), main(), prepare_all(), restart(), run_batch()
-#   Calls:     record_job(), sbatch_value(), send_job()
+#   Calls:     job_size(), record_job(), sbatch_value(), send_job()
 def submit(calc, args, script=JOBSCRIPT, key="jobid"):
     start = calc.castep.stat().st_size if calc.castep.exists() else 0   # where its output begins
     jobid = send_job(calc.dir, script, args)
@@ -2262,19 +2314,7 @@ def submit(calc, args, script=JOBSCRIPT, key="jobid"):
     record_job(calc, jobid, start, wall, key)
     info = calc.info()
     if key == "jobid":
-        nodes, tpn, cpus = info.get("nodes"), info.get("tasks_per_node"), info.get("cpus_per_task")
-        part = f" ({info['partition']})" if info.get("partition") else ""
-        if info.get("charged_cores") and not info.get("exclusive"):     # part of a shared node
-            size = (f"{tpn} processes" + (f" x {cpus} cores" if cpus and cpus > 1 else "")
-                    + f" ({info['charged_cores']} cores of a shared node"
-                    + (f", {info['partition']})" if info.get("partition") else ")"))
-            part = ""
-        elif nodes:
-            size = (f"{nodes} {'whole ' if info.get('exclusive') else ''}"
-                    f"node{'s' if nodes > 1 else ''} x {tpn} processes")
-        else:
-            size = f"{info.get('ncores')} cores"
-        log(f"submitted {calc.name}: job {info[key]} on {size}{part}"
+        log(f"submitted {calc.name}: job {info[key]} on {job_size(info)}"
             + (f", walltime {wall}" if wall else ""))
     else:
         log(f"submitted dry run for {calc.name} ({len(calc.atoms)} atoms): job {info[key]}")
@@ -2317,7 +2357,7 @@ def pack_line(run, rx, calc, own, env):
 
 # A new directory for a pack's job script: <workdir>/packs/<prefix>_NNN, numbered on from those
 # already there.
-#   Called by: submit_dryrun_pack(), submit_pack()
+#   Called by: submit_array(), submit_dryrun_pack(), submit_pack()
 def new_pack_dir(workdir, prefix):
     packs = workdir / PACK_DIR
     packs.mkdir(exist_ok=True)
@@ -2428,6 +2468,88 @@ def submit_pack(group, ctx, args, workdir):
         + ", ".join(f"{c.name} ({i['ncores']} processes)" for c, i in zip(group, infos)))
 
 
+# The line of a jobscript template that runs CASTEP on {SEED}, for array : N. There must be
+# exactly one; unlike a pack's, it needn't use srun, since each task of a job array is a job of
+# its own. Returns the line; stops with what to change otherwise.
+#   Called by: run_batch(), submit_array()
+def array_castep_line(template, name="the runner settings"):
+    runs = [line for line in template.splitlines()
+            if CASTEP_RUN.search(line) and not line.lstrip().startswith("#")]
+    if len(runs) != 1:
+        die(f"{name}: array runs each job as a task of a Slurm job array, so the jobscript "
+            "template needs exactly one line that runs CASTEP on {SEED}, e.g.\n"
+            "    srun --distribution=block:block --hint=nomultithread castep.mpi {SEED}")
+    return runs[0]
+
+
+# A planned job's job.sh as a key that is the same for jobs that can go in one job array: the
+# script with the job's seed and name put back as {SEED} and {JOBNAME}, and without its --time and
+# --job-name, which the array sets for all of its tasks.
+#   Called by: run_batch(), submit_array()
+def array_key(calc):
+    lines = []
+    for line in (calc.dir / JOBSCRIPT).read_text().splitlines():
+        if re.match(r"#SBATCH\s+((--time|--job-name)(=|\s|$)|-[tJ])", line.strip()):
+            continue
+        lines.append(line.replace(calc.seed, "{SEED}").replace(calc.name, "{JOBNAME}"))
+    return "\n".join(lines) + "\n"
+
+
+# Runs planned jobs as one Slurm job array (array : N).
+# Writes <workdir>/packs/array_NNN/job.sh: the jobs' own job.sh (array_key, the same for all of
+# them), with --array=0-<n-1>, the longest of their walltimes and a job name for the group; in
+# place of the line that runs CASTEP, lines that read the task's directory and seed from tasks.txt
+# beside it (line SLURM_ARRAY_TASK_ID + 1: directory, a tab, seed), go there and run CASTEP on that
+# seed, with its output in slurm-<array job id>_<task>.out there. A relaxation's run_time is set
+# for the array's walltime. The array is submitted from its directory (send_job), and each job is
+# recorded (record_job) with its task's job id, <array job id>_<task> as squeue and sacct give it,
+# so waiting, timings and restarts work as for a job of its own (a restart runs on its own).
+#   Called by: run_batch()
+#   Calls:     add_sbatch_option(), array_castep_line(), array_key(), job_size(), new_pack_dir(),
+#              record_job(), run_time_for(), send_job(), set_param(), slurm_seconds(), slurm_time()
+def submit_array(group, ctx, args, workdir):
+    infos = [c.info() for c in group]
+    walls = [slurm_seconds(i["walltime"]) for i in infos if i.get("walltime")]
+    wall = slurm_time(max(walls)) if walls else None
+    adir = new_pack_dir(workdir, "array")
+    tasks = adir / ARRAY_TASKS
+    tasks.write_text("".join(f"{c.dir.resolve()}\t{c.seed}\n" for c in group))
+    text = array_key(group[0])
+    run = array_castep_line(text)
+    m = CASTEP_RUN.search(run)
+    cmd = (run[:m.start()] + m.group(1) + '"$SEED"' + run[m.end():]).rstrip()
+    pick = ("awk -F '\\t' -v n=\"$SLURM_ARRAY_TASK_ID\" 'NR == n + 1 {print $%d}' "
+            + shlex.quote(str(tasks.resolve())))
+    lines = []
+    for line in text.splitlines():
+        if line != run:
+            lines.append(line)
+            continue
+        lines += ["TASK_DIR=$(" + pick % 1 + ")", "SEED=$(" + pick % 2 + ")",
+                  'cd "$TASK_DIR" || exit 1',
+                  cmd + ' > "slurm-${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}.out" 2>&1']
+    name = f"{group[0].name}+{len(group) - 1}"
+    script = "\n".join(lines).replace("{SEED}", "$SEED").replace("{JOBNAME}", name) + "\n"
+    script = add_sbatch_option(script, f"--job-name={name}")
+    if wall:
+        script = add_sbatch_option(script, f"--time={wall}")
+    script = add_sbatch_option(script, f"--array=0-{len(group) - 1}")
+    (adir / JOBSCRIPT).write_text(script)
+    (adir / JOBSCRIPT).chmod(0o755)
+    for c, i in zip(group, infos):              # each relaxation stops cleanly before the end
+        c.save(dict(c.info(), walltime=wall))
+        if c.kind == "geom" and wall and not (args.max_restarts == 0
+                                              and getattr(args, "tolerate_failures", False)):
+            set_param(c, run_time=run_time_for(slurm_seconds(wall), i.get("scf_seconds")))
+    starts = [c.castep.stat().st_size if c.castep.exists() else 0 for c in group]
+    jobid = send_job(adir, JOBSCRIPT, args)
+    rel = str(adir.relative_to(workdir))
+    for k, (c, start) in enumerate(zip(group, starts)):
+        record_job(c, f"{jobid}_{k}", start, wall, pack=rel)
+    log(f"submitted {rel}: job array {jobid} of {len(group)} jobs ({group[0].name} ... "
+        f"{group[-1].name}), each on {job_size(infos[0])}" + (f", walltime {wall}" if wall else ""))
+
+
 # Runs several dry runs side by side, as one job (dryrun_pack : N).
 # Writes <workdir>/packs/dryrun_NNN/job.sh from the dry-run template (dryrun_template_text), filled
 # in for one core per dry run (on one node), with dryrun_partition, dryrun_time and dryrun_options
@@ -2494,6 +2616,23 @@ def job_active(jobid, args):
         return True                          # scheduler slow: assume still there
     out = res.stdout
     return res.returncode == 0 and jobid in out and not any(s in out for s in END_STATES)
+
+
+# The queue's state of all the user's jobs, from one squeue call with one line per array task
+# (-r), for array : N, where a step may have hundreds of jobs and array tasks queued: {job id:
+# state}, an array task's job id being <array job id>_<task>. None if squeue failed or didn't
+# answer within 2 minutes, so that every job counts as still there.
+#   Called by: wait_for()
+def queue_states():
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    try:
+        res = subprocess.run(["squeue", "-h", "-r", "-o", "%i %T"] + (["-u", user] if user else []),
+                             capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    return {f[0]: f[1] for f in (line.split() for line in res.stdout.splitlines()) if len(f) > 1}
 
 
 # A size in bytes as 'x.y GB' or 'n MB', for log messages.
@@ -2823,16 +2962,17 @@ def handle_failure(calc, args, resubmitted, key="jobid"):
 # reports what is still queued and returns False instead of waiting. Batch mode: with any_done it
 # returns as soon as one of the jobs has finished (so run_batch can submit the next), and with
 # tolerate_failures a job handle_failure would stop the script for is marked failed instead
-# (mark_failed) and counts as finished.
+# (mark_failed) and counts as finished. With array : N the queue is read once a poll for all the
+# jobs (queue_states) instead of a squeue call for each.
 #   Called by: main(), prepare_all(), run_batch()
 #   Calls:     Calc.done(), Calc.err_files(), dryrun_output(), handle_failure(), job_active(),
-#              mark_failed(), remove_check()
+#              mark_failed(), queue_states(), remove_check()
 def wait_for(calcs, args, key="jobid", any_done=False):
     """Poll until every calc's job (key='jobid') or dry run (key='dryrun_jobid') is done
     (with any_done, until at least one is). Returns False if --no-wait and some are still
     queued or running."""
     if key == "jobid":          # (a job marked failed, with tolerate_failures, has finished)
-        is_done, what = (lambda c: c.done() or bool(c.info().get("failed"))), ""
+        is_done, what = (lambda c: c.done() or bool(c.peek().get("failed"))), ""
     else:
         is_done, what = (lambda c: dryrun_output(c) is not None), " dry run"
     gone, resubmitted, announced = {c.name: 0 for c in calcs}, set(), False
@@ -2844,13 +2984,21 @@ def wait_for(calcs, args, key="jobid", any_done=False):
                 "same command to carry on.")
             sys.exit(0)
         waiting = []
+        polled = getattr(args, "array", 1) > 1
+        states = queue_states() if polled else None
         for c in calcs:
             if is_done(c):
                 if key == "jobid":
                     remove_check(c, args)      # delete_check : true
                 continue
             waiting.append(c)
-            if c.err_files() or not job_active(c.info()[key], args):
+            jobid = str(c.peek()[key])
+            if polled:                         # (squeue didn't answer: still there)
+                there = states is None or (jobid in states and
+                                           not any(s in states[jobid] for s in END_STATES))
+            else:
+                there = job_active(jobid, args)
+            if c.err_files() or not there:
                 gone[c.name] += 1          # job left the queue: confirm over a few polls
                 if c.err_files() or gone[c.name] >= 3:
                     try:
@@ -3130,7 +3278,12 @@ def job_spec(job, base):
 # a share of a node go N at a time (or fewer, as evenly as the jobs left allow, each then getting
 # more of the node) in one job (submit_pack); one left on its own is planned again for whole nodes.
 # With charging : core, up to N jobs on part of a node go in one job, the first in the queue and
-# those after it on the same partition, as long as one node holds their cores. With
+# those after it on the same partition, as long as one node holds their cores. With array : N, the
+# jobs waiting go as Slurm job arrays of up to N tasks (submit_array), those planned alike
+# (array_key) in one array; max_jobs still counts each task as a job, and the queue is topped up
+# once array_min places are free (default: a quarter of array, or of max_jobs if that is smaller;
+# at most that array or max_jobs, so a step whose own runner block lowers max_jobs still tops up),
+# or all the jobs left fit. With
 # tolerate_failures, a job that fails is marked failed (mark_failed) and the others carry on;
 # --resubmit-failed starts failed jobs again from the beginning. A job whose inputs changed since it
 # was set up (job_spec) is set up again if it never ran; one that has run stops the script, unless
@@ -3139,9 +3292,10 @@ def job_spec(job, base):
 # <workdir>/batch_results.json; 'complete' is False after --prepare-only, or with --no-wait while
 # jobs are still queued.
 #   Called by: batch_main(), dwf.py
-#   Calls:     Calc(), Calc.done(), Calc.err_files(), calibrate(), check_templates(), finalize(),
-#              job_result(), job_spec(), measure_times(), pack_castep_line(), parse_castep_input(),
-#              prepare_all(), remove_check(), submit(), submit_pack(), wait_for()
+#   Calls:     Calc(), Calc.done(), Calc.err_files(), array_castep_line(), array_key(), calibrate(),
+#              check_templates(), finalize(), job_result(), job_spec(), measure_times(),
+#              pack_castep_line(), parse_castep_input(), prepare_all(), remove_check(), submit(),
+#              submit_array(), submit_pack(), wait_for()
 def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, spacing=None,
               energy="auto", share_dryruns=True, stop_file=None):
     workdir = Path(workdir)
@@ -3166,6 +3320,8 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
            "calcs": [], "share_dryruns": share_dryruns, "batch": True}
     if args.pack > 1:
         pack_castep_line(job_template)
+    if getattr(args, "array", 1) > 1:
+        array_castep_line(job_template)
     base = "\n".join([cell_text, param_text, geom_param_text or "", repr(spacing)])
     calcs, keys = {}, []
     for i, job in enumerate(jobs):
@@ -3220,7 +3376,7 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
 
     # Finished, or marked failed (tolerate_failures).
     def finished(c):
-        return c.done() or bool(c.info().get("failed"))
+        return c.done() or bool(c.peek().get("failed"))
 
     if args.resubmit_failed:                       # start failed jobs again from the beginning
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -3258,10 +3414,30 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
     while True:
         calibrate(calcs, keys, args)
         measure_times(calcs, keys)
-        active = [c for c in todo if c.info().get("jobid") and not finished(c)]
-        queue = [c for c in todo if not c.info().get("jobid") and not finished(c)]
-        running = {c.info()["jobid"] for c in active}          # jobs, not calculations
-        while queue and (not args.max_jobs or len(running) < args.max_jobs):
+        active = [c for c in todo if c.peek().get("jobid") and not finished(c)]
+        queue = [c for c in todo if not c.peek().get("jobid") and not finished(c)]
+        running = {c.peek()["jobid"] for c in active}          # jobs, not calculations
+        if getattr(args, "array", 1) > 1:          # array : N - the queue as job arrays
+            free = (args.max_jobs - len(running)) if args.max_jobs else len(queue)
+            top = min(args.array, args.max_jobs or args.array)
+            least = min(getattr(args, "array_min", None) or max(1, top // 4), top)
+            while queue and free > 0 and (not active or free >= min(len(queue), least)):
+                take = queue[:min(free, args.array)]
+                del queue[:len(take)]
+                groups = {}
+                for c in take:                     # planned now, with what is known so far
+                    plan(c)
+                    groups.setdefault(array_key(c), []).append(c)
+                for group in groups.values():
+                    if len(group) > 1:
+                        submit_array(group, ctx, args, workdir)
+                    else:
+                        submit(group[0], args)
+                    running.update(c.info()["jobid"] for c in group)
+                active += take
+                free -= len(take)
+        while queue and getattr(args, "array", 1) == 1 and (not args.max_jobs
+                                                           or len(running) < args.max_jobs):
             c = queue.pop(0)
             group = [c]
             if plan(c) and args.charging == "core":    # pack : N - others beside it, in its
@@ -3778,6 +3954,7 @@ KEYWORDS = {
     "poll": (_num("s", cast=int), 120),
     "max_jobs": (_num(cast=int), None), "tolerate_failures": (_bool, False),    # batch mode
     "pack": (_num(cast=int), 1), "dryrun_pack": (_num(cast=int), 1),           # batch mode
+    "array": (_num(cast=int), 1), "array_min": (_num(cast=int), None),          # batch mode
     "prepare_only": (_bool, False), "no_wait": (_bool, False),
     "resubmit_failed": (_bool, False), "force": (_bool, False),
     "partitions": (None, None),                               # %block only
@@ -3871,13 +4048,13 @@ def convert_settings(items, name):
 # (not max_cores, unless charging : core) and a cores value that splits evenly over the nodes;
 # charging : core with cores_per_node, the memory per core, a dryrun_pack whose dry runs fit on a
 # node, and max_nodes (by default the nodes max_cores or cores need) that holds the job; %block
-# partitions without mem_per_core, and with a partition that can take cores. Starts
-# mem_replicated : auto at R_START.
+# partitions without mem_per_core, and with a partition that can take cores; array (Slurm job
+# arrays) with sbatch and without pack. Starts mem_replicated : auto at R_START.
 #   Called by: batch_args(), read_input()
 def check_runner(args, raw_vals, name):
     for key in ("max_cores", "cores", "dryrun_cores", "poll", "dryrun_timeout",
                 "cores_per_node", "max_nodes", "prerelax_steps", "prerelax_threads", "max_jobs",
-                "pack", "dryrun_pack"):
+                "pack", "dryrun_pack", "array", "array_min"):
         if getattr(args, key) is not None and getattr(args, key) < 1:
             die(f"{name}: {key} must be at least 1")
     if args.charging == "core":              # nodes shared out, charged by the core
@@ -3909,6 +4086,12 @@ def check_runner(args, raw_vals, name):
                 and args.cores > args.cores_per_node // args.pack):
             die(f"{name}: with pack : {args.pack} each job has {args.cores_per_node // args.pack} "
                 f"cores, so cores : {args.cores} is too many")
+    if args.array > 1:                       # jobs planned alike go as one Slurm job array
+        if args.pack > 1:
+            die(f"{name}: array and pack both put several jobs in one - use one of them")
+        if "sbatch" not in args.submit_cmd:
+            die(f"{name}: array : {args.array} runs jobs as Slurm job arrays (sbatch --array), "
+                f"but submit_cmd is '{args.submit_cmd}'")
     if args.cores_per_node and args.dryrun_pack > args.cores_per_node:
         die(f"{name}: dryrun_pack : {args.dryrun_pack} is more dry runs than a node has cores "
             f"({args.cores_per_node})")
@@ -4285,10 +4468,11 @@ def main():
     print(f"\nSettings from {args.input_path} (everything else at its default):")
     for key, raw in args.raw.items():
         print(f"  {key:<17}: {raw}")
-    for key in ("max_jobs", "tolerate_failures", "pack", "dryrun_pack"):
+    for key in ("max_jobs", "tolerate_failures", "pack", "dryrun_pack", "array", "array_min"):
         if key in args.raw:
             log(f"note: {key} is for batch mode only, so it is ignored here")
     args.max_jobs, args.tolerate_failures, args.pack, args.dryrun_pack = None, False, 1, 1
+    args.array, args.array_min = 1, None
     cell_text, param_text = args.cell.read_text(), args.param.read_text()
     geom_param_text = args.geom_param.read_text() if args.geom_param else param_text
     job_template, dryrun_template = check_templates(args)

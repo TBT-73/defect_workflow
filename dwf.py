@@ -244,6 +244,19 @@ def _spin_or_any(v):
     return x
 
 
+# The dopant_pairs keyword: true (pairs of any two dopant defects, of the same element or not),
+# false (none) or 'same' (only pairs of two defects of the same dopant, e.g. Sb_Ca + Sb_O: each
+# dopant on its own with the host). true and false stay booleans, so a project file that gave
+# them before keeps its B1.
+def _dopant_pairs(v):
+    if v.strip().lower() == "same":
+        return "same"
+    try:
+        return sc._bool(v)
+    except ValueError:
+        raise ValueError("expected true, false or same") from None
+
+
 _t, _b, _w = sc._text, sc._bool, sc._words
 # keyword: (converter, default). Blocks of whole lines ('lines') keep their rows; 'kv' blocks
 # hold "keyword : value" lines (.param keywords to set); a 'template' is a file name or a block
@@ -275,7 +288,7 @@ PROJECT_KEYWORDS = {
     "antisites": (_b, False),
     "interstitials": (sc._choice("none", "dopants", "all"), "none"),
     "pairs": (_b, True), "pair_max_distance": (sc._num("ang", "A"), 5.0),
-    "native_pairs": (_b, False), "dopant_pairs": (_b, False),
+    "native_pairs": (_b, False), "dopant_pairs": (_dopant_pairs, False),
     "scan": (_b, True), "scan_lengths": (_floats(), [8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0]),
     "scan_tol": (sc._num("eV"), 0.02), "scan_edge_tol": (sc._num("ang", "A"), 0.05),
     "scan_test": (sc._choice("line", "flat"), "line"),
@@ -351,7 +364,8 @@ RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "core
                "sp_walltime", "max_walltime", "max_restarts", "delete_check", "dryrun_on",
                "dryrun_partition", "dryrun_time", "dryrun_cores", "dryrun_mem_gb",
                "dryrun_options", "dryrun_cmd", "dryrun_timeout", "submit_cmd", "status_cmd",
-               "poll", "max_jobs", "tolerate_failures", "pack", "dryrun_pack"}
+               "poll", "max_jobs", "tolerate_failures", "pack", "dryrun_pack", "array",
+               "array_min"}
 # The steps that run CASTEP jobs, and the group of steps each belongs to. The runner settings of a
 # step: the project's, changed by its group's defaults (GROUP_DEFAULTS), then by %block
 # runner_<group>, then by %block runner_<step> (Project.runner_items). screen is both a step and
@@ -3194,7 +3208,8 @@ def candidate(prim, comps, sep, mult):
 
 # The generated candidates (B1 'no'): the single defects (single_defects), then the pairs
 # (pairs : true) of a dopant defect with a native one, and with native_pairs / dopant_pairs also
-# native + native and dopant + dopant pairs; never two interstitials. Each pair type gives its
+# native + native and dopant + dopant pairs (dopant_pairs : same: only two of the same dopant,
+# so each dopant meets the host on its own); never two interstitials. Each pair type gives its
 # symmetry-distinct arrangements up to pair_max_distance (pair_arrangements).
 #   Called by: step_generate()
 #   Calls:     candidate(), pair_arrangements(), single_defects()
@@ -3214,9 +3229,11 @@ def generate(p, prim):
             if j < i or (a["host"] is None and b["host"] is None):
                 continue
             kinds = (is_dopant(a), is_dopant(b))
+            both = p.s.dopant_pairs is True or (p.s.dopant_pairs == "same" and
+                                                a["new"] == b["new"])
             ok = ((kinds in ((True, False), (False, True))) or
                   (kinds == (False, False) and p.s.native_pairs) or
-                  (kinds == (True, True) and p.s.dopant_pairs))
+                  (kinds == (True, True) and both))
             if not ok:
                 continue
             first, second = (b, a) if (not kinds[0] and kinds[1]) else (a, b)
@@ -8057,6 +8074,8 @@ highmem    5.33                #   cores per process where that takes the fewest
 dryrun_time : 0:20:00          # dry runs: small jobs (one process, cores for 4 GB)
 !dryrun_on  : login            # ... or run them where dwf.py runs (dryrun_cmd)
 max_jobs  : 16                 # most jobs of one step queued at once
+!array    : 500                # jobs planned alike as Slurm job arrays of up to this many
+                               #   tasks (each still counts in max_jobs; not with pack)
 max_restarts : 20              # a relaxation that runs out of time carries on this many times
 poll      : 300
 delete_check : true            # delete each .check once its calculation has finished
@@ -8147,7 +8166,7 @@ interstitials : none           # none | dopants | all (Voronoi sites, needs pyma
 pairs         : true           # dopant + native pairs ...
 pair_max_distance : 5.0 ang    # ... up to this far apart
 native_pairs  : false
-dopant_pairs  : false
+dopant_pairs  : false          # true: any two dopant defects | same: two of the same dopant
 # B2: the supercell sizes, as lengths (the shortest distance between periodic images), and
 # the MACE scan of every candidate in each. A candidate is converged at the smallest size from
 # which its MACE relaxation energy R lies on a line R_inf - c/N (N: the cell's atoms): that size

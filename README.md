@@ -559,8 +559,10 @@ defects (`Sb_Ca + Vac_O  all  q=-1`, `Vac_O  q=+2,+1`): those are screened inste
 `screen_charges`. Without the block, on each symmetry-inequivalent site
 of the primitive cell: a vacancy (`vacancies`), a substitution by each dopant, antisites
 (`antisites`), Voronoi interstitials (`interstitials`), and pairs: dopant + native (`pairs`),
-native + native (`native_pairs`), dopant + dopant (`dopant_pairs`), never two interstitials. Each
-pair type gives every symmetry-distinct arrangement up to `pair_max_distance` apart. Candidates
+native + native (`native_pairs`), dopant + dopant (`dopant_pairs`: any two, or with `same` only
+two of one dopant, such as Sb_Ca + Sb_O, so that each dopant meets the host on its own), never two
+interstitials. Each pair type gives every symmetry-distinct arrangement up to `pair_max_distance`
+apart. Candidates
 get ids `d001`, `d002`, ... and a composition group, e.g. `+Sb-Ca-O` for Sb_Ca + Vac_O: those with
 the same group (Sb_Ca + Vac_O and Sb_O + Vac_Ca) are compared directly in C3. The number of
 candidates grows quickly with each option and with `pair_max_distance`: check the list
@@ -1279,7 +1281,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 
 **Alphabetical index** (the group in brackets):
 
-- **A**: [`antisites`](#b-candidates-the-screening-and-electronic-cells) (B)
+- **A**: [`antisites`](#b-candidates-the-screening-and-electronic-cells) (B) · [`array`](#runner-settings) (runner) · [`array_min`](#runner-settings) (runner)
 - **B**: [`band_spread_tol`](#e-production) (E) · [`bands_kspacing`](#a-host) (A) · [`baseline_mb`](#runner-settings) (runner)
 - **C**: [`carrier_fraction`](#c-screening) (C) · [`carrier_reach`](#c-screening) (C) · [`ccd_points`](#g-lineshapes) (G) · [`charge_correction`](#f-thermodynamics) (F) · [`charge_margin`](#c-screening) (C) · [`charging`](#runner-settings) (runner) · [`%block chemical_potentials`](#a-host) (A) · [`configuration_margin`](#c-screening) (C) · [`converge`](#a-host) (A) · [`converge_cutoffs`](#a-host) (A) · [`converge_kcutoff`](#a-host) (A) · [`converge_kgrid_max`](#a-host) (A) · [`converge_kgrid_min`](#a-host) (A) · [`converge_kgrid_step`](#a-host) (A) · [`converge_tol`](#a-host) (A) · [`cores`](#runner-settings) (runner) · [`cores_per_node`](#runner-settings) (runner)
 - **D**: [`decay_length_multiple`](#b-candidates-the-screening-and-electronic-cells) (B) · [`deep_level_margin`](#f-thermodynamics) (F) · [`%block defects`](#b-candidates-the-screening-and-electronic-cells) (B) · [`delete_check`](#runner-settings) (runner) · [`dielectric`](#a-host) (A) · [`dielectric_cell`](#a-host) (A) · [`dielectric_inf`](#a-host) (A) · [`dielectric_param`](#a-host) (A) · [`dielectric_task`](#a-host) (A) · [`distort_around`](#c-screening) (C) · [`distort_cell`](#c-screening) (C) · [`distort_charges`](#c-screening) (C) · [`distortion_min_gain`](#d-ground-and-excited-states) (D) · [`distortions`](#c-screening) (C) · [`dopant_pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`dopants`](#b-candidates-the-screening-and-electronic-cells) (B) · [`dryrun_cmd`](#runner-settings) (runner) · [`dryrun_cores`](#runner-settings) (runner) · [`dryrun_jobscript`](#runner-settings) (runner) · [`dryrun_mem_gb`](#runner-settings) (runner) · [`dryrun_on`](#runner-settings) (runner) · [`dryrun_options`](#runner-settings) (runner) · [`dryrun_pack`](#runner-settings) (runner) · [`dryrun_partition`](#runner-settings) (runner) · [`dryrun_time`](#runner-settings) (runner) · [`dryrun_timeout`](#runner-settings) (runner)
@@ -1376,7 +1378,7 @@ Details: [Phase B](#phase-b-candidate-defects-the-screening-and-electronic-cells
 | `interstitials` | `none` | B1 | `dopants`: the dopants on each Voronoi interstitial site (pymatgen-analysis-defects); `all`: every element there. |
 | `pairs` | `true` | B1 | Pairs of a dopant defect with a native one, in every symmetry-distinct arrangement up to `pair_max_distance` apart. Never two interstitials. |
 | `native_pairs` | `false` | B1 | Also pairs of two native defects. |
-| `dopant_pairs` | `false` | B1 | Also pairs of two dopant defects. |
+| `dopant_pairs` | `false` | B1 | Also pairs of two dopant defects: `true` any two (Sb_Ca + N_O as well as Sb_Ca + Sb_O), `same` only two of the same dopant, so that each dopant meets the host on its own. |
 | `pair_max_distance` | `5.0 ang` | B1 | The largest separation of the pair arrangements, generated or from `all`. A pair farther apart than half a cell's shortest image distance isn't built in it: B2 skips that size, and C1 leaves the pair out if it is the screening cell. |
 | `scan` | `true` | B2 | Scan every candidate with MACE in every size (also needs `mace : true`). With `false`, B2 makes only the size ladder. |
 | `scan_lengths` | `8 10 12 14 16 18 20 ang` (*list*) | B2, B3, B4, D8 | The sizes, as lengths: for each, the most compact supercell whose periodic images are all at least that far apart (doped; n × `transform` with a transform). B2 scans them, B3 and B4 pick their cells from them (B4 goes beyond the largest if it must), and D8's sizes are the next ones above the screening cell. |
@@ -1551,9 +1553,11 @@ here, and `cores_per_node` for the default `mace_pack` ([MACE](#mace) has their 
 | `submit_cmd` | `sbatch` | The command that submits a job. |
 | `status_cmd` | `squeue` or `qstat` | The command that lists queued and running jobs. |
 | `poll` | `120 s` | Seconds between checks of the queue. |
-| `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once. |
+| `max_jobs` | no limit | The most jobs, and dry runs, of one step in the queue at once (with `array`, each task of an array counts). |
 | `tolerate_failures` | `false` (`true` for C2, C3, C5, D1, D2, D4, D6, D7, D8, E1, E2, G1 and G2) | A job that fails is marked as failed and the others carry on, instead of the run stopping. `--resubmit-failed` starts failed jobs again. |
 | `pack` | `1` | Run up to N of a step's jobs side by side on one node, in one job: with `charging : node`, each on `cores_per_node`/N cores and its share of the node's memory; with `charging : core`, each with its own cores, the pack asking for them all, as many as one node holds ([How a run works](#how-a-run-works)). Needs `cores_per_node` and a jobscript whose CASTEP line uses `srun`. |
+| `array` | `1` | With Slurm: send a step's jobs as job arrays of up to N tasks instead of one `sbatch` each, the jobs planned alike in one array (others in arrays of their own). `max_jobs` still counts every task, and the queue is topped up with a new array once `array_min` places are free; the queue is read with one `squeue -r` a poll. For steps of thousands of jobs, such as C2 of a big screen; keep N within the site's array limit. Not with `pack`. |
+| `array_min` | a quarter of `array` (or of `max_jobs`, if smaller) | With `array`: how many places in the queue (of `max_jobs`) must be free before another array goes, so the fewest tasks such an array has (unless fewer jobs are left). Bigger: fewer, bigger arrays, but the queue runs lower meanwhile. Capped at `array` and `max_jobs` (so a step whose own block lowers `max_jobs` still tops up); ignored without `array`. |
 
 `--prepare-only`, `--no-wait`, `--resubmit-failed` and `--force` are command-line switches
 ([Command line](#command-line)), not project-file keywords.
@@ -2074,13 +2078,32 @@ point; a candidate with no bound state is kept by a band state that passes, and 
 With `require_spin : 2`, a candidate whose −1 passes is kept, pending, and one whose −1 is spread
 out is dropped. `stable` and `screened` make no single points and carry on what they did before.
 
+Then `dopant_pairs : same`. Tested on CaO with Sb and N, vacancies, antisites, interstitials on the
+Voronoi vertices and pairs up to 8.5 Å: `false` gives 336 candidates and no pair of two dopant
+defects, `same` 400 (the 32 pairs of each dopant with itself, such as Sb_Ca + Sb_O, and no Sb +
+N), `true` 452 (the 52 Sb + N pairs as well); never two interstitials; `true` and `false` still
+read as before, so a project that gave them keeps its B1. On ADAQ's CaO set (33 dopants, the rest
+as above), B1 makes 4,709 candidates in 511 composition groups in under a minute.
+
+Then job arrays (`array`), for steps of thousands of jobs. Tested on a mock Slurm whose `sbatch`
+runs an array's tasks one after another: seven single points planned alike with `array : 3` and
+`max_jobs : 5` went as arrays of 3, 2 and 2 (`max_jobs` counting each task), each task running in
+its own job's directory with its output there and its job id `<array job id>_<task>`; a group of one
+went as a plain job; 8- and 64-atom jobs, planned on different numbers of processes, went in arrays
+of their own; two relaxations of one array that stopped at `run_time` each carried on from its
+`.check` in a job of its own; `array` with `pack`, without `sbatch` or at 0 is refused; `squeue -r`
+is read once a poll; with `array_min : 3` the top-up of 2 waits, giving arrays of 3 and 3 and the
+last job on its own. With `array : 1` nothing changes. The runner now keeps each job's
+`job_info.json` in memory and doesn't read a finished job's output again: 1,000 mock jobs took about
+110 s of the runner's own work before and 9 s after, and 10,000 about a minute.
+
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), real `mace_run_train` trainings with two heads and the charge embedding (D3, D4, G2: the
 command was checked, not run), real hybrid single points (D2, D4; they need CASTEP to print the
 forces of a single point), real CASTEP ΔSCF (D7, E2, G1) and `.pdos_weights` files (C3, D7; their
 layout is taken from CASTEP's source), real CASTEP stress tensors (D8), real Slurm for the MACE and
-model jobs, a phonon job on a real GPU, and real CASTEP output for the DFPT permittivity and the
-`.bands` of spin-polarised runs.
+model jobs and for job arrays (`array`), a phonon job on a real GPU, and real CASTEP output for the
+DFPT permittivity and the `.bands` of spin-polarised runs.
 
 On the first real runs, check:
 
@@ -2176,3 +2199,9 @@ On the first real runs, check:
    `<excitation>_ccd.dat`, and check in the ΔSCF runs at the ends of the path that the same bands
    were constrained). For G2, try a smaller `lineshape_length` first to time the phonon job, and
    check the model's test error and the imaginary modes in G2's table.
+15. **Job arrays** (`array`): on the first array, look at `packs/array_NNN/job.sh` and
+   `tasks.txt` in the step's jobs folder, and check with `squeue -r -u $USER` that its tasks are
+   queued as `<array job id>_<task>`, and afterwards that each task's
+   `slurm-<array job id>_<task>.out` and `.castep` are in its own job's folder. If `sbatch` refuses
+   the array (a limit on the jobs you may queue, or an array bigger than the site allows), lower
+   `array` and `max_jobs`.
