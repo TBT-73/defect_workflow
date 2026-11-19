@@ -3158,39 +3158,81 @@ def phase_list(p):
 
 # Competing phases from doped's CompetingPhases (Materials Project entries within
 # phases_e_above_hull of the hull, elemental references and diatomic molecules in a box). Needs
-# doped and an MP API key (mp_api_key, or doped's own configuration).
+# doped and an MP API key (mp_api_key, or doped's own configuration). Works with doped 3.1 and
+# later (CompetingPhases(energy_above_hull=..., extrinsic=...)) and with doped 2.x and 3.0
+# (CompetingPhases(e_above_hull=...), or ExtrinsicCompetingPhases with dopants, whose
+# intrinsic_entries are the host's phases): the keywords doped's CompetingPhases takes tell them
+# apart. Each keeps an entry's band gap in its own place, so the phases are grouped here as
+# doped 3 groups them: molecules, metals (band gap 0 on the Materials Project), then the rest;
+# and named as doped 3 names them (formula_spacegroup_EaH_e), each name once.
 #   Called by: phase_list()
 #   Calls:     Project.host()
 def doped_phases(p):
+    import inspect
     import warnings
-    warnings.filterwarnings("ignore")
-    try:
-        from doped.chemical_potentials import CompetingPhases
-        from pymatgen.io.ase import AseAtomsAdaptor
-    except ImportError as err:
-        die(f"phases_from : doped needs doped (pip install doped): {err}")
-    host = p.host()
-    formula = host.get_chemical_formula(empirical=True)
-    try:
-        cp = CompetingPhases(formula, energy_above_hull=p.s.phases_e_above_hull,
-                             extrinsic=p.s.dopants or None, api_key=p.s.mp_api_key)
-    except Exception as err:                       # network, API key, ...
-        die(f"doped could not get the competing phases from the Materials Project: {err}")
-    out = []
-    for kind, entries in (("molecule", cp.molecular_entries), ("metal", cp.metallic_entries),
-                          ("insulator", cp.nonmetallic_entries)):
+    from importlib import metadata
+    formula = p.host().get_chemical_formula(empirical=True)
+    dopants, eah, key = list(p.s.dopants), p.s.phases_e_above_hull, p.s.mp_api_key
+    with warnings.catch_warnings(record=True) as said:     # doped and pymatgen say a lot
+        warnings.simplefilter("always")
+        try:
+            from doped import chemical_potentials as dcp
+            from pymatgen.io.ase import AseAtomsAdaptor
+        except ImportError as err:
+            die(f"phases_from : doped needs doped (pip install doped): {err}")
+        try:
+            have = metadata.version("doped")
+        except metadata.PackageNotFoundError:            # doped from a source folder
+            have = "?"
+        try:
+            if "energy_above_hull" in inspect.signature(dcp.CompetingPhases).parameters:
+                entries = dcp.CompetingPhases(formula, energy_above_hull=eah,       # 3.1 on
+                                              extrinsic=dopants or None, api_key=key).entries
+            elif dopants:                                # doped 2.x and 3.0
+                cp = dcp.ExtrinsicCompetingPhases(formula, extrinsic_species=dopants,
+                                                  e_above_hull=eah, api_key=key)
+                entries = cp.intrinsic_entries + cp.entries
+            else:
+                entries = dcp.CompetingPhases(formula, e_above_hull=eah, api_key=key).entries
+        except Exception as err:                         # network, API key, ...
+            tips = dict.fromkeys(str(w.message) for w in said if "install" in str(w.message))
+            die(f"doped {have} could not get the competing phases from the Materials Project: "
+                f"{err}" + "".join(f"\n  doped warned: {t}" for t in tips)
+                + ("\n  doped 2.x takes only a legacy Materials Project API key; doped 3 (pip "
+                   "install -U doped, on Python 3.10 or later) takes the current ones"
+                   if have.startswith("2.") else ""))
+        kinds = {"molecule": [], "metal": [], "insulator": []}
         for e in entries:
-            name = e.data.get("doped_name") or e.name
-            atoms = AseAtomsAdaptor.get_atoms(e.structure)
-            opts = {"overrides": {}}
-            if kind == "molecule":
-                opts["molecule"] = True
-                if e.composition.reduced_formula == "O2":
-                    opts["overrides"].update(spin="2", spin_polarized="true")
-            if kind == "metal":
-                opts["metal"] = True
-                opts["overrides"].update(fix_occupancy="false")
-            out.append((sc.re.sub(r"[^\w.\-]", "_", name), atoms, opts))
+            gap = e.data.get("band_gap")                 # doped 2.x and 3.0 keep it here,
+            if gap is None:                              # 3.1 on in the summary
+                gap = (e.data.get("summary") or {}).get("band_gap")
+            kinds["molecule" if e.data.get("molecule") else "metal" if gap == 0
+                  else "insulator"].append(e)
+        out, used = [], set()
+        for kind, group in kinds.items():
+            for e in group:
+                name = e.data.get("doped_name")          # doped 3 names its entries
+                if not name:                             # doped 2.x doesn't: name it as 3 would
+                    above = next((e.data[k] for k in ("e_above_hull", "energy_above_hull")
+                                  if e.data.get(k) is not None), 0)
+                    sg = "mmm" if kind == "molecule" else e.structure.get_space_group_info()[0]
+                    name = f"{e.name}_{sg}_EaH_{round(above, 3) or 0}"
+                name = base = sc.re.sub(r"[^\w.\-]", "_", name)
+                n = 1
+                while name in used:                      # two polymorphs named alike
+                    n += 1
+                    name = f"{base}_{n}"
+                used.add(name)
+                atoms = AseAtomsAdaptor.get_atoms(e.structure)
+                opts = {"overrides": {}}
+                if kind == "molecule":
+                    opts["molecule"] = True
+                    if e.composition.reduced_formula == "O2":
+                        opts["overrides"].update(spin="2", spin_polarized="true")
+                if kind == "metal":
+                    opts["metal"] = True
+                    opts["overrides"].update(fix_occupancy="false")
+                out.append((name, atoms, opts))
     if not out:
         die("doped found no competing phases")
     return out
