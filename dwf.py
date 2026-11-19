@@ -52,7 +52,8 @@ were production, thermodynamics and lineshapes) is brought up to date, its resul
 --migrate.
 
 All CASTEP jobs go through supercell_convergence.py's batch mode (it must be in the same
-directory), which runs the structures this script builds. Its runner settings (jobscript,
+directory, and the one that came with this script: it checks), which runs the structures this
+script builds. Its runner settings (jobscript,
 partitions, cores_per_node, charging, max_cores or max_nodes, max_walltime, ...) go in NAME.run,
 for every step; %block runner_host, runner_screen and runner_production change them for the
 steps at the host, screening or production settings, and %block runner_<step> for one step
@@ -91,6 +92,9 @@ sys.path.insert(0, str(HERE))
 import supercell_convergence as sc            # noqa: E402  (the job runner)
 
 log, die = sc.log, sc.die
+# The oldest supercell_convergence.py (its VERSION) this dwf.py works with: the two come together,
+# and an older runner plans and checks the jobs by its own, older rules.
+SC_VERSION = "2026-11-19"
 
 # ==========================================================================================
 # HOW THE FUNCTIONS FIT TOGETHER
@@ -796,8 +800,8 @@ class Project:
         items = self.runner_items(step)
         sig = json.dumps([[item_key(x), x.get("value"), x.get("body")] for x in items])
         if sig not in self._runners:
-            args = sc.batch_args(items, self.base, f"{self.path.name} (runner settings of step "
-                                                    f"{STEP_INDEX[step].label} {step})")
+            args = sc.batch_args(items, self.base, f"{self.run_path.name} (runner settings of "
+                                                    f"step {STEP_INDEX[step].label} {step})")
             for flag in ("no_wait", "prepare_only", "force", "resubmit_failed"):
                 if getattr(self.cl, flag, False):
                     setattr(args, flag, True)
@@ -1549,6 +1553,7 @@ def project_path(word):
 # --split OLD.dwf makes the two files from an older dwf.py's one (split_project); --migrate
 # updates a work directory made by an older dwf.py (migrate_workdir); --mace-worker and
 # --phonon-worker are what a MACE or F2 phonon job runs (mace_worker, phonon_worker), not a project.
+# Stops first if supercell_convergence.py is older than this dwf.py needs (SC_VERSION).
 #   Called by: the main block
 #   Calls:     Project.__init__(), Project.finished(), Project.results(), Project.save_results(),
 #              Project.save_state(), inputs_hash(), mace_worker(), migrate_workdir(),
@@ -1585,8 +1590,14 @@ def main():
     ap.add_argument("--mace-worker", metavar="TASKS",
                     help="(what a MACE job runs) relax the structures in this task file")
     ap.add_argument("--phonon-worker", metavar="SPEC",
-                    help="(what a F2 job runs) a defect's force constants with its model")
+                    help="(what an F2 job runs) a defect's force constants with its model")
     cl = ap.parse_args()
+    have = getattr(sc, "VERSION", None)
+    if (have or "") < SC_VERSION:
+        die(f"{Path(sc.__file__).resolve()} is " + (f"the version of {have}" if have else
+                                                       "an older version")
+            + f", but this dwf.py needs the supercell_convergence.py of {SC_VERSION} or later: "
+            "put the one that came with this dwf.py beside it")
     if cl.mace_worker:
         mace_worker(cl.mace_worker)
         return

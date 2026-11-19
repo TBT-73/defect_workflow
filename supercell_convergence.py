@@ -292,6 +292,8 @@ if sys.version_info < (3, 7):   # Python 3.6: subprocess.run has no capture_outp
 
     subprocess.run = _run
 
+# This version's date. dwf.py checks it, as it needs the runner it was written with.
+VERSION = "2026-11-19"
 BOHR = 0.529177210903
 COULOMB = 14.399645                    # e^2/(4 pi eps0) in eV*Ang
 # Lany-Zunger shape factors c_sh for supercells of these shapes (Lany & Zunger, Modelling Simul.
@@ -1172,7 +1174,7 @@ def dryrun_template_text(job_template, dryrun_template):
 # The GB of memory each core of a dry-run job brings, with charging : core: that of
 # dryrun_partition if %block partitions lists it, otherwise of the first partition listed (where
 # the dry runs go), or mem_per_core. None if nothing says.
-#   Called by: dryrun_cpus(), submit_dryrun_pack()
+#   Called by: dryrun_cpus(), dryrun_lanes(), submit_dryrun_pack()
 def dryrun_core_gb(args):
     parts = args.partitions or []
     name = args.dryrun_partition or (parts[0]["name"] if parts else None)
@@ -1182,7 +1184,7 @@ def dryrun_core_gb(args):
 
 # How many cores each process of a dry-run job asks for: one, but with charging : core enough for
 # the dry run's gb, as there the memory comes with the cores (dryrun_core_gb each).
-#   Called by: check_runner(), dryrun_subs()
+#   Called by: check_runner(), dryrun_lanes(), dryrun_subs()
 #   Calls:     dryrun_core_gb()
 def dryrun_cpus(ncores, gb, args):
     if args.charging != "core":
@@ -2342,18 +2344,19 @@ def pack_castep_line(template, name="the runner settings", rx=CASTEP_RUN, what="
 
 # One line of a pack's job script: the template's line that runs CASTEP (run, matched by rx), made
 # to run one calculation, seed, in its own directory, where (both shell words: a name, quoted, or a
-# variable such as "$SEED"), in the background - with env set and srun given the calculation's own
-# options (own) in place of the template's ones of that kind (SRUN_OWN) - with its output in out
-# there: slurm-<job id>.out, or for a task of a job array slurm-<array job id>_<task>.out.
+# variable such as "$SEED"), in the background (or not: background=False, for dry runs that take
+# their turn on a core) - with env set and srun given the calculation's own options (own) in place
+# of the template's ones of that kind (SRUN_OWN) - with its output in out there: slurm-<job id>.out,
+# or for a task of a job array slurm-<array job id>_<task>.out.
 #   Called by: submit_dryrun_pack(), submit_pack(), submit_pack_array()
-def pack_line(run, rx, seed, where, own, env, out="slurm-${SLURM_JOB_ID}.out"):
+def pack_line(run, rx, seed, where, own, env, out="slurm-${SLURM_JOB_ID}.out", background=True):
     m = rx.search(run)
     head, exe, tail = run[:m.start()], m.group(1), run[m.end():]
     s = re.search(r"(?<![\w/.\-])srun\b", head)
     rest = SRUN_OWN.sub("", " " + head[s.end():]).split()
     cmd = (f"{head[:s.start()]}{env}srun {own}" + (" " + " ".join(rest) if rest else "")
            + f" {exe}{seed}{tail}").replace("{SEED}", seed).strip()
-    return f"( cd {where} && {cmd} ) > {where}/{out} 2>&1 &"
+    return f"( cd {where} && {cmd} ) > {where}/{out} 2>&1" + (" &" if background else "")
 
 
 # A new directory for a pack's job script: <workdir>/packs/<prefix>_NNN, numbered on from those
@@ -2649,6 +2652,23 @@ def submit_array(group, ctx, args, workdir):
         f"{group[-1].name}), each on {job_size(infos[0])}" + (f", walltime {wall}" if wall else ""))
 
 
+# How many of a pack's n dry runs (dryrun_pack : N) run at once: one a core of a node (with
+# charging : core, as many as a node's cores hold at dryrun_cpus cores each), and on whole nodes
+# no more than the node's memory holds at dryrun_mem_gb each, when its GB per core is known
+# (dryrun_core_gb); all n without cores_per_node. submit_dryrun_pack runs the rest in turn.
+#   Called by: submit_dryrun_pack()
+#   Calls:     dryrun_core_gb(), dryrun_cpus()
+def dryrun_lanes(n, args):
+    cpn = args.cores_per_node
+    if not cpn:
+        return n
+    lanes = cpn // dryrun_cpus(1, args.dryrun_mem_gb, args)
+    per = dryrun_core_gb(args)
+    if per and args.charging != "core":
+        lanes = min(lanes, math.floor(cpn * per / args.dryrun_mem_gb))
+    return max(1, min(n, lanes))
+
+
 # Runs several dry runs side by side, as one job (dryrun_pack : N).
 # Writes <workdir>/packs/dryrun_NNN/job.sh from the dry-run template (dryrun_template_text), filled
 # in for one core per dry run (on one node), with dryrun_partition, dryrun_time and dryrun_options
@@ -2659,15 +2679,20 @@ def submit_array(group, ctx, args, workdir):
 # its own dryrun.sh, which --resubmit-failed uses. With charging : core each dry run has the cores
 # that hold dryrun_mem_gb (dryrun_cpus), asks for their memory with --mem-per-cpu (the job's
 # SLURM_MEM_PER_CPU, or else dryrun_core_gb), and the job shares its node (no --exclusive).
+# A pack of more dry runs than a node holds at once (dryrun_lanes) runs that many lanes, each on
+# its own core(s): the job is filled in for the lanes, and each lane is a group of the pack's dry
+# runs, as even as can be, that runs in the background one after another, each going on even if
+# the one before failed (|| true); dryrun_time must allow for a lane's dry runs in turn.
 #   Called by: prepare_all()
-#   Calls:     dryrun_core_gb(), dryrun_sbatch(), dryrun_subs(), dryrun_template_text(), fill(),
-#              new_pack_dir(), pack_castep_line(), pack_line(), record_job(), send_job(),
-#              set_exclusive()
+#   Calls:     dryrun_core_gb(), dryrun_lanes(), dryrun_sbatch(), dryrun_subs(),
+#              dryrun_template_text(), fill(), new_pack_dir(), pack_castep_line(), pack_line(),
+#              record_job(), send_job(), set_exclusive()
 def submit_dryrun_pack(group, ctx, args):
     workdir, n, core = group[0].dir.parent, len(group), args.charging == "core"
+    lanes = dryrun_lanes(n, args)
     pdir = new_pack_dir(workdir, "dryrun")
-    subs = dryrun_subs(pdir.name, f"{group[0].name}_dry+{n - 1}", n, n * args.dryrun_mem_gb,
-                       args)
+    subs = dryrun_subs(pdir.name, f"{group[0].name}_dry+{n - 1}", lanes,
+                       lanes * args.dryrun_mem_gb, args)
     template = dryrun_template_text(ctx["job_template"], ctx["dryrun_template"])
     run = pack_castep_line(template, rx=DRYRUN_RUN, what="dryrun_pack")
     lines = []
@@ -2681,8 +2706,16 @@ def submit_dryrun_pack(group, ctx, args):
                   f"--mem={mb}M")
         own = (f"--nodes=1 --ntasks=1 --ntasks-per-node=1 --cpus-per-task={cpus} --exact "
                + memory)
-        lines += [pack_line(run, DRYRUN_RUN, c.seed, shlex.quote(str(c.dir.resolve())), own,
-                            f"OMP_NUM_THREADS=1 SRUN_CPUS_PER_TASK={cpus} ") for c in group]
+        env = f"OMP_NUM_THREADS=1 SRUN_CPUS_PER_TASK={cpus} "
+        where = {c.name: shlex.quote(str(c.dir.resolve())) for c in group}
+        if lanes == n:                          # all at once
+            lines += [pack_line(run, DRYRUN_RUN, c.seed, where[c.name], own, env) for c in group]
+        else:                                   # lanes, each running its share in turn
+            for k in range(lanes):
+                lane = group[round(k * n / lanes):round((k + 1) * n / lanes)]
+                lines += (["("] + ["    " + pack_line(run, DRYRUN_RUN, c.seed, where[c.name], own,
+                                                      env, background=False) + " || true"
+                                   for c in lane] + [") &"])
         lines.append("wait")
     script = dryrun_sbatch(fill("\n".join(lines) + "\n", subs), subs, args)
     if core:
@@ -2692,8 +2725,13 @@ def submit_dryrun_pack(group, ctx, args):
     jobid = send_job(pdir, JOBSCRIPT, args)
     for c in group:
         record_job(c, jobid, 0, None, key="dryrun_jobid")
-    log(f"submitted {n} dry runs in {pdir.relative_to(workdir)}: job {jobid} ("
-        + ", ".join(c.name for c in group) + ")")
+    if lanes == n:
+        log(f"submitted {n} dry runs in {pdir.relative_to(workdir)}: job {jobid} ("
+            + ", ".join(c.name for c in group) + ")")
+    else:
+        log(f"submitted {n} dry runs in {pdir.relative_to(workdir)}: job {jobid}, {lanes} side "
+            f"by side, each running up to {math.ceil(n / lanes)} in turn ({group[0].name} ... "
+            f"{group[-1].name})")
 
 
 # Asks the scheduler whether a job is still queued or running.
@@ -4200,10 +4238,11 @@ def convert_settings(items, name):
 # Checks the settings that control how jobs run, for both the size series and batch mode.
 # Numbers that must be at least 1, greater than 0 or not negative; cores_per_node with max_nodes
 # (not max_cores, unless charging : core) and a cores value that splits evenly over the nodes;
-# charging : core with cores_per_node, the memory per core, a dryrun_pack whose dry runs fit on a
-# node, and max_nodes (by default the nodes max_cores or cores need) that holds the job; %block
-# partitions without mem_per_core, and with a partition that can take cores; array (Slurm job
-# arrays, of packs with pack too) with sbatch. Starts mem_replicated : auto at R_START.
+# charging : core with cores_per_node, the memory per core, a dry run that fits on a node (a
+# dryrun_pack of more than a node holds runs them in turn), and max_nodes (by default the nodes
+# max_cores or cores need) that holds the job; %block partitions without mem_per_core, and with a
+# partition that can take cores; array (Slurm job arrays, of packs with pack too) with sbatch.
+# Starts mem_replicated : auto at R_START.
 #   Called by: batch_args(), read_input()
 def check_runner(args, raw_vals, name):
     for key in ("max_cores", "cores", "dryrun_cores", "poll", "dryrun_timeout",
@@ -4219,10 +4258,9 @@ def check_runner(args, raw_vals, name):
             die(f"{name}: with charging : core the memory comes with the cores, so give how "
                 "much each core brings: mem_per_core, or a %block partitions")
         cpus = dryrun_cpus(1, args.dryrun_mem_gb, args)       # each dry run's cores
-        if args.dryrun_pack * cpus > args.cores_per_node:
-            die(f"{name}: dryrun_pack : {args.dryrun_pack} dry runs of {cpus} cores each (for "
-                f"dryrun_mem_gb : {args.dryrun_mem_gb:g}) are more than a node's "
-                f"{args.cores_per_node} cores")
+        if cpus > args.cores_per_node:
+            die(f"{name}: a dry run with dryrun_mem_gb : {args.dryrun_mem_gb:g} needs {cpus} "
+                f"cores for its memory, more than a node's {args.cores_per_node}")
         want = args.cores or args.max_cores
         nodes = math.ceil(want / args.cores_per_node)
         if "max_nodes" not in raw_vals:
@@ -4243,9 +4281,6 @@ def check_runner(args, raw_vals, name):
     if args.array > 1 and "sbatch" not in args.submit_cmd:     # Slurm job arrays (of packs,
         die(f"{name}: array : {args.array} runs jobs as Slurm job arrays (sbatch --array), "
             f"but submit_cmd is '{args.submit_cmd}'")             # with pack too)
-    if args.cores_per_node and args.dryrun_pack > args.cores_per_node:
-        die(f"{name}: dryrun_pack : {args.dryrun_pack} is more dry runs than a node has cores "
-            f"({args.cores_per_node})")
     if args.cores_per_node:
         if "max_cores" in raw_vals and args.charging != "core":
             die(f"{name}: with cores_per_node the job size is set by max_nodes - remove max_cores "
