@@ -297,7 +297,8 @@ PROJECT_KEYWORDS = {
     "dielectric_cell": (_t, None),
     "phases": ("lines", None), "phases_from": (sc._choice("none", "doped"), "none"),
     "mp_api_key": (_t, None), "phases_e_above_hull": (sc._num("eV/atom", "eV"), 0.05),
-    "phases_max_steps": (sc._num(cast=int), 100), "chemical_potentials": ("lines", None),
+    "phases_max_steps": (sc._num(cast=int), 100),
+    "phases_molecule_box": (sc._num("ang", "A"), 15.0), "chemical_potentials": ("lines", None),
     # B: candidates and the screening cell
     "dopants": (_w, []), "defects": ("lines", None), "vacancies": (_b, True),
     "antisites": (_b, False),
@@ -653,6 +654,8 @@ def read_project(path, run_path):
     for key in ("charge_margin", "carrier_reach"):
         if getattr(s, key) < 0:
             die(f"{name}: {key} can't be negative")
+    if s.phases_molecule_box <= 0:
+        die(f"{name}: phases_molecule_box, the side of the molecules' box, must be above 0")
     if not 0 < s.carrier_fraction <= 1:
         die(f"{name}: carrier_fraction is a fraction of the cell's atoms, greater than 0 and at "
             "most 1")
@@ -3200,10 +3203,11 @@ def step_dielectric(p):
 # The competing phases, from %block phases (name, structure file, options: molecule, metal
 # (fix_occupancy : false unless the line says otherwise), kspacing=..., anything else a .param
 # keyword) or from doped (phases_from : doped, with the Materials Project: every phase it
-# chooses for the host and each dopant, each with eah, its energy above the hull). A3.1, C4 and
-# E1.1 each take their part of it (phases_for). Returns a list of (name, Atoms, options dict).
+# chooses for the host and each dopant, each with eah, its energy above the hull; its molecules
+# in boxes of phases_molecule_box, molecule_in_box). A3.1, C4 and E1.1 each take their part of
+# it (phases_for). Returns a list of (name, Atoms, options dict).
 #   Called by: step_dopant_phases(), step_phases(), step_ref_phases()
-#   Calls:     doped_phases(), read_structure_file(), sc.canonical_key()
+#   Calls:     doped_phases(), molecule_in_box(), read_structure_file(), sc.canonical_key()
 def phase_list(p):
     if p.s.phases:
         out = []
@@ -3224,8 +3228,47 @@ def phase_list(p):
             out.append((row[0], read_structure_file(p.base / row[1]), opts))
         return out
     if p.s.phases_from == "doped":
-        return doped_phases(p)
+        out, size = doped_phases(p), p.s.phases_molecule_box
+        mols = [name for name, _, opts in out if opts.get("molecule")]
+        if mols:
+            log(f"doped's molecules ({', '.join(mols)}) in boxes of {size:g} A "
+                "(phases_molecule_box)")
+        return [(name, molecule_in_box(name, atoms, size) if opts.get("molecule") else atoms,
+                 opts) for name, atoms, opts in out]
     return []
+
+
+# The least vacuum (A) molecule_in_box leaves between a molecule and its periodic images.
+MOLECULE_VACUUM = 5.0
+
+
+# A molecule doped made (H2, N2, O2, F2 or Cl2, each in a 30 A box) moved into a box of side size
+# (phases_molecule_box, 15 A by default). In a plane-wave code the vacuum costs as much as the
+# atoms: a 30 A box has eight times the volume of a 15 A one, so about eight times the plane
+# waves, memory and time, which a small neutral molecule doesn't need. The box has doped's shape
+# (size + 0.01, size and size - 0.01 A along x, y and z, no two sides equal), and the molecule
+# keeps the geometry doped gave it (its atoms taken together across the old box's edges), centred.
+# A cell that is already that box is left as it is, so phases_molecule_box : 30 ang keeps
+# doped's own structures. Stops if the box would leave less than MOLECULE_VACUUM between the
+# molecule and its images.
+#   Called by: phase_list()
+def molecule_in_box(name, atoms, size):
+    lengths = np.array([size + 0.01, size, size - 0.01])
+    cell = np.asarray(atoms.cell)
+    if np.allclose(cell, np.diag(lengths), atol=1e-6):
+        return atoms
+    d = atoms.get_positions() - atoms.get_positions()[0]       # from the first atom
+    frac = np.linalg.solve(cell.T, d.T).T
+    d = (frac - np.round(frac)) @ cell                          # nearest images
+    lo, hi = d.min(axis=0), d.max(axis=0)
+    gap = float(np.min(lengths - (hi - lo)))
+    if gap < MOLECULE_VACUUM:
+        die(f"phases_molecule_box : {size:g} ang leaves {gap:.1f} A between {name} and its "
+            f"images (at least {MOLECULE_VACUUM:g} A is needed)")
+    out = atoms.copy()
+    out.set_cell(np.diag(lengths))
+    out.set_positions(d - (lo + hi) / 2 + lengths / 2)
+    return out
 
 
 # How far beyond phases_e_above_hull (eV/atom) doped_phases still downloads Materials Project
@@ -3391,9 +3434,10 @@ def lean_mp_entries(folder, eah_max, original, expect=()):
 
 
 # Competing phases from doped's CompetingPhases (Materials Project entries within
-# phases_e_above_hull of the hull, elemental references and diatomic molecules in a box). Needs
-# doped and an MP API key (mp_api_key, or doped's own configuration). Works with doped 3.1 and
-# later (CompetingPhases(energy_above_hull=..., extrinsic=...)) and with doped 2.x and 3.0
+# phases_e_above_hull of the hull, elemental references and diatomic molecules in a 30 A box,
+# which phase_list makes smaller: molecule_in_box). Needs doped and an MP API key (mp_api_key,
+# or doped's own configuration). Works with doped 3.1 and later
+# (CompetingPhases(energy_above_hull=..., extrinsic=...)) and with doped 2.x and 3.0
 # (CompetingPhases(e_above_hull=...), or ExtrinsicCompetingPhases with dopants, whose
 # intrinsic_entries are the host's phases): the keywords doped's CompetingPhases takes tell them
 # apart. Each keeps an entry's band gap in its own place, so the phases are grouped here as
@@ -8215,9 +8259,9 @@ STEPS = [
          owns=("A_host/jobs/dielectric",)),
     Step("ref_phases", "A3.1", "reference energies at the screening settings (the host, its "
          "competing phases, the dopants' elements)", step_ref_phases,
-         keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps", "dopants",
-               "screen_cutoff", "screen_overrides", "energy"), needs=("relax",),
-         owns=("A_host/jobs/ref_phases",)),
+         keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps",
+               "phases_molecule_box", "dopants", "screen_cutoff", "screen_overrides", "energy"),
+         needs=("relax",), owns=("A_host/jobs/ref_phases",)),
     Step("ref_limits", "A3.2", "chemical-potential limits at the screening settings",
          step_ref_limits, keys=("dopants",), needs=("ref_phases",)),
     # B: candidate defects and the screening cell
@@ -8309,9 +8353,9 @@ STEPS = [
                "D_production/jobs/zpl", "D_production/structures/zpl")),
     # E: thermodynamics
     Step("phases", "E1.1", "relax the competing phases at the production settings", step_phases,
-         keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps", "dopants",
-               "chemical_potentials", "energy"), needs=("relaxations", "generate", "relax"),
-         owns=("E_thermo/jobs/phases",)),
+         keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps",
+               "phases_molecule_box", "dopants", "chemical_potentials", "energy"),
+         needs=("relaxations", "generate", "relax"), owns=("E_thermo/jobs/phases",)),
     Step("limits", "E1.2", "chemical-potential limits", step_limits,
          keys=("chemical_potentials", "dopants"),
          needs=("phases", "relaxations", "generate", "relax")),
@@ -8398,6 +8442,8 @@ Sb2O3   Sb2O3.cell
 !mp_api_key  : <your key>
 phases_max_steps : 100         # geometry steps for each phase's relaxation (CASTEP's own 30
                                #   can be too few for a soft metal's cell)
+!phases_molecule_box : 15 ang  # the box for doped's molecules (H2, N2, O2, F2, Cl2): doped's
+                               #   own 30 A has eight times the volume (default: 15 A)
 # ...or E's limits themselves (eV per atom, absolute: the same reference as your production
 # runs; C3 and C4 then compare the defects within each composition only, unless phases are given)
 !%block chemical_potentials

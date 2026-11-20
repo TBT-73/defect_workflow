@@ -609,7 +609,11 @@ only within their composition groups, and E3 leaves out the μ terms). `%block
 chemical_potentials` gives E1.2 its limits itself (E1.1 runs nothing), on the production
 settings' energy scale, which the screening runs don't share: A3 and C4 still run the phases of
 `%block phases` or doped, if given.
-Solids relax lattice and positions; molecules relax in their fixed box at Γ.
+Solids relax lattice and positions; molecules relax in their fixed box at Γ. doped puts its
+molecules (H₂, N₂, O₂, F₂, Cl₂) in 30 Å boxes, and `dwf.py` moves each into a box of
+`phases_molecule_box` (15 Å) instead: in a plane-wave code the vacuum costs as much as the atoms,
+and a 30 Å box has eight times the volume, so about eight times the plane waves, memory and time.
+The molecules of `%block phases` keep their files' boxes.
 
 With `phases_from : doped`, each dopant gets its phases on its own: doped is given one dopant at a
 time, so each works on the hull of the host's elements and that dopant (Ca-O-Sb, then Ca-O-Bi,
@@ -1387,7 +1391,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **M**: [`mace`](#mace) (MACE) · [`mace_device`](#mace) (MACE) · [`mace_fmax`](#mace) (MACE) · [`mace_jobscript`](#mace) (MACE) · [`mace_max_jobs`](#mace) (MACE) · [`mace_model`](#mace) (MACE) · [`mace_pack`](#mace) (MACE) · [`mace_python`](#mace) (MACE) · [`mace_steps`](#mace) (MACE) · [`mace_threads`](#mace) (MACE) · [`max_cores`](#runner-settings) (runner) · [`max_formation_energy`](#c-screening-ground-and-excited-states) (C) · [`max_jobs`](#runner-settings) (runner) · [`max_nodes`](#runner-settings) (runner) · [`max_restarts`](#runner-settings) (runner) · [`max_walltime`](#runner-settings) (runner) · [`mem_per_core`](#runner-settings) (runner) · [`mem_replicated`](#runner-settings) (runner) · [`mem_safety`](#runner-settings) (runner) · [`model_batch`](#f-lineshapes) (F) · [`model_channels`](#f-lineshapes) (F) · [`model_command`](#f-lineshapes) (F) · [`model_device`](#f-lineshapes) (F) · [`model_epochs`](#f-lineshapes) (F) · [`model_jobscript`](#f-lineshapes) (F) · [`model_max_L`](#f-lineshapes) (F) · [`model_r_max`](#f-lineshapes) (F) · [`model_train_args`](#f-lineshapes) (F) · [`mp_api_key`](#a-host) (A)
 - **N**: [`name`](#general) (general) · [`native_pairs`](#b-candidates-the-screening-and-electronic-cells) (B)
 - **O**: [`omp_threads`](#runner-settings) (runner) · [`%block oxidation_states`](#c-screening-ground-and-excited-states) (C)
-- **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-the-screening-and-electronic-cells) (B) · [`pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`phases_max_steps`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
+- **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-the-screening-and-electronic-cells) (B) · [`pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`phases_max_steps`](#a-host) (A) · [`phases_molecule_box`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
 - **Q**: [`quench_temperature`](#e-thermodynamics) (E)
 - **R**: [`rattle_dmin`](#c-screening-ground-and-excited-states) (C) · [`rattle_stdev`](#c-screening-ground-and-excited-states) (C) · [`require_bound`](#c-screening-ground-and-excited-states) (C) · [`require_gap_states`](#c-screening-ground-and-excited-states) (C) · [`require_spin`](#c-screening-ground-and-excited-states) (C) · [`%block runner_scan`, `runner_prerelax`](#mace) (MACE) · [`%block runner_host`, `runner_screen`, `runner_production`, `runner_<step>`](#runner-settings) (runner)
 - **S**: [`scan`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_edge_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_lengths`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_test`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`screen_charges`](#c-screening-ground-and-excited-states) (C) · [`screen_cutoff`](#c-screening-ground-and-excited-states) (C) · [`screen_max_steps`](#c-screening-ground-and-excited-states) (C) · [`screen_min_image`](#b-candidates-the-screening-and-electronic-cells) (B) · [`%block screen_overrides`](#c-screening-ground-and-excited-states) (C) · [`screen_spins`](#c-screening-ground-and-excited-states) (C) · [`share_rounds`](#c-screening-ground-and-excited-states) (C) · [`site_margin`](#c-screening-ground-and-excited-states) (C) · [`sp_walltime`](#runner-settings) (runner) · [`spin_tol`](#c-screening-ground-and-excited-states) (C) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-the-screening-and-electronic-cells) (B)
@@ -1459,6 +1463,7 @@ Details: [Phase A](#phase-a-the-host).
 | `mp_api_key` | — | — | Materials Project API key for `phases_from : doped`: the 32 characters on your dashboard, without quotes. Given here, it is used rather than doped's own (`PMG_MAPI_KEY` in `~/.pmgrc.yaml`). It needs doped 3 and pymatgen 2026.9.23 or later (so Python 3.11 or later; older pymatgen can't read the Materials Project's replies): doped 2.x takes only the legacy keys, whose API the Materials Project was closing in September 2025; 3.0 takes the current ones but also needs `mp-api` and `emmet-core`, 3.1 and later nothing more. |
 | `phases_e_above_hull` | `0.05 eV/atom` | A3.1, C4, E1.1 | `phases_from : doped` takes the Materials Project entries up to this far above the hull. A3.1 and C4 relax only the lowest of each composition, E1.1 every one. |
 | `phases_max_steps` | `100` | A3.1, C4, E1.1 | `geom_max_iter` of each competing phase's relaxation (CASTEP's own is 30, which can be too few for a soft metal's cell). A `%block phases` line's own `geom_max_iter=` wins for that phase. |
+| `phases_molecule_box` | `15 ang` | A3.1, E1.1 | The side of the box each of `phases_from : doped`'s molecules (H₂, N₂, O₂, F₂, Cl₂) relaxes in: doped's shape, that +0.01, that and −0.01 Å along x, y and z, with the molecule as doped made it, centred. doped's own box is 30 Å, eight times the volume, so about eight times the plane waves, memory and time. `30 ang` keeps doped's structures as they are; a box that leaves less than 5 Å between a molecule and its images is refused. A `%block phases` molecule keeps its file's box. |
 | `%block chemical_potentials` | — | E1.1, E1.2 | The limits themselves, one per line: `name  El=value ...`, in absolute eV per atom on the energy scale of your production runs, for every element of the host and the dopants. E1.1 then relaxes nothing, and E1.2 records them: it takes precedence over `%block phases` and `phases_from` there. They are not on the screening settings' scale, so A3 and C4 still run `%block phases` or doped's phases, if given (without them, C3 and C4 make no cuts on formation energy). |
 
 #### B: candidates, the screening and electronic cells
@@ -2329,6 +2334,19 @@ converged. Li ran out of steps without reverting. Every phase's relaxation now g
 `phases_max_steps` (100) geometry steps, and `fine_gmax` in `%block screen_overrides` gives the
 screening runs and A3.1's and C4's phases a finer density grid alike (checklist 16).
 
+Then `phases_molecule_box`, after the same user's dry run of O₂ in doped's 30 Å box was stopped
+about 30 s in, twice, its `.castep` cut off in the pseudopotential report: with
+`fine_gmax : 35 1/ang` that box has about 335 grid points a side instead of 192, and in a pack each
+dry run has `dryrun_mem_gb` (4 GB). doped's molecules now go in 15 Å boxes. Tested with doped
+3.2.1's own molecules: O₂ and Cl₂ come out in 15.01 × 15 × 14.99 Å boxes, centred, with doped's
+bonds, options and names, from `phases_doped.json` as from doped; the solids are left alone;
+`30 ang` gives doped's structures back exactly, 12 Å a 12.01 × 12 × 11.99 Å box, and 6.5 Å is
+refused for Cl₂ (4.5 Å from its images), as is 0; a molecule split across the old box's edge comes
+out whole; a `%block phases` molecule keeps its file's box. On a mock Slurm and CASTEP, with the dry
+runs in a pack under `--mem=4096M`: O₂'s dry run in doped's box is killed and the run stops, as the
+user's did; with the 15 Å box the next run sets O₂'s job up again (it had never run) and finishes,
+and the solid keeps its dry run (checklist 17).
+
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's and C4's cuts on real energies (see 15 below), real `mace_run_train` trainings with
 the charge embedding (F2: the command was checked, not run), real CASTEP ΔSCF (C8, D2, F1) and
@@ -2450,3 +2468,7 @@ On the first real runs, check:
    `--redo ref_phases`. A failure without reverts usually just needs more `phases_max_steps`.
    Each cell relaxation's `.castep` also gives `dEtot/dlog(Ecut)` near the top: the larger it is
    per atom, the further that element is from converged at `screen_cutoff`.
+17. **doped's molecules** (`phases_from : doped`): A3.1's log names them and their box. 15 Å leaves
+   at least 13 Å of vacuum around each, plenty for a small neutral molecule at Γ. To check, relax
+   one by hand in a 20 Å box with the same settings (its folder in `A_host/jobs/ref_phases/` has
+   them): its energy should change by no more than a few meV.
