@@ -633,8 +633,14 @@ host on A2.1's relaxed cell, the cell the defect supercells are built from; the 
 phases (made of its own elements, not of its own composition); and each dopant's pure element.
 From doped, each composition only once, the phase lowest above the hull. A cell relaxed at a
 lower cut-off than production comes out a little off in volume (Pulay stress), which changes its
-energy only to second order. Without `%block phases` or `phases_from : doped` nothing runs, and
-C3 makes no cuts across composition groups.
+energy only to second order. Each relaxation (here, in C4 and in E1.1) gets `phases_max_steps`
+(100) geometry steps: CASTEP's own 30 can be too few for a soft metal's cell. At a low
+`screen_cutoff`, a hard ultrasoft potential (O, or Be with its 1s electrons in valence) may need a
+finer density grid than CASTEP's default: its energy then jumps whenever the grid changes as the
+cell relaxes, and the relaxation keeps "reverting to earlier configuration" until it runs out of
+steps. `fine_gmax : 35 1/ang` in `%block screen_overrides` gives the screening runs and these
+phases a finer grid alike. Without `%block phases` or `phases_from : doped` nothing runs, and C3
+makes no cuts across composition groups.
 
 **A3.2 ref_limits.** A pymatgen phase diagram of A3.1's host and the phases made of its own
 elements (it needs a phase of each pure element, and stops if the host lies above the hull).
@@ -1381,7 +1387,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **M**: [`mace`](#mace) (MACE) · [`mace_device`](#mace) (MACE) · [`mace_fmax`](#mace) (MACE) · [`mace_jobscript`](#mace) (MACE) · [`mace_max_jobs`](#mace) (MACE) · [`mace_model`](#mace) (MACE) · [`mace_pack`](#mace) (MACE) · [`mace_python`](#mace) (MACE) · [`mace_steps`](#mace) (MACE) · [`mace_threads`](#mace) (MACE) · [`max_cores`](#runner-settings) (runner) · [`max_formation_energy`](#c-screening-ground-and-excited-states) (C) · [`max_jobs`](#runner-settings) (runner) · [`max_nodes`](#runner-settings) (runner) · [`max_restarts`](#runner-settings) (runner) · [`max_walltime`](#runner-settings) (runner) · [`mem_per_core`](#runner-settings) (runner) · [`mem_replicated`](#runner-settings) (runner) · [`mem_safety`](#runner-settings) (runner) · [`model_batch`](#f-lineshapes) (F) · [`model_channels`](#f-lineshapes) (F) · [`model_command`](#f-lineshapes) (F) · [`model_device`](#f-lineshapes) (F) · [`model_epochs`](#f-lineshapes) (F) · [`model_jobscript`](#f-lineshapes) (F) · [`model_max_L`](#f-lineshapes) (F) · [`model_r_max`](#f-lineshapes) (F) · [`model_train_args`](#f-lineshapes) (F) · [`mp_api_key`](#a-host) (A)
 - **N**: [`name`](#general) (general) · [`native_pairs`](#b-candidates-the-screening-and-electronic-cells) (B)
 - **O**: [`omp_threads`](#runner-settings) (runner) · [`%block oxidation_states`](#c-screening-ground-and-excited-states) (C)
-- **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-the-screening-and-electronic-cells) (B) · [`pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
+- **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-the-screening-and-electronic-cells) (B) · [`pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`phases_max_steps`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
 - **Q**: [`quench_temperature`](#e-thermodynamics) (E)
 - **R**: [`rattle_dmin`](#c-screening-ground-and-excited-states) (C) · [`rattle_stdev`](#c-screening-ground-and-excited-states) (C) · [`require_bound`](#c-screening-ground-and-excited-states) (C) · [`require_gap_states`](#c-screening-ground-and-excited-states) (C) · [`require_spin`](#c-screening-ground-and-excited-states) (C) · [`%block runner_scan`, `runner_prerelax`](#mace) (MACE) · [`%block runner_host`, `runner_screen`, `runner_production`, `runner_<step>`](#runner-settings) (runner)
 - **S**: [`scan`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_edge_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_lengths`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_test`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`screen_charges`](#c-screening-ground-and-excited-states) (C) · [`screen_cutoff`](#c-screening-ground-and-excited-states) (C) · [`screen_max_steps`](#c-screening-ground-and-excited-states) (C) · [`screen_min_image`](#b-candidates-the-screening-and-electronic-cells) (B) · [`%block screen_overrides`](#c-screening-ground-and-excited-states) (C) · [`screen_spins`](#c-screening-ground-and-excited-states) (C) · [`share_rounds`](#c-screening-ground-and-excited-states) (C) · [`site_margin`](#c-screening-ground-and-excited-states) (C) · [`sp_walltime`](#runner-settings) (runner) · [`spin_tol`](#c-screening-ground-and-excited-states) (C) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-the-screening-and-electronic-cells) (B)
@@ -1452,6 +1458,7 @@ Details: [Phase A](#phase-a-the-host).
 | `phases_from` | `none` | A3.1, C4, E1.1 | `doped`: when there is no `%block phases`, take the competing phases from the Materials Project through doped (needs doped and `mp_api_key`). The phases doped chooses are kept in `A_host/phases_doped.json` for later runs ([Phase A](#phase-a-the-host)). |
 | `mp_api_key` | — | — | Materials Project API key for `phases_from : doped`: the 32 characters on your dashboard, without quotes. Given here, it is used rather than doped's own (`PMG_MAPI_KEY` in `~/.pmgrc.yaml`). It needs doped 3 and pymatgen 2026.9.23 or later (so Python 3.11 or later; older pymatgen can't read the Materials Project's replies): doped 2.x takes only the legacy keys, whose API the Materials Project was closing in September 2025; 3.0 takes the current ones but also needs `mp-api` and `emmet-core`, 3.1 and later nothing more. |
 | `phases_e_above_hull` | `0.05 eV/atom` | A3.1, C4, E1.1 | `phases_from : doped` takes the Materials Project entries up to this far above the hull. A3.1 and C4 relax only the lowest of each composition, E1.1 every one. |
+| `phases_max_steps` | `100` | A3.1, C4, E1.1 | `geom_max_iter` of each competing phase's relaxation (CASTEP's own is 30, which can be too few for a soft metal's cell). A `%block phases` line's own `geom_max_iter=` wins for that phase. |
 | `%block chemical_potentials` | — | E1.1, E1.2 | The limits themselves, one per line: `name  El=value ...`, in absolute eV per atom on the energy scale of your production runs, for every element of the host and the dopants. E1.1 then relaxes nothing, and E1.2 records them: it takes precedence over `%block phases` and `phases_from` there. They are not on the screening settings' scale, so A3 and C4 still run `%block phases` or doped's phases, if given (without them, C3 and C4 make no cuts on formation energy). |
 
 #### B: candidates, the screening and electronic cells
@@ -1495,7 +1502,7 @@ C8's too, and `screen_cutoff` and `%block screen_overrides` those of A3.1's and 
 | `screen_spins` | `triplet` | C2 | The starting spin (unpaired electrons): `triplet` runs once from 2, or from 1 (a doublet) when the electron count is odd; `low` runs once from the lowest the electron count allows (0 or 1); `both` runs from that and from that + 2. A starting value: the results keep the final spin. |
 | `screen_cutoff` | the production cut-off | A3.1, C2, C3, C4, C6, C7, C8 | The cut-off of the screening runs, and of A3.1's and C4's reference phases, so that their energies are on one scale. |
 | `screen_max_steps` | `50` | C2, C6, C7, C8 | `geom_max_iter` of the screening relaxations. A run that reaches it is logged as failed but keeps its last energy, marked as not converged. |
-| `%block screen_overrides` | — | A3.1, C2, C3, C4, C6, C7, C8 | Any other `.param` keywords for the screening runs (and A3.1's and C4's phases), e.g. a looser `elec_energy_tol`. |
+| `%block screen_overrides` | — | A3.1, C2, C3, C4, C6, C7, C8 | Any other `.param` keywords for the screening runs (and A3.1's and C4's phases), e.g. a looser `elec_energy_tol`, or `fine_gmax : 35 1/ang`, a finer density grid, for hard ultrasoft potentials at a low `screen_cutoff` (a phase's cell relaxation whose energy jumps as the grid changes, and never converges). |
 | `level_margin` | `0.1 eV` | C2, C3, C6, C7, C8 | How far inside the host's band edges (from the pristine cell at the same settings) an eigenvalue must lie to count as a defect level in the gap. Anything closer to an edge, or past it, is in a band: the electrons and holes there make a run a band state (at least 0.5 of either), which C3 doesn't judge by its energy. The eigenvalues aren't aligned to the host's, so raise it if a defect cell's band edges sit visibly off the host's. |
 | `hull_margin` | `0.2 eV` | C3 | Keep an arrangement if its lowest formation energy comes within this of its composition group's defect hull somewhere in the gap. Allow for the error of the screening settings. |
 | `site_margin` | `0.5 eV` | C3 | Keep a defect with dopant atoms if its formation energy comes within this of the lowest of the defects with the same dopant atoms (on any site, with any host atoms added or removed) somewhere in the host's stability region and the gap: the dopant's chemical potential cancels between them. Needs A3's phases. Native defects aren't compared so. |
@@ -2284,33 +2291,43 @@ from the kept replies; a run with Sb, then one with Sb and Sr, asked only for Sr
 the fallback and a wrong key as before. The whole suite passes on Python 3.10, 3.11 and 3.13.
 
 Then the competing phases were split three ways, after the same user's screen got 287 of them from
-doped, to be relaxed at the production settings before any screening. A3.1 (`ref_phases`) and
-A3.2 (`ref_limits`) now run, at the screening settings, a single point of the host, the host's own
-phases and each dopant's element (the lowest of each composition). C3 uses them to drop a defect
-more than `site_margin` (0.5 eV) above the lowest defect with its dopant atoms everywhere in the
-host's stability region and gap (the dopant's μ cancels; a linear program finds the closest point
-exactly), and any defect whose least formation energy, the dopants at their elements, is above
+doped, to be relaxed at the production settings before any screening. A3.1 (`ref_phases`) and A3.2
+(`ref_limits`) now run, at the screening settings, a single point of the host, the host's own phases
+and each dopant's element (the lowest of each composition). C3 uses them to drop a defect more than
+`site_margin` (0.5 eV) above the lowest defect with its dopant atoms everywhere in the host's
+stability region and gap (the dopant's μ cancels; a linear program finds the closest point exactly),
+and any defect whose least formation energy, the dopants at their elements, is above
 `max_formation_energy` (2 eV). A new C4 (`dopant_phases`) relaxes the compounds of the dopants C3
 kept, and cuts again with them. The competing phases at the production settings became E1.1 and
 E1.2, for the dopants of D1's defects only, and without the host's own composition (relaxed in
-another cell, it could come out a hair below the host and stop E1.2). C4 to C8 became C5 to C9,
-and E1 to E3 became E2 to E4. Tested on made-up energies for CaO with Sb, Bi and Sr, checked by
-hand: A3.1 chose the host, CaO₂, Ca, O₂, Sb and Bi (the lowest of each; not a second CaO, nor
-compounds) at `screen_cutoff`; A3.2 gave the Ca-rich and O-rich corners with Sb and Bi at their
-elements (Sr has none). C3 dropped Sb<sub>i</sub> + O<sub>i</sub> (always 0.80 eV above
-Sb<sub>Ca</sub>), Sb<sub>i</sub> (1.25 eV above the Sb set's lowest at best, and 5 eV),
-V<sub>Ca</sub> (3 eV) and Bi<sub>Ca</sub> (2.6 eV), and kept Sb<sub>Ca</sub> + O<sub>i</sub>
-(0.30 eV at best) and Sr<sub>Ca</sub> (not judged); looser settings, and no limits, kept more. C4 relaxed Sb₂O₃,
-Sb₂O₅, CaSb₂O₆ and SrO (not the higher Sb₂O₃, BiSbO₄, or Bi₂O₃: no Bi defect was left); with
-μ_Sb held 4.75 eV down by CaSb₂O₆ at the O-rich corner, it dropped Sb<sub>Ca</sub> (now 5.25 eV)
-and Sb<sub>Ca</sub> + O<sub>i</sub> (5.55 eV), and Sr<sub>Ca</sub> through SrO (2.4 eV), and kept
+another cell, it could come out a hair below the host and stop E1.2). C4 to C8 became C5 to C9, and
+E1 to E3 became E2 to E4. Tested on made-up energies for CaO with Sb, Bi and Sr, checked by hand:
+A3.1 chose the host, CaO₂, Ca, O₂, Sb and Bi (the lowest of each; not a second CaO, nor compounds)
+at `screen_cutoff`; A3.2 gave the Ca-rich and O-rich corners with Sb and Bi at their elements (Sr
+has none). C3 dropped Sb<sub>i</sub> + O<sub>i</sub> (always 0.80 eV above Sb<sub>Ca</sub>),
+Sb<sub>i</sub> (1.25 eV above the Sb set's lowest at best, and 5 eV), V<sub>Ca</sub> (3 eV) and
+Bi<sub>Ca</sub> (2.6 eV), and kept Sb<sub>Ca</sub> + O<sub>i</sub> (0.30 eV at best) and
+Sr<sub>Ca</sub> (not judged); looser settings, and no limits, kept more. C4 relaxed Sb₂O₃, Sb₂O₅,
+CaSb₂O₆ and SrO (not the higher Sb₂O₃, BiSbO₄, or Bi₂O₃: no Bi defect was left); with μ_Sb held 4.75
+eV down by CaSb₂O₆ at the O-rich corner, it dropped Sb<sub>Ca</sub> (now 5.25 eV) and
+Sb<sub>Ca</sub> + O<sub>i</sub> (5.55 eV), and Sr<sub>Ca</sub> through SrO (2.4 eV), and kept
 Sb<sub>O</sub> and V<sub>O</sub>. E1.1 ran every phase of Ca, O and Sb but CaO's own, and E1.2's
 limits had Sb alone. `--migrate` on the old work directory now also moves the old A3.1's jobs and
 A3.1's and A3.2's results to `E_thermo/`: afterwards A3.1 can run, A3.2 and C3 to C7 wait for it,
-E1.1 and E1.2 run again and every other step is up to date. A work directory from between the
-two (merged, with those phases still in `A_host/` and their step running) has them moved by
-`--status`, its record dropped with a warning to cancel the old jobs. The whole suite passes on
-Python 3.10, 3.11 and 3.13.
+E1.1 and E1.2 run again and every other step is up to date. A work directory from between the two
+(merged, with those phases still in `A_host/` and their step running) has them moved by `--status`,
+its record dropped with a warning to cancel the old jobs. The whole suite passes on Python 3.10,
+3.11 and 3.13.
+
+Then the same user's A3.1 at `screen_cutoff : 500 eV`: Be's and CaO₂'s cell relaxations never
+converged. In Be's, the energy jumped by 0.18 eV and the pressure by 1.4 GPa each time c crossed
+3.9177 Å, where CASTEP's FFT grid along c needs another point, and the zero-stress point lay in
+the jump, so the optimiser reverted back and forth until its 30 steps ran out; its
+`dEtot/dlog(Ecut)` (−5.4 eV for two atoms) and CaO₂'s, O₂'s and the host's (about −18 eV per O)
+showed how far from converged Be and O are at 500 eV, while Ca and the heavier elements were
+converged. Li ran out of steps without reverting. Every phase's relaxation now gets
+`phases_max_steps` (100) geometry steps, and `fine_gmax` in `%block screen_overrides` gives the
+screening runs and A3.1's and C4's phases a finer density grid alike (checklist 16).
 
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's and C4's cuts on real energies (see 15 below), real `mace_run_train` trainings with
@@ -2425,3 +2442,11 @@ On the first real runs, check:
    off: once phase E has run, compare A3.2's Δμ with E1.2's, and a survivor's least formation
    energy with E3's. If a defect you expect is dropped, raise `site_margin` or
    `max_formation_energy` (C3 and C4 run again; their jobs are reused).
+16. **A3.1's relaxations at a low `screen_cutoff`**: list the ones that failed, and how often each
+   reverted, from `A_host/jobs/ref_phases`:
+   `grep -l "failed to converge" */*.castep` and `grep -c "reverting to earlier" */*.castep`.
+   Many reverts mean an energy that jumps as the grid changes (check that the steps' energies
+   fall into two groups): add `fine_gmax` to `%block screen_overrides` (glossary) and
+   `--redo ref_phases`. A failure without reverts usually just needs more `phases_max_steps`.
+   Each cell relaxation's `.castep` also gives `dEtot/dlog(Ecut)` near the top: the larger it is
+   per atom, the further that element is from converged at `screen_cutoff`.

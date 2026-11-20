@@ -297,7 +297,7 @@ PROJECT_KEYWORDS = {
     "dielectric_cell": (_t, None),
     "phases": ("lines", None), "phases_from": (sc._choice("none", "doped"), "none"),
     "mp_api_key": (_t, None), "phases_e_above_hull": (sc._num("eV/atom", "eV"), 0.05),
-    "chemical_potentials": ("lines", None),
+    "phases_max_steps": (sc._num(cast=int), 100), "chemical_potentials": ("lines", None),
     # B: candidates and the screening cell
     "dopants": (_w, []), "defects": ("lines", None), "vacancies": (_b, True),
     "antisites": (_b, False),
@@ -3605,17 +3605,19 @@ def screen_bulk(p):
 
 # The jobs that relax competing phases: solids, lattice and positions, with symmetry, at the batch's
 # k-point spacing (or the phase's own kspacing); molecules ('molecule'), positions only in a fixed
-# box, Gamma point, no symmetry. extra: .param keywords for every one (the screening settings);
-# a phase's own (%block phases, doped's: fix_occupancy : false for a metal, the spin of O2) win.
+# box, Gamma point, no symmetry. Each gets steps geometry steps (phases_max_steps: CASTEP's own 30
+# can be too few for a soft metal's cell). extra: .param keywords for every one (the screening
+# settings); a phase's own (%block phases, doped's: fix_occupancy : false for a metal, the spin of
+# O2) win.
 #   Called by: step_dopant_phases(), step_phases(), step_ref_phases()
 #   Calls:     sc.kgrid()
-def phase_jobs(phases, extra=None):
+def phase_jobs(phases, steps, extra=None):
     jobs = []
     for name, atoms, o in phases:
         mol = bool(o.get("molecule"))
         job = {"name": name, "atoms": atoms, "kind": "geom", "fix_cell": mol,
-               "symmetry": not mol, "overrides": dict(HOST_OVERRIDES, **(extra or {}),
-                                                      **o["overrides"])}
+               "symmetry": not mol, "overrides": dict(HOST_OVERRIDES, geom_max_iter=steps,
+                                                      **(extra or {}), **o["overrides"])}
         if mol:
             job["kgrid"] = [1, 1, 1]
         elif o.get("kspacing"):
@@ -3669,7 +3671,8 @@ def step_ref_phases(p):
         die("a competing phase can't be called 'host' (A3.1 runs the host under that name)")
     extra = screen_bulk(p)
     jobs = [{"name": "host", "atoms": host, "kind": "sp", "symmetry": True,
-             "overrides": dict(HOST_OVERRIDES, **extra)}] + phase_jobs(phases, extra)
+             "overrides": dict(HOST_OVERRIDES, **extra)}]
+    jobs += phase_jobs(phases, p.s.phases_max_steps, extra)
     res = p.batch("A_host/jobs/ref_phases", jobs, "ref_phases", p.production_param(),
                   spacing=p.kspacing())
     if not res["complete"]:
@@ -5236,8 +5239,9 @@ def step_dopant_phases(p):
               and set(x[1].get_chemical_symbols()) - own]   # compounds with a dopant
     out, rows = {}, []
     if phases:
-        res = p.batch("C_screen/jobs/dopant_phases", phase_jobs(phases, screen_bulk(p)),
-                      "dopant_phases", p.production_param(), spacing=p.kspacing())
+        res = p.batch("C_screen/jobs/dopant_phases",
+                      phase_jobs(phases, p.s.phases_max_steps, screen_bulk(p)), "dopant_phases",
+                      p.production_param(), spacing=p.kspacing())
         if not res["complete"]:
             return None
         out, rows = phase_results(res, phases)
@@ -7092,8 +7096,8 @@ def step_phases(p):
     if not phases:
         return {"phases": {}, "_note": "no competing phases given, so no chemical-potential "
                 "limits (E3 then gives energies without the mu terms)"}
-    res = p.batch("E_thermo/jobs/phases", phase_jobs(phases), "phases", p.production_param(),
-                  spacing=p.kspacing())
+    res = p.batch("E_thermo/jobs/phases", phase_jobs(phases, p.s.phases_max_steps), "phases",
+                  p.production_param(), spacing=p.kspacing())
     if not res["complete"]:
         return None
     out, rows = phase_results(res, phases)
@@ -8211,8 +8215,8 @@ STEPS = [
          owns=("A_host/jobs/dielectric",)),
     Step("ref_phases", "A3.1", "reference energies at the screening settings (the host, its "
          "competing phases, the dopants' elements)", step_ref_phases,
-         keys=("phases", "phases_from", "phases_e_above_hull", "dopants", "screen_cutoff",
-               "screen_overrides", "energy"), needs=("relax",),
+         keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps", "dopants",
+               "screen_cutoff", "screen_overrides", "energy"), needs=("relax",),
          owns=("A_host/jobs/ref_phases",)),
     Step("ref_limits", "A3.2", "chemical-potential limits at the screening settings",
          step_ref_limits, keys=("dopants",), needs=("ref_phases",)),
@@ -8254,8 +8258,8 @@ STEPS = [
                               # and least formation energies (A3.2's limits)
     Step("dopant_phases", "C4", "the dopants' competing phases at the screening settings, and "
          "the defects they rule out", step_dopant_phases,
-         keys=("phases", "phases_from", "phases_e_above_hull", "max_formation_energy",
-               "screen_cutoff", "screen_overrides", "energy"),
+         keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps",
+               "max_formation_energy", "screen_cutoff", "screen_overrides", "energy"),
          needs=("filter", "ref_phases", "ref_limits", "generate", "relax"),
          owns=("C_screen/jobs/dopant_phases",)),
     Step("distort", "C5", "ShakeNBreak distortions of the survivors", step_distort,
@@ -8305,8 +8309,8 @@ STEPS = [
                "D_production/jobs/zpl", "D_production/structures/zpl")),
     # E: thermodynamics
     Step("phases", "E1.1", "relax the competing phases at the production settings", step_phases,
-         keys=("phases", "phases_from", "phases_e_above_hull", "dopants", "chemical_potentials",
-               "energy"), needs=("relaxations", "generate", "relax"),
+         keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps", "dopants",
+               "chemical_potentials", "energy"), needs=("relaxations", "generate", "relax"),
          owns=("E_thermo/jobs/phases",)),
     Step("limits", "E1.2", "chemical-potential limits", step_limits,
          keys=("chemical_potentials", "dopants"),
@@ -8392,6 +8396,8 @@ Sb2O3   Sb2O3.cell
 #  Ca2Sb2O7 or a Ca-Sb compound: phases_from : doped would find them)
 !phases_from : doped           # ...or from the Materials Project via doped (needs mp_api_key)
 !mp_api_key  : <your key>
+phases_max_steps : 100         # geometry steps for each phase's relaxation (CASTEP's own 30
+                               #   can be too few for a soft metal's cell)
 # ...or E's limits themselves (eV per atom, absolute: the same reference as your production
 # runs; C3 and C4 then compare the defects within each composition only, unless phases are given)
 !%block chemical_potentials
@@ -8448,8 +8454,12 @@ screen_spins     : triplet     # the starting spin: triplet (a doublet for an od
                                #   count) | low (0 or 1) | both (low, and low + 2)
 !screen_cutoff   : 500 eV      # a lower cut-off for screening (default: production)
 screen_max_steps : 50          # geometry steps per screening relaxation
-%block screen_overrides        # any other .param keywords for the screening runs
+%block screen_overrides        # any other .param keywords for the screening runs, and for
+                               #   A3.1's and C4's phases
 elec_energy_tol : 1e-5
+!fine_gmax : 35 1/ang          # a finer density grid, for hard ultrasoft potentials at a low
+                               #   screen_cutoff: a cell relaxation in A3.1 or C4 that keeps
+                               #   reverting, as its energy jumps when the grid changes
 %endblock screen_overrides
 !configuration_margin : 1.0 eV # C1: drop arrangements this far above the lowest of their
                                # composition by MACE energy (off unless given)
