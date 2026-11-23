@@ -1,0 +1,150 @@
+--- a/supercell_convergence.py
++++ b/supercell_convergence.py
+@@ -344,6 +344,11 @@
+ TOTAL_TIME = re.compile(r"^\s*Total time\s*=\s*([\d.]+)\s*s", re.M)
+ GEOM_STEP = re.compile(r"finished iteration\s+\d+")
+ OUT_OF_TIME = "Insufficient time for another iteration"   # CASTEP stopped at run_time
++# How long before its walltime a relaxation's run_time stops CASTEP (s; doubled after a job is
++# killed at the time limit anyway). CASTEP checks run_time before each SCF iteration, so this only
++# has to cover what that check doesn't: the job's start-up before CASTEP's clock starts, forces
++# and stress after an SCF that converges near the limit, writing the .check, and shutting down
++RUN_TIME_MARGIN = 300.0
+ # CASTEP failed to read the .check file it was asked to carry on from
+ CHECK_UNREADABLE = re.compile(r"model_continuation|model_read|wave_read|Error reading[^\n]*check",
+                               re.I)
+@@ -1325,7 +1330,7 @@
+ # Every restart appends to the same .castep; submit() records where each run starts (info['runs']).
+ # Output from before the first recorded run counts as a run too. Returns [(run, text)], oldest
+ # first, so timings and memory can be read run by run.
+-#   Called by: job_timing(), last_peak(), scf_seconds()
++#   Called by: job_timing(), last_peak()
+ def run_segments(calc):
+     """The .castep split into the job's runs, oldest first, as (run, text): every job
+     appends its output to the .castep. Output from before the first recorded run counts
+@@ -1583,7 +1588,7 @@
+     need = est * args.walltime_safety
+     if calc.kind == "geom" and not (args.max_restarts == 0
+                                     and getattr(args, "tolerate_failures", False)):
+-        need += max(900.0, 1.5 * (plan.per_scf or 0.0))     # run_time stops it this much earlier
++        need += RUN_TIME_MARGIN                     # run_time stops it this much earlier
+     secs = max(WALLTIME_MIN, math.ceil(need / 900) * 900)
+     if secs < smax:
+         plan.time, plan.secs, plan.note = slurm_time(secs), secs, f" (estimated from {ref.name})"
+@@ -1597,15 +1602,15 @@
+
+
+ # CASTEP's run_time for a job with a given walltime (s).
+-# The walltime minus a margin, so CASTEP stops cleanly between geometry steps and writes its .check
+-# before Slurm stops the job. The margin is the larger of 900 s and 1.5 x the time of one SCF (5%
+-# of the walltime while the SCF time isn't known), times a factor that restart doubles after a job
+-# is killed anyway, and never more than half the walltime.
++# The walltime minus RUN_TIME_MARGIN, so CASTEP stops cleanly (it checks run_time before each SCF
++# iteration, stopping mid-SCF if need be) and writes its .check before Slurm stops the job; the
++# continuation picks up from there. The margin is multiplied by a factor that restart doubles
++# after a job is killed anyway, and is never more than half the walltime.
+ #   Called by: finalize(), restart(), share_walltime()
+-def run_time_for(walltime, per_scf=None, factor=1.0):
+-    """CASTEP run_time (s) for a job with this walltime (s): early enough to finish the SCF
+-    under way and write the .check before the scheduler stops the job."""
+-    margin = max(900.0, 1.5 * per_scf if per_scf else 0.05 * walltime) * factor
++def run_time_for(walltime, factor=1.0):
++    """CASTEP run_time (s) for a job with this walltime (s): early enough to stop cleanly
++    and write the .check before the scheduler stops the job."""
++    margin = RUN_TIME_MARGIN * factor
+     return int(walltime - min(margin, 0.5 * walltime))
+
+
+@@ -2164,7 +2169,7 @@
+         if args.max_restarts == 0 and getattr(args, "tolerate_failures", False):
+             set_param(calc, run_time=None)      # (screening: no restart would carry it on)
+         else:
+-            set_param(calc, run_time=run_time_for(wall.secs, wall.per_scf))
++            set_param(calc, run_time=run_time_for(wall.secs))
+     info = calc.info()
+     info.update(nkpts=dr["nkpts"], ncores=ncores, mem_per_core_gb=round(mpc / 1024, 2),
+                 nelec=dr["nelec"], partition=part["name"] if part else None,
+@@ -2460,7 +2465,7 @@
+         c.save(dict(c.info(), walltime=wall))
+         if c.kind == "geom" and wall and not (args.max_restarts == 0
+                                               and getattr(args, "tolerate_failures", False)):
+-            set_param(c, run_time=run_time_for(slurm_seconds(wall), i.get("scf_seconds")))
++            set_param(c, run_time=run_time_for(slurm_seconds(wall)))
+
+
+ # Runs several planned calculations side by side on one node, as one job (pack : N).
+@@ -2868,20 +2873,6 @@
+     return atoms, len(ends), source.name
+
+
+-# Wall time per SCF in the latest run CASTEP finished, and that run's number of processes.
+-# Used to set the next run's run_time margin, scaled to its new number of processes.
+-#   Called by: restart()
+-#   Calls:     run_segments()
+-def scf_seconds(calc):
+-    """Wall time per SCF in the latest run that CASTEP finished, and the number of
+-    processes it ran on, or (None, None)."""
+-    for run, text in reversed(run_segments(calc)):
+-        tot, nscf = TOTAL_TIME.findall(text), len(re.findall(ENERGY_PATTERNS["final"], text))
+-        if tot and nscf:
+-            return float(tot[-1]) / nscf, run.get("procs") or calc.info().get("ncores")
+-    return None, None
+-
+-
+ # The dry-run output a calculation is planned from.
+ # Its own <seed>.dryrun.castep, or for a single point (kind 'defect') its relaxation's. None if
+ # there isn't one.
+@@ -2912,13 +2903,13 @@
+ #   .check it stops using .check files for that calculation;
+ # - for a single point, renames the .castep and starts again;
+ # - renames the .err files, asks for the longest walltime (add_sbatch_option), sets a new run_time
+-#   (run_time_for, scf_seconds; the margin doubles if the job was killed), counts the restart in
++#   (run_time_for; the margin doubles if the job was killed), counts the restart in
+ #   job_info.json and resubmits the job (submit).
+ #   Called by: handle_failure()
+ #   Calls:     Calc.err_files(), Calc.run_text(), add_sbatch_option(), calibrate(), cell_options(),
+ #              file_size(), finalize(), killed_at_time_limit(), last_geometry(), planning_dryrun(),
+-#              run_time_for(), sbatch_value(), scf_seconds(), set_param(), slurm_seconds(),
+-#              submit(), write_cell()
++#              run_time_for(), sbatch_value(), set_param(), slurm_seconds(), submit(),
++#              write_cell()
+ def restart(calc, args):
+     """Resubmit a job that stopped before the end, when it can carry on:
+      - CASTEP stopped itself at run_time: a relaxation carries on from its .check file
+@@ -2966,7 +2957,6 @@
+                  and not info.get("no_continuation"))
+     nscf = len(re.findall(ENERGY_PATTERNS["final"], seg))
+     progress = unreadable or (geom and (bool(GEOM_STEP.search(seg)) or nscf > 1))
+-    per_scf, scf_procs = scf_seconds(calc)
+     old_procs = (info.get("runs") or [{}])[-1].get("procs") or info.get("ncores")
+     old_layout = [info.get(k) for k in ("nodes", "tasks_per_node", "ncores", "cpus_per_task",
+                                         "partition")]
+@@ -3033,9 +3023,7 @@
+         if use_check:                              # CASTEP takes continuation or reuse, not both
+             new["reuse"] = None
+         if smax:
+-            if per_scf and scf_procs and new_procs:
+-                per_scf *= scf_procs / new_procs
+-            new["run_time"] = run_time_for(smax, per_scf or info.get("scf_seconds"), margin)
++            new["run_time"] = run_time_for(smax, margin)
+         set_param(calc, **new)
+     info.update(restarts=n + 1, walltime=tmax, margin_factor=margin)
+     calc.save(info)
+--- a/README_supercell_convergence.md
++++ b/README_supercell_convergence.md
+@@ -358,9 +358,13 @@
+
+ ### Clean stops
+
+-Each relaxation gets CASTEP's `run_time` a margin below its walltime: at least 15 minutes, or
+-1.5 × one SCF if longer. CASTEP then stops between geometry steps and writes its `.check`
+-before Slurm would kill it.
++Each relaxation gets CASTEP's `run_time` 5 minutes below its walltime (`RUN_TIME_MARGIN`).
++CASTEP checks `run_time` before each SCF iteration and stops, mid-SCF if need be, when the
++next one won't fit; it then writes its `.check` before Slurm would kill the job, and the
++continuation carries on from there. The 5 minutes cover what CASTEP's own check doesn't: the
++job's start-up before CASTEP's clock starts, forces and stress after an SCF that converges near
++the limit, writing the `.check`, and shutting down. A job killed at the limit anyway gets twice
++the margin on each restart (at most half the walltime).
+
+ ### Automatic restarts (`max_restarts`, default 10)
+
