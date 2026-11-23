@@ -26,7 +26,8 @@ param     : CaO.param          # production settings (functional, cut-off, ...);
 !   1 -1  1
 !   1  1 -1
 !%endblock transform
-mace         : true            # MACE for the size scan (B2) and the pre-relaxations (C1)
+mace         : true            # MACE for the size scan (B2), the pre-relaxations (C1) and the
+                               #   distortions' search (C4); false: C5 relaxes the distortions
 mace_model  : mace-matpes-pbe-0    # a mace_mp foundation model, or your own .model file
 # ======================================================================= A: host
 converge : true                # A1: converge the cut-off and k-point spacing first
@@ -44,7 +45,9 @@ converge_tol	   : 0.001 eV/atom
 dielectric_param   : CaO_ncp.param   # its own .param (NCP cut-off, fix_occupancy : true)
 dielectric_cell    : CaO_ncp.cell    # its own .cell (species_pot: NCP)
 !dielectric        : 11.95     # static (electronic + ionic): skips the DFPT run
-# Competing phases for the chemical-potential limits (A3): your own structure files...
+# Competing phases for the chemical potentials: A3.1 runs the host's and the dopants' elements at
+# the screening settings (for C3), and E1.1 all of them, compounds too, for the dopants that
+# reach D, at the production settings (for E3). Your own structure files...
 # (%block phases wins over phases_from, so it stays off here: doped finds them for all 33)
 !%block phases
 !Ca      Ca.cell       metal  smearing_width=0.1  kspacing=0.03
@@ -55,9 +58,14 @@ dielectric_cell    : CaO_ncp.cell    # its own .cell (species_pot: NCP)
 #  Ca2Sb2O7 or a Ca-Sb compound: phases_from : doped would find them)
 phases_from : doped            # ...or from the Materials Project via doped: every phase that
                                #   limits the host or a dopant, within phases_e_above_hull
-!mp_api_key  : <your key>      # your Materials Project key, or leave it in pymatgen's own
+mp_api_key  : EpYJUYhUESi4O4bM3iP44iS7nJEcJMcg      # your Materials Project key, or leave it in pymatgen's own
                                #   settings (PMG_MAPI_KEY in ~/.config/.pmgrc.yaml)
-# ...or the limits themselves (eV per atom, absolute: the same reference as your CASTEP runs)
+phases_max_steps : 100         # geometry steps for each phase's relaxation (CASTEP's own 30
+                               #   can be too few for a soft metal's cell)
+phases_molecule_box : 15 ang   # the box for doped's molecules (H2, N2, O2, F2, Cl2): doped's
+                               #   own 30 A has eight times the volume (default: 15 A)
+# ...or E's limits themselves (eV per atom, absolute: the same reference as your production
+# runs; C3 then compares the defects within each composition only, unless phases are given)
 !%block chemical_potentials
 !O-rich   Ca=-1008.6  O=-432.6  Sb=-505.1
 !O-poor   Ca=-1002.0  O=-439.2  Sb=-503.0
@@ -94,7 +102,7 @@ scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this
 # B3: the screening cell is the smallest size that holds every candidate (B2) and is at least
 # the Gamma-only floor, estimated from the band edges' effective masses (A2.2) for the
 # shallowest deep level (deep_level_margin, below).
-screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate
+!screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate
 !supercell : 14 ang            # fix the screening cell (a length, or n: n x transform)
 # B4: the electronic cell, where the survivors go after C3 (C4 to F, all but the optional C8):
 # the smallest size at least as big as the screening cell that folds every band-edge k-point
@@ -109,12 +117,17 @@ screen_spins     : triplet     # the starting spin: triplet (a doublet for an od
                                #   count) | low (0 or 1) | both (low, and low + 2)
 screen_cutoff   : 500 eV      # a lower cut-off for screening (default: production)
 screen_max_steps : 50          # geometry steps per screening relaxation
-%block screen_overrides        # any other .param keywords for the screening runs
+%block screen_overrides        # any other .param keywords for the screening runs, and for
+fine_gmax        : 35 1/Ang                               #   A3.1's phases
 elec_energy_tol : 1e-5
+fine_gmax : 35 1/ang           # a finer density grid (the default is 20 1/ang at 500 eV): Be's
+                               #   and CaO2's energies jumped as the grid changed
 %endblock screen_overrides
 configuration_margin : 1.0 eV # C1: drop arrangements this far above the lowest of their
                                # composition by MACE energy (off unless given)
 hull_margin   : 0.2 eV         # C3: keep arrangements within this of the defect hull
+site_margin   : 0.5 eV         # C3: drop a defect this far above the lowest one with the
+                               #   same dopant atoms at every growth condition and Fermi level
 require_gap_states : none      # none | occupied | empty | both (filled and empty levels)
 require_spin  : 2              # a triplet ground state in a stable charge state (or one in a
                                #   band carried on, pending): what the screen is for
@@ -122,17 +135,20 @@ require_bound : false          # bound against its isolated components
 level_margin  : 0.1 eV         # gap levels lie further inside the band edges than this;
                                #   anything nearer or past them is in a band, and a run that
                                #   leaves an electron or hole there isn't judged in C3
-distortions   : -0.4 -0.2 0.2 0.4  # C4: ShakeNBreak's bond distortions (was -0.6 to 0.6 by
-                               #   0.1: C5 found every lowest structure with these four, and
-                               #   half the +-0.6 runs failed or didn't finish relaxing)
+!distortions  : -0.4 -0.2 0.2 0.4  # C4: ShakeNBreak's bond distortions (default: its own,
+                               #   -0.6 to 0.6 in steps of 0.1), each charge state's with its own
+                               #   number of neighbours, all relaxed with MACE and pooled (with
+                               #   mace : false, these four by default, each relaxed in C5)
+distort_starts  : 2            # C5: the lowest distinct MACE minima each charge state is relaxed
+                               #   from in CASTEP, beside its screened structure
 distort_charges : relevant     # C3: the charge states carried on: relevant (the stable ones,
                                #   bound ones within charge_margin of stable, and band states
                                #   with a shallow carrier on the defect) | stable (the stable
                                #   ones, plus any in a band) | screened (every one)
 charge_margin : 0.5 eV         #   a distortion may lower a charge state about this much
                                #   (C5: 0.34 eV for q = 0)
-!carrier_reach    : 1.0 eV     #   a band state's carrier at most this far inside its band ...
-!carrier_fraction : 0.2        #   ... and spread over at most this fraction of the cell's atoms
+carrier_reach    : 1.0 eV     #   a band state's carrier at most this far inside its band ...
+carrier_fraction : 0.2        #   ... and spread over at most this fraction of the cell's atoms
 distort_around  : auto         # auto: a single defect's site, a nearest-neighbour complex's
                                #   centre, else each component in turn | centre | each |
                                #   anchor (the first component, e.g. the dopant) | vacancy
@@ -144,10 +160,10 @@ distort_cell    : electronic   # where everything after C3 works: electronic (B4
 !O  -2
 !Sb +3
 !%endblock oxidation_states
-# C6: the ground states: C5's relaxations, with a winning distortion tried in the other charge
+# C6: the ground states: C5's relaxations, with a winning structure tried in the other charge
 # states.
-distortion_min_gain : 0.05 eV  # a distortion counts if it beats the unperturbed by this
-share_rounds    : 2            # rounds of sharing distortions
+distortion_min_gain : 0.05 eV  # a structure counts if it beats the screened one by this
+share_rounds    : 2            # rounds of sharing winning structures between charge states
 keep_structures : 1            # per charge state, on to C7
 # C7: in the electronic cell, at the screening settings. Each charge state's ground state is
 # relaxed: a triplet (spin within spin_tol of excite_spin) goes on, a band state is left
@@ -203,18 +219,18 @@ freeze_radius : 0              # (untested idea) fix the atoms further than this
                                #   every component of the defect, in D1
 # ======================================================================= E: thermodynamics
 charge_correction : lz         # lz | mp | none
-gap : 7.09 eV                  # band gap for the Fermi-level range of C3, E2 and E3 (default:
+gap : 7.09 eV                  # band gap for the Fermi-level range of C3, E3 and E4 (default:
                                #   the screening cell's in C3, A2.2's in E): CaO's measured one
 !fermi_temperature  : 1000 K   # self-consistent Fermi level at this temperature
 !quench_temperature : 300 K    # ... with the defects frozen in, then at this one
-deep_level_margin : 0.5 eV     # E3: a level this far from both band edges is "deep" (B3's
+deep_level_margin : 0.5 eV     # E4: a level this far from both band edges is "deep" (B3's
                                #   Gamma-only floor is for a level this deep)
-# E2 finds the Fermi level of each set of dopants on its own (the native defects alone, with
-# each dopant, and with each mix that one defect brings), and E3 sends on to F each excitation
+# E3 finds the Fermi level of each set of dopants on its own (the native defects alone, with
+# each dopant, and with each mix that one defect brings), and E4 sends on to F each excitation
 # that passed D2 whose charge state is the lowest for some Fermi level in the gap.
 
 # ======================================================================= F: lineshapes
-# F1: the 1D configuration-coordinate diagram of each excitation E3 sends on: ground-state and
+# F1: the 1D configuration-coordinate diagram of each excitation E4 sends on: ground-state and
 # ΔSCF single points along the line from the relaxed ground state (0) to the relaxed excited
 # state (1), at D2's settings; parabolas give each state's phonon energy and Huang-Rhys factor,
 # and the 1D luminescence lineshape.

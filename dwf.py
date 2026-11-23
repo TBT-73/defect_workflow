@@ -18,14 +18,14 @@ or --until STEP to stop after a step or phase.
 
   A  host            A1 converge, A2.1 relax, A2.2 bands, A2.3 dielectric, A3.1 ref_phases,
                      A3.2 ref_limits (reference energies at the screening settings: the host,
-                     its competing phases, the dopants' elements)
+                     and the pure elements of the host and the dopants)
   B  candidates      B1 generate, B2 scan (the supercell sizes, and MACE on every candidate),
                      B3 choose (the screening cell), B4 electronic (the electronic cell, from
-                     C5 on: every band-edge valley folded onto Gamma)
-  C  screening,      C1 prerelax (MACE), C2 screen, C3 filter, in the screening cell, and C4
-     ground and      dopant_phases (the competing phases of the dopants C3 kept); then C5
-     excited states  distort (ShakeNBreak), C6 drelax, C7 rank, C8 excite (triplets, localised
-                     levels, ΔSCF), in the electronic cell; C9 validate (optional finite-size
+                     C4 on: every band-edge valley folded onto Gamma)
+  C  screening,      C1 prerelax (MACE), C2 screen, C3 filter, in the screening cell; then C4
+     ground and      distort (ShakeNBreak's distortions relaxed with MACE, the lowest kept), C5
+     excited states  drelax (CASTEP from those), C6 rank, C7 excite (triplets, localised
+                     levels, ΔSCF), in the electronic cell; C8 validate (optional finite-size
                      test)
   D  production      D1 relaxations, D2 zpl (production ΔSCF), in the electronic cell
   E  thermodynamics  E1.1 phases, E1.2 limits (the competing phases of the host and of the
@@ -51,7 +51,7 @@ time. Change a setting and the steps that use it, and the steps after them, run 
 jobs whose inputs did not change are reused, and a job that already ran with other inputs
 stops the script, so results from two sets of settings never mix (--redo STEP starts a step
 again from scratch). A work directory made by a dwf.py from when phase D held the ground and
-excited states (D1-D5's model, then D6 rank, D7 excite and D8 validate, now C7-C9; E, F and G
+excited states (D1-D5's model, then D6 rank, D7 excite and D8 validate, now C6-C8; E, F and G
 were production, thermodynamics and lineshapes) is brought up to date, its results kept, with
 --migrate.
 
@@ -60,13 +60,14 @@ directory, and the one that came with this script: it checks), which runs the st
 script builds. Its runner settings (jobscript,
 partitions, cores_per_node, charging, max_cores or max_nodes, max_walltime, ...) go in NAME.run,
 for every step; %block runner_host, runner_screen and runner_production change them for phase
-A's steps and the competing phases (A3.1, C4, E1.1), the defects' steps at the screening
+A's steps and the competing phases (A3.1, E1.1), the defects' steps at the screening
 settings, or those at the production settings, and %block runner_<step> for one step (e.g.
-runner_converge, runner_excite). The MACE relaxations (B2, C1) run where this script runs,
-or, with mace_jobscript, as jobs on compute nodes (each job runs this script as a worker: python3
-dwf.py --mace-worker <tasks>.json); %block runner_scan and runner_prerelax give B2's and C1's
-MACE jobs settings of their own. F2's model training and phonons (python3 dwf.py
---phonon-worker spec.json) run here, or as jobs with model_jobscript.
+runner_converge, runner_excite). The MACE relaxations (B2, C1, C4) run where this script
+runs, or, with mace_jobscript, as jobs on compute nodes (each job runs this script as a worker:
+python3 dwf.py --mace-worker <tasks>.json); %block runner_scan, runner_prerelax and
+runner_distort give B2's, C1's and C4's MACE jobs settings of their own. F2's model training
+and phonons (python3 dwf.py --phonon-worker spec.json) run here, or as jobs with
+model_jobscript.
 """
 
 import argparse
@@ -142,7 +143,7 @@ PHASE_TITLES = {"A": "host", "B": "candidate defects, the screening and electron
                 "D": "production ground and excited states", "E": "thermodynamics",
                 "F": "optical lineshapes"}
 # Work directories made while phase D held the ground and excited states (D1-D5's ground-state
-# model, D6 rank, D7 excite and D8 validate, now C7-C9; production, thermodynamics and lineshapes
+# model, D6 rank, D7 excite and D8 validate, now C6-C8; production, thermodynamics and lineshapes
 # were phases E, F and G): the phase folders that were renamed, the folder that held D6-D8, what
 # they kept there, and the steps that are gone (--migrate, migrate_workdir)
 OLD_PHASE_DIRS = {"E_production": "D_production", "F_thermo": "E_thermo",
@@ -152,6 +153,10 @@ OLD_D_PATHS = ("jobs/share_*", "jobs/excite_relax", "jobs/excite_gs", "jobs/exci
                "jobs/validate", "jobs/validate_gamma", "structures/share",
                "structures/excite_relax", "structures/excite", "structures/validate")
 OLD_STEPS = ("dataset", "hybrid", "train", "check", "search")
+# Steps removed since that a work directory of the current layout may have run (C4
+# dopant_phases, the dopants' compounds, 19-23 Nov 2026): their records leave state.json and
+# their results their phase's results.json when the project is opened; their folders stay.
+GONE_STEPS = {"dopant_phases": "C"}
 HB2M = 3.80998                                # hbar^2 / (2 m_e), eV Ang^2
 GPA_A3 = 6.241509e-3                          # eV in 1 GPa Ang^3
 # B2: the atoms at a supercell's edge, whose MACE displacements show whether a defect's strain
@@ -163,21 +168,29 @@ SCAN_CONFIRM = 3
 # C2: a Gamma-point gap of the screening cell this much above A2.2's means band edges that don't
 # fold onto Gamma (eV)
 FOLD_GAP_TOL = 0.05
-# C2-C7: a screening run with at least this many electrons in the conduction band (or holes in the
+# C2-C6: a screening run with at least this many electrons in the conduction band (or holes in the
 # valence band) left them there instead of in defect levels: a band state, not a bound one
 BAND_CARRIER = 0.5
-# C5 (distort_around : auto): a complex whose components are all within this many host bond
+# C4 (distort_around : auto): a complex whose components are all within this many host bond
 # lengths of each other is distorted around its centre; one more spread out, around each component
 PAIR_BOND_FACTOR = 1.25
-# C5: an atom this close to a complex's centre (Ang) is the centre the distortions are made around
+# C4: an atom this close to a complex's centre (Ang) is the centre the distortions are made around
 CENTRE_ATOM_TOL = 0.5
-# C8: two relaxations of a defect (in different cells, or before and after C8 relaxes it) are in the
+# C7: two relaxations of a defect (in different cells, or before and after C7 relaxes it) are in the
 # same basin if no atom near the defect is displaced from its site by more than this differently
 # (Ang)
 BASIN_TOL = 0.2
-# C6's ranking: two relaxations are compared for being the same structure only when their energies
+# C5's ranking: two relaxations are compared for being the same structure only when their energies
 # are within this (eV); further apart, they are different minima
 RANK_E_TOL = 0.05
+# C4's table: each defect's lowest this many distinct MACE minima are listed (more if
+# distort_starts keeps more)
+MACE_TABLE_MINIMA = 5
+# C4 without MACE (mace : false): the distortions C5 relaxes in CASTEP, each in its own charge
+# state, when the project gives none. ShakeNBreak's full set, the default with MACE (which relaxes
+# them for little), would cost three times as much there; these four found the lowest structure
+# of every charge state of CaO:Sb that the full set found
+CASTEP_DISTORTIONS = (-0.4, -0.2, 0.2, 0.4)
 # F2: the structures left out of its model's training data (more than MODEL_E_WINDOW eV above the
 # lowest of their charge state, atoms closer than MODEL_MIN_DIST Ang, a force above MODEL_MAX_FORCE
 # eV/Ang), the share kept for testing, the random seed; the total charge's embedding (classes from
@@ -189,7 +202,7 @@ CHARGE_OFFSET, CHARGE_CLASSES = 10, 21
 # a multi-head model's heads, a total charge, fmax, steps), in this order (mace_key's,
 # mace_relax's)
 EXTRA_TASK_KEYS = ("model", "head", "charge", "fmax", "steps")
-# C8, D2: the smallest Kohn-Sham step taken as an excitation (it skips a degenerate partner level),
+# C7, D2: the smallest Kohn-Sham step taken as an excitation (it skips a degenerate partner level),
 # eV; and a mode's energy from a curvature, hbar sqrt(eV / (amu Ang^2)), in eV
 KS_STEP_MIN = 0.1
 HW_UNIT = 0.0646541
@@ -318,10 +331,12 @@ PROJECT_KEYWORDS = {
     "screen_overrides": ("kv", {}),
     "configuration_margin": (sc._num("eV"), None),
     "hull_margin": (sc._num("eV"), 0.2), "level_margin": (sc._num("eV"), 0.1),
-    "site_margin": (sc._num("eV"), 0.5), "max_formation_energy": (sc._num("eV"), 2.0),
+    "site_margin": (sc._num("eV"), 0.5),
     "require_bound": (_b, False), "require_spin": (sc._num(), None),
     "require_gap_states": (sc._choice("none", "occupied", "empty", "both"), "none"),
-    "distortions": (_floats(), [-0.4, -0.2, 0.2, 0.4]),
+    "distortions": (_floats(), [-0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0.1, 0.2, 0.3, 0.4, 0.5,
+                                0.6]),
+    "distort_starts": (sc._num(cast=int), 2),
     "distort_charges": (sc._choice("relevant", "stable", "screened"), "relevant"),
     "charge_margin": (sc._num("eV"), 0.5), "carrier_reach": (sc._num("eV"), 1.0),
     "carrier_fraction": (sc._num(), 0.2),
@@ -370,10 +385,10 @@ LIST_KEYS = {"transform", "converge_cutoffs", "dopants", "scan_lengths", "screen
 RUN_PROJECT_KEYS = {"workdir", "mace_jobscript", "mace_pack", "mace_max_jobs", "mace_python",
                     "mace_threads", "mace_device", "model_jobscript", "model_command",
                     "model_device"}
-# The steps whose MACE relaxations may have settings of their own, in %block runner_scan (B2) or
-# runner_prerelax (C1) in NAME.run, and the keywords such a block may hold: the MACE job settings
-# and max_walltime, the jobs' --time (Project.mace_settings)
-MACE_STEPS = ("scan", "prerelax")
+# The steps whose MACE relaxations may have settings of their own, in %block runner_scan (B2),
+# runner_prerelax (C1) or runner_distort (C4) in NAME.run, and the keywords such a block may hold:
+# the MACE job settings and max_walltime, the jobs' --time (Project.mace_settings)
+MACE_STEPS = ("scan", "prerelax", "distort")
 MACE_BLOCK_KEYS = ("mace_jobscript", "mace_pack", "mace_max_jobs", "mace_threads", "mace_python",
                    "mace_device", "max_walltime")
 # supercell_convergence keywords that control how jobs run (allowed in the project file, for every
@@ -389,13 +404,13 @@ RUNNER_KEYS = {"jobscript", "dryrun_jobscript", "partitions", "max_cores", "core
 # The steps that run CASTEP jobs, and the group of steps each belongs to. The runner settings of a
 # step: the project's, changed by its group's defaults (GROUP_DEFAULTS), then by %block
 # runner_<group>, then by %block runner_<step> (Project.runner_items). host is for phase A's
-# steps and the competing phases wherever they run (A3.1, C4, E1.1: small cells, which stop the
+# steps and the competing phases wherever they run (A3.1, E1.1: small cells, which stop the
 # step if one fails). screen is both a step and a group: runner_screen is for every defect step
-# at the screening settings (C2, C3's single points, C6, C7, C8), and runner_filter,
+# at the screening settings (C2, C3's single points, C5, C6, C7), and runner_filter,
 # runner_drelax, runner_rank or runner_excite changes it for one of them; runner_production is
-# for every step at the production settings (C9, D1, D2, F1, F2's single points).
+# for every step at the production settings (C8, D1, D2, F1, F2's single points).
 RUNNER_STEPS = {"converge": "host", "relax": "host", "bands": "host", "dielectric": "host",
-                "ref_phases": "host", "dopant_phases": "host", "phases": "host",
+                "ref_phases": "host", "phases": "host",
                 "screen": "screen", "filter": "screen", "drelax": "screen",
                 "rank": "screen", "excite": "screen", "validate": "production",
                 "relaxations": "production", "zpl": "production", "ccd": "production",
@@ -450,20 +465,24 @@ _NO_C2B = ("has been removed, with step C2b (the Gamma-only check of the screeni
 _NO_C2C = "has been removed, with step C2c (the size check of the screening cell)"
 _NO_SERIES = ("has been removed with the CASTEP size series of one defect (the old B3): B2 now "
               "scans every candidate with MACE, and the survivors run in the electronic cell "
-              "(B4) from C5 on")
+              "(B4) from C4 on")
 _NO_E0 = ("has been removed with E0's size series: every defect now runs in the electronic cell "
-          "(B4), and C9 (validate : true) tests its finite-size error on a few defects")
+          "(B4), and C8 (validate : true) tests its finite-size error on a few defects")
 _NO_E2 = ("has been removed with the old E2: F2 (lineshape : true) trains its own model on the "
           "production runs")
-_NO_MODEL = ("has been removed, with D1-D5 (the ground-state model): C7 ranks C6's "
+_NO_MODEL = ("has been removed, with D1-D5 (the ground-state model): C6 ranks C5's "
              "relaxations, with sharing between charge states")
 RETIRED = {"series_tol": _NO_E0, "runner_cells": _NO_E0, "finetune": _NO_E2,
+           "max_formation_energy": "has been removed: C3 no longer drops a defect on its absolute "
+                                   "formation energy, which could drop every defect of a dopant "
+                                   "(site_margin still compares a dopant's defects across "
+                                   "their sites)",
            "finetune_args": _NO_E2, "runner_finetune": _NO_E2,
            "triage": "has been renamed: use configuration_margin (in eV; giving it switches the "
                      "filter on)",
            "triage_window": "has been renamed: use configuration_margin (in eV; giving it switches "
                             "the filter on)",
-           "zpl_window": "has been removed, with step C3b and its Kohn-Sham ZPL estimate: C8 "
+           "zpl_window": "has been removed, with step C3b and its Kohn-Sham ZPL estimate: C7 "
                          "filters on the ΔSCF ZPL instead (excite : true, excite_window)",
            "series_defect": _NO_SERIES,
            "series_charge": _NO_SERIES + " (in every charge state the defect reaches D in)",
@@ -481,7 +500,7 @@ RETIRED = {"series_tol": _NO_E0, "runner_cells": _NO_E0, "finetune": _NO_E2,
            "runner_dispersion": _NO_C2B,
            "size_check": _NO_C2C, "size_check_window": _NO_C2C, "size_check_max": _NO_C2C,
            "size_check_defects": _NO_C2C, "size_check_cell": _NO_C2C, "runner_sizecheck": _NO_C2C,
-           "band_state_cell": "has been replaced by distort_cell: C5 and C6 work in the electronic "
+           "band_state_cell": "has been replaced by distort_cell: C4 and C5 work in the electronic "
                               "cell for every charge state of every survivor (distort_cell : "
                               "electronic, the default), band states included",
            "model_hybrid_fraction": _NO_MODEL, "runner_hybrid": _NO_MODEL,
@@ -493,7 +512,8 @@ RETIRED = {"series_tol": _NO_E0, "runner_cells": _NO_E0, "finetune": _NO_E2,
                                      "search_steps", "search_keep")}}
 
 
-# The settings of a MACE step's own block (%block runner_scan or runner_prerelax, it: the parsed
+# The settings of a MACE step's own block (%block runner_scan, runner_prerelax or runner_distort,
+# it: the parsed
 # block; name: the file, for messages): the MACE job keywords it gives (MACE_BLOCK_KEYS), each
 # converted as the .run file's own, and max_walltime. Returns {keyword: value}.
 #   Called by: read_project()
@@ -527,12 +547,12 @@ def mace_block(it, name):
 # keywords, PROJECT_KEYWORDS, but those of RUN_PROJECT_KEYS), and run_path, NAME.run (how the jobs
 # run: the runner keywords, RUNNER_KEYS, passed to supercell_convergence.batch_args, the
 # RUN_PROJECT_KEYS and the runner blocks). %block runner_<group> or runner_<step> (RUNNER_BLOCKS)
-# holds runner keywords, and may hold a %block partitions, for a group of steps or one step;
-# %block runner_scan or runner_prerelax (MACE_STEPS) holds B2's or C1's MACE job settings
-# (mace_block). A keyword in the wrong file stops with where it goes; a typo gets the closest
-# keyword suggested, and a retired one (RETIRED) what to do. Returns (settings, the text each
-# setting was given as, the runner items, {group or step: runner items}, {MACE step: its block's
-# settings}).
+# holds runner keywords, and may hold a %block partitions, for a group of steps or one step; %block
+# runner_scan, runner_prerelax or runner_distort (MACE_STEPS) holds B2's, C1's or C4's MACE job
+# settings (mace_block). A keyword in the wrong file stops with where it goes; a typo gets the
+# closest keyword suggested, and a retired one (RETIRED) what to do. Without MACE (mace : false),
+# distortions not given are CASTEP_DISTORTIONS. Returns (settings, the text each setting was given
+# as, the runner items, {group or step: runner items}, {MACE step: its block's settings}).
 #   Called by: Project.__init__()
 #   Calls:     compliance(), item_key(), kgrid_list(), mace_block(), sc.block_rows(),
 #              sc.parse_castep_input()
@@ -549,11 +569,12 @@ def read_project(path, run_path):
             die(f"{name}: '{key}' {RETIRED[key]}")
         if key.startswith("runner_") and key not in known:
             die(f"{name}: there is no {key}: the runner blocks are runner_host (all of phase A's "
-                "CASTEP steps, and the competing phases of C4 and E1.1), runner_screen (C2, C3, "
-                "C6, C7, C8: the screening settings), "
-                "runner_production (C9, D1, D2, F1, F2: the production settings), for one step "
+                "CASTEP steps, and the competing phases of E1.1), runner_screen (C2, C3, "
+                "C5, C6, C7: the screening settings), "
+                "runner_production (C8, D1, D2, F1, F2: the production settings), for one step "
                 + ", ".join(f"runner_{s}" for s in RUNNER_STEPS if s not in RUNNER_GROUPS)
-                + ", and for the MACE jobs of B2 or C1 runner_scan or runner_prerelax")
+                + ", and for the MACE jobs of B2, C1 or C4 runner_scan, runner_prerelax or "
+                "runner_distort")
         if key not in known:
             close = difflib.get_close_matches(key, sorted(known), n=1)
             die(f"{name}: unknown keyword '{key}'" + (f" - did you mean '{close[0]}'?" if close
@@ -654,6 +675,10 @@ def read_project(path, run_path):
     for key in ("charge_margin", "carrier_reach"):
         if getattr(s, key) < 0:
             die(f"{name}: {key} can't be negative")
+    if s.distort_starts < 1:
+        die(f"{name}: distort_starts is how many MACE minima C5 starts from: 1 or more")
+    if not s.mace and "distortions" not in vals:   # C5 relaxes each one in CASTEP
+        s.distortions = list(CASTEP_DISTORTIONS)
     if s.phases_molecule_box <= 0:
         die(f"{name}: phases_molecule_box, the side of the molecules' box, must be above 0")
     if not 0 < s.carrier_fraction <= 1:
@@ -671,7 +696,7 @@ def read_project(path, run_path):
     if s.lineshape_temperature < 0 or s.lineshape_displacements < 0 or s.lineshape_host < 0:
         die(f"{name}: lineshape_temperature, lineshape_displacements and lineshape_host can't be "
             "negative")
-    compliance(s.elastic_constants)                # a bad block stops now, not at C9
+    compliance(s.elastic_constants)                # a bad block stops now, not at C8
     return s, raw, runner, blocks, mace_blocks
 
 
@@ -683,10 +708,11 @@ class Project:
     # earlier runs, and checks the runner settings of every step now (rather than when the step
     # starts, perhaps days later), and each MACE step's job template, and that its workers fit on
     # a node. Stops if the work directory has the phase folders of an older dwf.py (old_layout),
-    # unless this is --migrate.
+    # unless this is --migrate; drops the records of steps since removed (GONE_STEPS).
     #   Called by: main()
     #   Calls:     Project.mace_runner(), Project.mace_settings(), Project.mace_template(),
-    #              Project.runner(), old_layout(), read_project()
+    #              Project.runner(), Project.save_state(), old_layout(), read_project(),
+    #              write_json()
     def __init__(self, path, cl):
         self.path, self.base, self.cl = path, path.parent, cl
         self.run_path = path.with_name(path.stem + ".run")
@@ -711,13 +737,25 @@ class Project:
         self.state_file = self.dir / STATE
         self.state = (json.loads(self.state_file.read_text()) if self.state_file.exists()
                       else {"steps": {}})
+        gone = [s for s in GONE_STEPS if s in self.state["steps"]]
+        for s in gone:                       # steps this dwf.py no longer has
+            del self.state["steps"][s]
+            res = self.dir / PHASE_DIRS[GONE_STEPS[s]] / RESULTS
+            if res.is_file():
+                saved = json.loads(res.read_text())
+                if saved.pop(s, None) is not None:
+                    write_json(res, saved)
+        if gone:
+            self.save_state()
+            log("dropped the record of " + ", ".join(gone) + " (no longer a step: C4 is now the "
+                "distortions, searched with MACE; its folders are left as they are)")
         if old_layout(self.dir) and not getattr(cl, "migrate", False):
             die(f"{self.dir} was made by an older dwf.py, from when phase D held the ground and "
-                "excited states (D1-D5's model, D6 rank, D7 excite, D8 validate: now C7-C9) and "
+                "excited states (D1-D5's model, D6 rank, D7 excite, D8 validate: now C6-C8) and "
                 "production, thermodynamics and lineshapes were phases E, F and G. Once none of "
                 f"its jobs from D6 on are queued or running, run  python3 dwf.py {path.stem} "
-                "--migrate  to move its folders to the new layout (C7 runs again from its "
-                "finished jobs, after the steps added since); or finish it with the older dwf.py")
+                "--migrate  to move its folders to the new layout (C3 to C6 run again, after the "
+                "steps added since); or finish it with the older dwf.py")
 
     # A file named by a project keyword (relative to the project file); stops if it is missing.
     #   Called by: Project.cell_text(), Project.production_param(), inputs_hash(), step_converge(),
@@ -737,7 +775,7 @@ class Project:
         return d
 
     # Writes state.json (through a temporary file, so it is never left half written).
-    #   Called by: main(), migrate_workdir(), move_old_phases(), reset_step()
+    #   Called by: Project.__init__(), main(), migrate_workdir(), move_old_phases(), reset_step()
     #   Calls:     write_json()
     def save_state(self):
         write_json(self.state_file, self.state)
@@ -805,7 +843,7 @@ class Project:
 
     # The runner settings of a step (supercell_convergence.batch_args of its runner_items), with
     # the command-line switches. Steps with the same settings share them, as the steps of a group
-    # did before there were step blocks (so e.g. the memory model measured in C2 is used for C6's
+    # did before there were step blocks (so e.g. the memory model measured in C2 is used for C5's
     # first jobs when they run in one go).
     #   Called by: Project.__init__(), Project.batch()
     #   Calls:     Project.runner_items(), item_key(), sc.batch_args()
@@ -826,9 +864,9 @@ class Project:
     # keep_check : True keeps the jobs' .check files even with delete_check : true (for jobs that
     # later jobs start from). Returns run_batch's result ({'complete', 'jobs', 'calcs'}).
     #   Called by: run_screen_jobs(), step_bands(), step_ccd(), step_converge(), step_dielectric(),
-    #              step_dopant_phases(), step_excite(), step_filter(), step_lineshape(),
-    #              step_phases(), step_ref_phases(), step_relax(), step_relaxations(),
-    #              step_screen(), step_validate(), step_zpl(), validate_gamma()
+    #              step_excite(), step_filter(), step_lineshape(), step_phases(), step_ref_phases(),
+    #              step_relax(), step_relaxations(), step_screen(), step_validate(), step_zpl(),
+    #              validate_gamma()
     #   Calls:     Project.cell_text(), Project.runner(), sc.run_batch()
     def batch(self, subdir, jobs, step, param_text, cell_text=None, spacing=None,
               keep_check=False):
@@ -848,10 +886,9 @@ class Project:
 
     # The .param of the production settings: A1's (with the converged cut-off) once it has run,
     # else the project's .param as it is.
-    #   Called by: run_screen_jobs(), step_bands(), step_ccd(), step_dielectric(),
-    #              step_dopant_phases(), step_excite(), step_filter(), step_lineshape(),
-    #              step_phases(), step_ref_phases(), step_relax(), step_relaxations(),
-    #              step_screen(), step_validate(), step_zpl(), validate_gamma()
+    #   Called by: run_screen_jobs(), step_bands(), step_ccd(), step_dielectric(), step_excite(),
+    #              step_filter(), step_lineshape(), step_phases(), step_ref_phases(), step_relax(),
+    #              step_relaxations(), step_screen(), step_validate(), step_zpl(), validate_gamma()
     #   Calls:     Project.file(), Project.finished()
     def production_param(self):
         if self.finished("converge"):
@@ -859,9 +896,9 @@ class Project:
         return self.file("param").read_text()
 
     # The production k-point spacing (1/Ang): A1's, else kspacing, else from the host .cell's grid.
-    #   Called by: step_bands(), step_ccd(), step_converge(), step_dielectric(),
-    #              step_dopant_phases(), step_lineshape(), step_phases(), step_ref_phases(),
-    #              step_relax(), step_relaxations(), step_validate(), step_zpl()
+    #   Called by: step_bands(), step_ccd(), step_converge(), step_dielectric(), step_lineshape(),
+    #              step_phases(), step_ref_phases(), step_relax(), step_relaxations(),
+    #              step_validate(), step_zpl()
     #   Calls:     Project.cell_text(), Project.finished(), sc.parse_castep_input(),
     #              sc.read_primitive(), sc.target_spacing()
     def kspacing(self):
@@ -877,8 +914,8 @@ class Project:
     # The relaxed host primitive cell from A2.1 (ASE Atoms, from A_host/host_relaxed.cell).
     #   Called by: d1_dopants(), doped_phases(), run_screen_jobs(), screen_setup(), step_bands(),
     #              step_ccd(), step_choose(), step_corrections(), step_dielectric(),
-    #              step_dopant_phases(), step_electronic(), step_excite(), step_formation(),
-    #              step_generate(), step_interest(), step_limits(), step_lineshape(), step_phases(),
+    #              step_electronic(), step_excite(), step_formation(), step_generate(),
+    #              step_interest(), step_limits(), step_lineshape(), step_phases(),
     #              step_ref_phases(), step_relaxations(), step_scan(), step_validate(), step_zpl()
     #   Calls:     load_cell()
     def host(self):
@@ -1008,11 +1045,11 @@ class Project:
                 "the command goes")
         return value
 
-    # The settings of a MACE step's jobs (step: one of MACE_STEPS, B2 scan or C1 prerelax): the
-    # .run file's mace_jobscript, mace_pack, mace_max_jobs, mace_threads, mace_python and
-    # mace_device, each replaced by the step's own block (%block runner_scan or runner_prerelax)
-    # where it gives one, and its max_walltime (the jobs' --time; without it, the template's).
-    # Returns a namespace of MACE_BLOCK_KEYS.
+    # The settings of a MACE step's jobs (step: one of MACE_STEPS, B2 scan, C1 prerelax or C4
+    # distort): the .run file's mace_jobscript, mace_pack, mace_max_jobs, mace_threads, mace_python
+    # and mace_device, each replaced by the step's own block (%block runner_scan, runner_prerelax or
+    # runner_distort) where it gives one, and its max_walltime (the jobs' --time; without it, the
+    # template's). Returns a namespace of MACE_BLOCK_KEYS.
     #   Called by: Project.__init__(), Project.mace_template(), mace_jobs(), mace_python(),
     #              mace_relaxations()
     def mace_settings(self, step):
@@ -1263,8 +1300,8 @@ def old_layout(d):
 
 
 # --migrate: brings a work directory made while phase D held the ground and excited states
-# (old_layout) up to date, unless a step from C7 on (or one of D1-D5) is still running (its jobs
-# may be queued: it should finish with the dwf.py that started it). Moves C7's, C8's and C9's jobs
+# (old_layout) up to date, unless a step from C6 on (or one of D1-D5) is still running (its jobs
+# may be queued: it should finish with the dwf.py that started it). Moves C6's, C7's and C8's jobs
 # and structures (OLD_D_PATHS) from D_states/ to C_screen/, and their results from
 # D_states/results.json to C_screen/results.json; renames E_production/ to D_production/,
 # F_thermo/ to E_thermo/ and G_lineshape/ to F_lineshape/ (OLD_PHASE_DIRS). The paths in every
@@ -1273,10 +1310,10 @@ def old_layout(d):
 # updated, and every phase's summary.txt is written again. D_states/ keeps what D1-D5 made, which
 # nothing reads any more. The competing phases at the production settings move from A_host/ to
 # E_thermo/ (move_old_phases). The checkpoints are brought up to date with the new paths. What
-# then runs again: the steps added since (A3.1, A3.2: the references at the screening settings;
-# C4: the dopants' competing phases), C3 (it cuts against them) and so C5 to C7, from their
-# finished jobs (C7 no longer waits for D5), and E1.1 and E1.2 (now only for the dopants that
-# reach D). The steps after C7 run again only if its results change.
+# then runs again: the steps added since (A3.1, A3.2: the references at the screening
+# settings), C3 (it cuts against them) and so C4 to C6 (C4 is now a search with MACE, whose
+# minima C5 relaxes too; C6 no longer waits for D5), and E1.1 and E1.2 (now only for the dopants
+# that reach D). The steps after C6 run again only if its results change.
 #   Called by: main()
 #   Calls:     Project.results(), Project.save_state(), inputs_hash(), move_old_phases(),
 #              old_layout(), outputs_hash(), write_json(), write_summary()
@@ -1339,12 +1376,13 @@ def migrate_workdir(p):
     p._results = {}
     move_old_phases(p)
 
-    # The checkpoints of C7 and the steps after it, whose results now name the new folders: which
+    # The checkpoints of C6 and the steps after it, whose results now name the new folders: which
     # were up to date (their inputs fingerprint, worked out as this dwf.py does with the earlier
     # steps' results fingerprints as they were), then each one's results fingerprint again from
     # its results as they are now, and the inputs fingerprint again of each that was up to date,
-    # so it stays so. C7 isn't (it no longer needs D5, and waits for C4): it runs again, and if it
-    # gives the same results (from its finished jobs) nothing after it does.
+    # so it stays so. C6 isn't (it no longer needs D5, and comes after C3 to C5, which run again):
+    # it runs again, and if it gives the same results (from its finished jobs) nothing after it
+    # does.
     done = [s for s in STEPS[first:] if p.state["steps"].get(s.name, {}).get("status") == "done"]
     fresh = []
     for s in done:
@@ -1418,12 +1456,12 @@ def move_old_phases(p):
 # --------------------------------------------------------------------------
 # A project's two files: --example, and --split for an older dwf.py's one
 # --------------------------------------------------------------------------
-# What an older dwf.py's step labels are now, for the comments --split keeps: C4 and C5 became C5
-# and C6 (C4 is now the dopants' competing phases), D6-D8 became C7-C9, and E, F and G became D, E
-# and F (their phase folders too), with E1-E3 now E2-E4 (E1 is the competing phases at the
-# production settings); D1-D5 were removed, and their mentions become 'old D1' and so on.
-OLD_LABELS = {"C4": "C5", "C5": "C6", "D6": "C7", "D7": "C8", "D8": "C9", "E1": "D1",
-              "E2": "D2", "F1": "E2", "F2": "E3", "F3": "E4", "G1": "F1", "G2": "F2"}
+# What an older dwf.py's step labels are now, for the comments --split keeps: C4 and C5 are
+# C4 and C5 still (distort, drelax), D6-D8 became C6-C8, and E, F and G became D, E and F
+# (their phase folders too), with E1-E3 now E2-E4 (E1 is the competing phases at the production
+# settings); D1-D5 were removed, and their mentions become 'old D1' and so on.
+OLD_LABELS = {"D6": "C6", "D7": "C7", "D8": "C8", "E1": "D1", "E2": "D2", "F1": "E2",
+              "F2": "E3", "F3": "E4", "G1": "F1", "G2": "F2"}
 OLD_PHASES = {"D": "C", "E": "D", "F": "E", "G": "F"}
 OLD_FOLDERS = {"D_states": "C_screen", **OLD_PHASE_DIRS}
 
@@ -1558,10 +1596,10 @@ def split_project(path):
     stem = path.stem
     for out, other, body in ((outs[0], outs[1], params), (outs[1], outs[0], run)):
         note = (f"Made by dwf.py --split from {path.name} ({time.strftime('%Y-%m-%d')}), whose "
-                f"other half is {other.name}. The comments' step labels are this dwf.py's: C4 "
-                "and C5 are now C5 and C6, D6-D8 are now C7-C9, phases E, F and G are now D, E "
-                "and F, and E's steps are E2-E4. D1-D5 (the ground-state model) were removed: "
-                "the comments call them old D1 to old D5.")
+                f"other half is {other.name}. The comments' step labels are this dwf.py's: "
+                "D6-D8 are now C6-C8, phases E, F and G are now D, E and F, and E's steps are "
+                "E2-E4. D1-D5 (the ground-state model) were removed: the comments call them old "
+                "D1 to old D5.")
         if dropped:
             note += (" Left out, as this dwf.py doesn't have them: " + ", ".join(dropped)
                      + f" (see {path.name}).")
@@ -2602,14 +2640,15 @@ def mace_relax(p, atoms, cache, model=None, head=None, charge=None, fmax=None, s
     return result
 
 
-# A step's MACE relaxations (mace_model; step: B2 scan or C1 prerelax, MACE_STEPS): {cache file:
-# (relaxed Atoms, energy before, energy after, steps)}, or None while MACE jobs are still queued
-# (--no-wait) or after --prepare-only. tasks: [{'atoms', 'cache', 'label'}, and optionally a
-# task's own 'model', 'head', 'charge', 'fmax', 'steps' (EXTRA_TASK_KEYS)]. A relaxation whose
-# cache file already holds it (the same structure, model and settings: mace_key) is not run
-# again. The others run as jobs on compute nodes with the step's mace_jobscript (mace_settings:
-# the .run file's, or its own block's; mace_jobs), else here, one after the other (mace_relax).
-#   Called by: step_prerelax(), step_scan()
+# A step's MACE relaxations (mace_model; step: B2 scan, C1 prerelax or C4 distort, MACE_STEPS):
+# {cache file: (relaxed Atoms, energy before, energy after, steps)}, or None while MACE jobs are
+# still queued (--no-wait) or after --prepare-only. tasks: [{'atoms', 'cache', 'label'}, and
+# optionally a task's own 'model', 'head', 'charge', 'fmax', 'steps' (EXTRA_TASK_KEYS)]. A
+# relaxation whose cache file already holds it (the same structure, model and settings: mace_key) is
+# not run again. The others run as jobs on compute nodes with the step's mace_jobscript
+# (mace_settings: the .run file's, or its own block's; mace_jobs), else here, one after the other
+# (mace_relax).
+#   Called by: step_distort(), step_prerelax(), step_scan()
 #   Calls:     Project.mace_settings(), mace_cached(), mace_jobs(), mace_key(), mace_relax()
 def mace_relaxations(p, step, tasks):
     out, todo = {}, []
@@ -2867,8 +2906,8 @@ def mace_worker(path):
 # --------------------------------------------------------------------------
 # Writes a JSON file, made readable, through a temporary file so that it is never left half
 # written (state.json, results.json).
-#   Called by: Project.save_results(), Project.save_state(), mace_jobs(), migrate_workdir(),
-#              move_old_phases(), phonon_worker(), run_training(), size_ladder()
+#   Called by: Project.__init__(), Project.save_results(), Project.save_state(), mace_jobs(),
+#              migrate_workdir(), move_old_phases(), phonon_worker(), run_training(), size_ladder()
 def write_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
@@ -2880,7 +2919,7 @@ def write_json(path, data):
 # as wide as needed (numbers to the right, text to the left). Floats are shown with 4 decimals,
 # None as blank.
 #   Called by: drelax_ranking(), ladder_table(), limits_table(), problem_table(), step_ccd(),
-#              step_choose(), step_converge(), step_corrections(), step_dopant_phases(),
+#              step_choose(), step_converge(), step_corrections(), step_distort(),
 #              step_electronic(), step_excite(), step_filter(), step_formation(), step_generate(),
 #              step_interest(), step_limits(), step_lineshape(), step_phases(), step_prerelax(),
 #              step_rank(), step_ref_phases(), step_relaxations(), step_scan(), step_validate(),
@@ -3197,16 +3236,16 @@ def step_dielectric(p):
 
 
 # --------------------------------------------------------------------------
-# A3: competing phases and chemical potentials (A3 at the screening settings for C3 and C4; the
-# same functions give E1's at the production settings)
+# A3: competing phases and chemical potentials (A3 at the screening settings for C3; the same
+# functions give E1's at the production settings)
 # --------------------------------------------------------------------------
 # The competing phases, from %block phases (name, structure file, options: molecule, metal
 # (fix_occupancy : false unless the line says otherwise), kspacing=..., anything else a .param
 # keyword) or from doped (phases_from : doped, with the Materials Project: every phase it
 # chooses for the host and each dopant, each with eah, its energy above the hull; its molecules
-# in boxes of phases_molecule_box, molecule_in_box). A3.1, C4 and E1.1 each take their part of
-# it (phases_for). Returns a list of (name, Atoms, options dict).
-#   Called by: step_dopant_phases(), step_phases(), step_ref_phases()
+# in boxes of phases_molecule_box, molecule_in_box). A3.1 and E1.1 each take their part of it
+# (phases_for). Returns a list of (name, Atoms, options dict).
+#   Called by: step_phases(), step_ref_phases()
 #   Calls:     doped_phases(), molecule_in_box(), read_structure_file(), sc.canonical_key()
 def phase_list(p):
     if p.s.phases:
@@ -3608,7 +3647,7 @@ def doped_phases(p):
 
 
 # A structure's composition, reduced: ((element, n), ...) in the order of the elements.
-#   Called by: phases_for(), step_phases(), step_ref_phases()
+#   Called by: phases_for(), step_phases()
 #   Calls:     counts()
 def reduced(atoms):
     c = counts(atoms)
@@ -3620,7 +3659,7 @@ def reduced(atoms):
 # one of the dopants given: a phase with two dopants limits neither on its own, and
 # chemical_limits leaves it out. lowest: each composition only once, the phase lowest above the
 # hull (doped's eah); a phase without one (%block phases) is always kept.
-#   Called by: step_dopant_phases(), step_phases(), step_ref_phases()
+#   Called by: step_phases(), step_ref_phases()
 #   Calls:     reduced()
 def phases_for(phases, host_el, dopants, lowest=False):
     keep = [(n, a, o) for n, a, o in phases
@@ -3637,11 +3676,11 @@ def phases_for(phases, host_el, dopants, lowest=False):
     return [x for x in keep if x[2].get("eah") is None or x[0] in chosen]
 
 
-# The .param keywords of a bulk run at the screening settings (A3.1, C4): screen_cutoff and
+# The .param keywords of a bulk run at the screening settings (A3.1): screen_cutoff and
 # %block screen_overrides, but not screen_max_steps (it is for the defects' relaxations). A cell
 # relaxed at a lower cut-off than production comes out a little off in volume (Pulay stress),
 # which changes its energy only to second order.
-#   Called by: step_dopant_phases(), step_ref_phases()
+#   Called by: step_ref_phases()
 #   Calls:     screen_overrides()
 def screen_bulk(p):
     return {k: v for k, v in screen_overrides(p).items() if k != "geom_max_iter"}
@@ -3653,7 +3692,7 @@ def screen_bulk(p):
 # can be too few for a soft metal's cell). extra: .param keywords for every one (the screening
 # settings); a phase's own (%block phases, doped's: fix_occupancy : false for a metal, the spin of
 # O2) win.
-#   Called by: step_dopant_phases(), step_phases(), step_ref_phases()
+#   Called by: step_phases(), step_ref_phases()
 #   Calls:     sc.kgrid()
 def phase_jobs(phases, steps, extra=None):
     jobs = []
@@ -3672,7 +3711,7 @@ def phase_jobs(phases, steps, extra=None):
 
 # The relaxed competing phases from a finished batch: {name: {energy, counts, natoms, molecule}}
 # and their table rows; stops if one did not finish.
-#   Called by: step_dopant_phases(), step_phases(), step_ref_phases()
+#   Called by: step_phases(), step_ref_phases()
 #   Calls:     counts()
 def phase_results(res, phases):
     out, rows = {}, []
@@ -3687,19 +3726,20 @@ def phase_results(res, phases):
     return out, rows
 
 
-# A3.1: the reference energies C3 and C4 use, at the screening settings (screen_bulk), so they
-# match C2's screening runs: the host itself, a single point of A2.1's relaxed cell (the cell the
-# defect supercells are built from), and relaxed, the host's competing phases (made of its own
-# elements) and each dopant's pure element, each composition only once (phases_for, lowest). C3
-# compares formation energies across a dopant's sites with the host's limits (the dopant's
-# chemical potential cancels) and bounds them from below with the dopants at their elements; C4
-# relaxes the dopants' compounds as well, for those C3 keeps. From %block phases, or doped
+# A3.1: the reference energies C3 uses, at the screening settings (screen_bulk), so they match
+# C2's screening runs: the host itself, a single point of A2.1's relaxed cell (the cell the defect
+# supercells are built from), and relaxed, the defects' constituents: the pure elements of the
+# host and of each dopant, each only once (phases_for, lowest). C3 compares formation energies
+# across a dopant's sites over the host's region against its elements (the dopant's chemical
+# potential cancels) and gives each defect's least formation energy with the dopants at their
+# elements (a bound from below, for its table). The compounds (the host's, e.g. CaO2 for CaO, and
+# the dopants') are run only in E1.1, at the production settings. From %block phases, or doped
 # (phases_from : doped); with neither, nothing runs and C3 compares within composition groups
 # only. The production energies E needs are E1.1's.
 #   Called by: main() (step A3.1)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              counts(), format_table(), phase_jobs(), phase_list(), phase_results(), phases_for(),
-#              reduced(), screen_bulk()
+#              screen_bulk()
 def step_ref_phases(p):
     if not (p.s.phases or p.s.phases_from == "doped"):
         return {"host": None, "phases": {}, "_note": "no competing phases (%block phases or "
@@ -3707,7 +3747,8 @@ def step_ref_phases(p):
     host = p.host()
     own = set(host.get_chemical_symbols())
     every = phase_list(p)
-    phases = [x for x in phases_for(every, own, [], lowest=True) if reduced(x[1]) != reduced(host)]
+    phases = [x for x in phases_for(every, own, [], lowest=True)
+              if len(set(x[1].get_chemical_symbols())) == 1]
     phases += [x for x in phases_for(every, own, p.s.dopants, lowest=True)
                if len(set(x[1].get_chemical_symbols())) == 1
                and not set(x[1].get_chemical_symbols()) <= own]
@@ -3729,7 +3770,8 @@ def step_ref_phases(p):
                     r["energy"] / len(host)])
     cut = f"{p.s.screen_cutoff:g} eV" if p.s.screen_cutoff else "the production cut-off"
     return {"host": {"energy": r["energy"], "counts": counts(host), "natoms": len(host)},
-            "phases": out, "_note": f"the host and {len(out)} phases at the screening settings",
+            "phases": out, "_note": f"the host and {len(out)} pure elements at the screening "
+                                    "settings",
             "_table": format_table(["phase", "formula", "atoms", "E/eV", "E/atom (eV)"], rows,
                                    f"Reference energies at the screening settings ({cut})")}
 
@@ -3740,7 +3782,7 @@ def step_ref_phases(p):
 # each corner, the highest value its phases allow, mu_X = min over phases P containing X of
 # (E_P - sum of the other elements' n mu) / n_X, with the limiting phase. Stops if the host is not
 # stable against its competing phases.
-#   Called by: step_dopant_phases(), step_limits(), step_ref_limits()
+#   Called by: step_limits(), step_ref_limits()
 def chemical_limits(host_counts, host_energy, phases, dopants):
     try:
         from pymatgen.analysis.phase_diagram import PDEntry, PhaseDiagram
@@ -3789,7 +3831,7 @@ def chemical_limits(host_counts, host_energy, phases, dopants):
 # The table of chemical-potential limits: each limit as Delta mu against the pure elements (where
 # those phases were run; each limit gets them as delta_mu), and the phases that limit each dopant.
 # Returns (the pure elements' energies per atom, the table).
-#   Called by: step_dopant_phases(), step_limits(), step_ref_limits()
+#   Called by: step_limits(), step_ref_limits()
 #   Calls:     format_table()
 def limits_table(limits, phases, title):
     ref = {}
@@ -3808,9 +3850,12 @@ def limits_table(limits, phases, title):
 
 
 # A3.2: the chemical-potential limits at the screening settings, from A3.1's energies
-# (chemical_limits): the corners of the host's stability region, and each dopant at its pure
-# element, the highest its chemical potential can be (C4 brings in its compounds). A dopant
-# without its element among the phases gets none, and C3 can't bound its defects from below.
+# (chemical_limits): the corners of the host's stability region against its elements alone (the
+# widest it can be: a compound of the host's elements, such as CaO2 next to CaO, would narrow it,
+# and is only run in E1.1), and each dopant at its pure element, the highest its chemical
+# potential can be. C3's cut across a dopant's sites with these limits can only keep too much,
+# never too little. A dopant without its element among the phases gets none, and C3 can't bound
+# its defects' formation energies from below (the least E_f in its table).
 #   Called by: main() (step A3.2)
 #   Calls:     chemical_limits(), limits_table()
 def step_ref_limits(p):
@@ -3822,8 +3867,8 @@ def step_ref_limits(p):
     have = [x for x in p.s.dopants if any(set(ph["counts"]) == {x} for ph in phases.values())]
     limits = chemical_limits(ref["host"]["counts"], ref["host"]["energy"], phases, have)
     refs, table = limits_table(limits, phases, "Chemical-potential limits at the screening "
-                               "settings (eV per atom, against the pure elements; each dopant at "
-                               "its element)")
+                               "settings, against the elements alone (eV per atom, against the "
+                               "pure elements; each dopant at its element)")
     missing = [x for x in p.s.dopants if x not in have]
     return {"limits": limits, "dopants": have, "references": refs, "_table": table,
             "_note": f"{len(limits)} limits at the screening settings"
@@ -4525,7 +4570,7 @@ def edge_folding(masses, P):
 
 
 # B4: the electronic cell, the supercell the survivors move into after C3 and every judgement of a
-# defect's electronic structure is made in: C5-C7's distortions (distort_cell), C8's excited
+# defect's electronic structure is made in: C4-C6's distortions (distort_cell), C7's excited
 # states, D's production runs, and so E and F (C1-C3, which screen every candidate, stay in the
 # screening cell, where they cost least). The screening cell (B3) is sized for the relaxation
 # (B2) and for levels at least deep_level_margin inside the gap; at the semilocal level many levels
@@ -4606,7 +4651,7 @@ def step_electronic(p):
 
 
 # ==========================================================================================
-# PHASE C: SCREENING, GROUND AND EXCITED STATES (flowchart C1-C9)
+# PHASE C: SCREENING, GROUND AND EXCITED STATES (flowchart C1-C8)
 # ==========================================================================================
 # The candidates (B1) and the screening cell (B3): (candidates by id, primitive host, matrix).
 #   Called by: step_distort(), step_filter(), step_prerelax(), step_screen()
@@ -4958,13 +5003,14 @@ def band_state_test(p, r, calc, nat, host):
 # groups, with A3.2's limits (the screening settings, so they match the screening runs): the
 # formation energies E_f = E + E_corr - E_host - sum n_i mu_i + q (VBM + E_F), against C2's
 # pristine screening cell, over the host's stability region (the convex combinations of its
-# corners) and the gap. A defect with dopant atoms is dropped if it stays more than site_margin
-# above the lowest defect with the same dopant atoms everywhere there (site_distance: those
-# atoms' chemical potentials cancel, so only the host's matter; native defects are not compared
-# so, as they don't compete for the same atoms). Any defect is dropped if its least formation
-# energy anywhere there, with the dopants at their pure elements (the highest their chemical
-# potentials can be, so a bound from below: C4 adds their compounds), is above
-# max_formation_energy. Without A3.2's limits neither is judged. Its stable
+# corners; A3.2's is against the host's elements alone, the widest it can be, so the cut can only
+# keep too much) and the gap. A defect with dopant atoms is dropped if it stays more than
+# site_margin above the lowest defect with the same dopant atoms everywhere there (site_distance:
+# those atoms' chemical potentials cancel, so only the host's matter; native defects are not
+# compared so, as they don't compete for the same atoms), so every dopant keeps its lowest
+# defect. Each defect's least formation energy anywhere there, with the dopants at their pure
+# elements (the highest their chemical potentials can be, so a bound from below), is worked out
+# for the table only: nothing is dropped on it. Without A3.2's limits neither is. Its stable
 # charge states are its bound ones that are its lowest somewhere in the gap. The gap is gap if the
 # project gives it (an experimental or hybrid value), else the screening cell's own: a
 # semilocal gap is too narrow, and a bound charge state that only becomes the lowest above its
@@ -4976,11 +5022,11 @@ def band_state_test(p, r, calc, nat, host):
 # (require_bound: the components must have been screened too) - each met by at least one stable
 # charge state. Arrangements that relaxed into the same structure as a lower one of their group in
 # every charge state both have (duplicates) are dropped too. With excite : true, native defects
-# (is_native) skip the property filters (C8 passes them on to D whatever their excited states, for
+# (is_native) skip the property filters (C7 passes them on to D whatever their excited states, for
 # E), but not the hull or the duplicates.
 # The charge states each survivor carries on (distort_charges): relevant (the default) - its stable
 # ones, its other bound ones whose line comes within charge_margin of its lowest somewhere in the
-# gap (a distortion may lower one that much, C6's gain, and make it stable), and the band states
+# gap (a distortion may lower one that much, C5's gain, and make it stable), and the band states
 # one charge beyond the stable one at either band edge (one more electron than the state stable at
 # the top of the gap, one more hole than the one at the bottom; every band state of a candidate
 # with none bound) whose carrier is shallow and on the defect: band_state_test, from a single point
@@ -4989,9 +5035,8 @@ def band_state_test(p, r, calc, nat, host):
 # filters (pending: bound, it might have the property) or has no bound charge state. stable: its
 # stable ones and every band state; screened: every charge state with a usable energy. Under these
 # two, any band state keeps a candidate pending, and one with no bound charge state is kept.
-# The results list the survivors, with the charge states to carry on (and, for C4, each charge
-# state's formation energy at E_F = 0 without the chemical potentials, formation0, and the top of
-# the Fermi levels scanned, fermi_top); the table gives every candidate's verdict, then the
+# The results list the survivors, with the charge states to carry on (and the top of the Fermi
+# levels scanned, fermi_top); the table gives every candidate's verdict, then the
 # judgement of each band state (relevant), then the correction for each |q| in the screening
 # cell. None while the single points run.
 #   Called by: main() (step C3)
@@ -5082,8 +5127,6 @@ def step_filter(p):
             why.append(f"{dist:.2f} eV above the hull")
         if site.get(cid) is not None and site[cid] > p.s.site_margin:
             why.append(f"{site[cid]:.2f} eV above the lowest defect with its dopant atoms")
-        if cid in lowest_f and lowest_f[cid] > p.s.max_formation_energy:
-            why.append(f"formation energy at least {lowest_f[cid]:.2f} eV")
         good = [q for q in stable if levels_ok(best[cid][q]) and spin_ok(best[cid][q])]
         failed, fixed = [], []      # the property filters it fails; those a band state can't help
         asked = [x for x, on in (("gap levels", p.s.require_gap_states != "none"),
@@ -5204,7 +5247,6 @@ def step_filter(p):
             survivors.append({"cand": cid, "name": c["name"], "group": c["group"],
                               "hull_distance": dist, "site_distance": site.get(cid),
                               "lowest_formation": lowest_f.get(cid),
-                              "formation0": {str(q): v for q, v in base[cid].items()},
                               "stable": stable, "charges": charges,
                               "near": {str(q): g for q, g in near.items()},
                               "in_band": banded[cid], "pending": failed if pending else [],
@@ -5221,10 +5263,10 @@ def step_filter(p):
                           "E_b/eV", "carried q", "verdict"], rows,
                          f"Defect hull (margin {p.s.hull_margin:g} eV), sites (above the lowest "
                          f"defect with the same dopant atoms anywhere in the host's stability "
-                         f"region, margin {p.s.site_margin:g} eV), least formation energy (the "
-                         f"dopants at their elements, at most {p.s.max_formation_energy:g} eV)"
-                         + ("" if corners else " (no A3.2 limits: sites and formation energies "
-                            "not judged)") + f" and property filters, "
+                         f"region against its elements, margin {p.s.site_margin:g} eV), the "
+                         f"least formation energy (the dopants at their elements; shown only)"
+                         + ("" if corners else " (no A3.2 limits: sites not judged)")
+                         + f" and property filters, "
                          f"Fermi levels 0 to {top:.2f} eV above the VBM"
                          + (f" (gap; the screening cell's own gap is {host['gap']:.2f} eV)"
                             if p.s.gap else "")
@@ -5253,78 +5295,8 @@ def step_filter(p):
 
 
 # --------------------------------------------------------------------------
-# C4: the competing phases of the dopants C3 kept
-# --------------------------------------------------------------------------
-# C4: the competing phases of the dopants C3 kept, and the defects they rule out. The dopants'
-# compounds (their pure elements are A3.1's) are relaxed at the screening settings as A3.1's
-# phases are, each composition once (phases_for, lowest). With them, at every corner of the host's
-# stability region a dopant's chemical potential is held below its element's by its most stable
-# compound (chemical_limits), so a defect's least formation energy (the best growth condition,
-# any Fermi level in the gap, as C3 worked it out) can only rise from C3's bound: one that rises
-# above max_formation_energy is dropped. The comparison of a dopant's sites doesn't change (its
-# chemical potential cancels). Without A3.2's limits, or with no dopant left, every survivor
-# carries on. The results: the survivors left (C5 to C7 read them), the phases and the limits.
-# None while the relaxations run.
-#   Called by: main() (step C4)
-#   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
-#              chemical_limits(), format_table(), limits_table(), phase_jobs(), phase_list(),
-#              phase_results(), phases_for(), screen_bulk()
-def step_dopant_phases(p):
-    flt, ref, lim0 = p.out("filter"), p.out("ref_phases"), p.out("ref_limits")["limits"]
-    surv, cands = flt["survivors"], p.out("generate")["candidates"]
-    own = set(p.host().get_chemical_symbols())
-    alive = sorted({el for x in surv for el in cands[x["cand"]]["delta"] if el not in own})
-    if not lim0 or not alive:
-        return {"survivors": surv, "phases": {}, "limits": lim0,
-                "_note": f"all {len(surv)} survivors carry on ("
-                         + ("no A3.2 limits)" if not lim0 else "no dopant left)")}
-    phases = [x for x in phases_for(phase_list(p), own, alive, lowest=True)
-              if len(set(x[1].get_chemical_symbols())) > 1
-              and set(x[1].get_chemical_symbols()) - own]   # compounds with a dopant
-    out, rows = {}, []
-    if phases:
-        res = p.batch("C_screen/jobs/dopant_phases",
-                      phase_jobs(phases, p.s.phases_max_steps, screen_bulk(p)), "dopant_phases",
-                      p.production_param(), spacing=p.kspacing())
-        if not res["complete"]:
-            return None
-        out, rows = phase_results(res, phases)
-    every = dict(ref["phases"], **out)
-    have = [x for x in alive if any(x in ph["counts"] for ph in every.values())]
-    limits = chemical_limits(ref["host"]["counts"], ref["host"]["energy"], every, have)
-    corners, top = [lim["mu"] for lim in limits.values()], flt["fermi_top"]
-    kept, verdicts = [], []
-    for x in surv:
-        delta, f0 = cands[x["cand"]]["delta"], x.get("formation0") or {}
-        least = None
-        if f0 and all(el in corners[0] for el in delta):
-            least = min(e0 + int(q) * e - sum(n * mu[el] for el, n in delta.items())
-                        for mu in corners for q, e0 in f0.items() for e in (0.0, top))
-        if least is not None and least > p.s.max_formation_energy:
-            verdicts.append([x["cand"], x["name"], x["lowest_formation"], least,
-                             f"dropped: formation energy at least {least:.2f} eV"])
-            continue
-        kept.append(dict(x, lowest_formation=least))
-        verdicts.append([x["cand"], x["name"], x["lowest_formation"],
-                         "" if least is None else least,
-                         "kept" if least is not None else "kept (not judged: no chemical "
-                         "potential for one of its elements)"])
-    _, ltable = limits_table(limits, every, "Chemical-potential limits at the screening "
-                             "settings, the dopants held by their compounds (eV per atom, "
-                             "against the pure elements)")
-    table = (format_table(["phase", "formula", "atoms", "E/eV", "E/atom (eV)"], rows,
-                          "The dopants' compounds at the screening settings") + "\n"
-             if rows else "") + ltable + "\n" + format_table(
-        ["id", "defect", "C3's least E_f/eV", "least E_f/eV", "verdict"], verdicts,
-        f"The defects C3 kept: least formation energy (best growth condition, Fermi level "
-        f"anywhere from 0 to {top:.2f} eV), at most {p.s.max_formation_energy:g} eV")
-    return {"survivors": kept, "phases": out, "limits": limits, "_table": table,
-            "_note": f"{len(kept)} of {len(surv)} survivors kept, {len(out)} compounds of "
-                     f"{len(alive)} dopants"}
-
-
-# --------------------------------------------------------------------------
-# C5, C6: distortions, the start of the ground-state search that C7 carries on
+# C4, C5: distortions searched with MACE and relaxed in CASTEP, the start of the ground-state
+# search that C6 carries on
 # --------------------------------------------------------------------------
 # The oxidation states for counting the neighbours to distort: %block oxidation_states, else
 # pymatgen's guess for the host and, for each dopant, its common oxidation state closest to that
@@ -5378,7 +5350,7 @@ def start_spin(atoms, q, spin):
     return s if s % 2 == par else s + 1
 
 
-# The points C5 distorts a defect around (distort_around), each as (label, ShakeNBreak keyword: a
+# The points C4 distorts a defect around (distort_around), each as (label, ShakeNBreak keyword: a
 # site_index or frac_coords in atoms, the screened structure, which keeps the build's atom order):
 # a component is its atom (the anchor's index, or the nearest atom of its element to where it was
 # built) or its vacant site. anchor: the anchor atom (the first vacancy if the anchor is one);
@@ -5430,27 +5402,55 @@ def distortion_centres(atoms, comps, info, mode, bond):
     return [("the centre", {"site_index": i} if d[i] < CENTRE_ATOM_TOL else point(info["centre"]))]
 
 
-# C5: the distortions, in the cell C5 and C6 work in (distort_cell): by default the electronic cell
-# (B4), so that C1-C3, which screen every candidate, run in the small screening cell while the
-# survivors' ground states are searched for where their electronic structure is judged. For each
-# survivor and each of its charge states (charges from C3), its screened structure in that charge
-# state (or the nearest screened one) is carried into that cell (carry_over: the defect rebuilt
-# there, the atoms near it moved as in the screened structure, the rest on their perfect-crystal
-# sites) and relaxed there as it is (<name>_<cell tag>), the start its distortions have to beat.
-# ShakeNBreak's distort_and_rattle then moves the neighbours_to_distort nearest neighbours of each
-# point the defect is distorted around (distortion_centres: distort_around) in or out by each of
-# distortions, and rattles the other atoms (rattle_stdev, default 10% of the host bond length;
-# rattle_dmin, 80%); with no neighbours to distort it is only rattled. A defect distorted around
-# more than one point gets c1, c2, ... (its components, in order) in its structures' names. In the
-# electronic cell a charge state that C2 left in a band can bind its carrier, and so find the
-# distortion the carrier drives, which the screening cell doesn't allow. The jobs carry the cell's
-# matrix and tag, which end their names. With distort_cell : screening, or when B4 chose the
-# screening cell itself, the screened structures are distorted where they are, and the screened
-# runs (C2) are the start. The structures go to C_screen/structures/distortions/.
-#   Called by: main() (step C5)
-#   Calls:     carry_over(), distortion_centres(), host_supercell(), load_cell(),
-#              neighbours_to_distort(), oxidation_states(), qtag(), save_cell(), screen_setup(),
-#              start_spin()
+# The distinct minima of a defect's MACE relaxations (entries: dicts with 'atoms' and 'energy',
+# MACE's, all of one defect in one cell, so on one energy surface whatever their charge state),
+# lowest first: relaxations into the same structure (same_structures, compared only within
+# RANK_E_TOL of each other, as C5's ranking does) merged under the lowest. Returns [(that entry,
+# [the entries merged into it])].
+#   Called by: step_distort()
+#   Calls:     same_structures()
+def mace_minima(entries):
+    out = []
+    for e in sorted(entries, key=lambda x: x["energy"]):
+        hit = next((m for m in out if abs(m[0]["energy"] - e["energy"]) < RANK_E_TOL
+                    and len(same_structures([m[0]["atoms"], e["atoms"]])) == 1), None)
+        if hit is None:
+            out.append((e, [e]))
+        else:
+            hit[1].append(e)
+    return out
+
+
+# C4: the distortions, searched with MACE, in the cell C4 and C5 work in (distort_cell): by
+# default the electronic cell (B4), so that C1-C3, which screen every candidate, run in the small
+# screening cell while the survivors' ground states are searched for where their electronic
+# structure is judged. For each survivor and each of its charge states (charges from C3), its
+# screened structure in that charge state (or the nearest screened one) is carried into that cell
+# (carry_over: the defect rebuilt there, the atoms near it moved as in the screened structure, the
+# rest on their perfect-crystal sites; <name>_<cell tag>), which C5 relaxes there as it is: the
+# start every other structure has to beat. ShakeNBreak's distort_and_rattle then moves that charge
+# state's neighbours_to_distort nearest neighbours of each point the defect is distorted around
+# (distortion_centres: distort_around) in or out by each of distortions, and rattles the other
+# atoms (rattle_stdev, default 10% of the host bond length; rattle_dmin, 80%); with no neighbours
+# to distort it is only rattled. A defect distorted around more than one point gets c1, c2, ...
+# (its components, in order) in its structures' names. With mace (the default), every one of
+# these structures, of all the defect's charge states and the starts too, is relaxed with MACE,
+# the cell fixed (mace_relaxations: as jobs with mace_jobscript, %block runner_distort; their
+# files in C_screen/mace/). MACE ignores the charge, so they all lie on one energy surface: they
+# are pooled, those that relaxed into the same structure merged (mace_minima), and the
+# distort_starts lowest distinct ones kept (<cid>_m1, _m2, ...), which C5 relaxes in CASTEP in
+# every charge state the defect carries (<cid>_<q>_m1, ...), beside its start. The charged
+# states' distortions (other neighbour counts) thus widen the search for all of them, at MACE's
+# cost. Without MACE (mace : false), C5 relaxes the distortions themselves, each in its own
+# charge state. The jobs carry the cell's matrix and tag, which end their names. With
+# distort_cell : screening, or when B4 chose the screening cell itself, the screened structures
+# are distorted where they are, and the screened runs (C2) are the starts (also relaxed with MACE
+# for the pool). The structures go to C_screen/structures/distortions/. The table lists each
+# defect's lowest MACE minima. None while MACE jobs run.
+#   Called by: main() (step C4)
+#   Calls:     carry_over(), distortion_centres(), format_table(), host_supercell(), load_cell(),
+#              mace_minima(), mace_relaxations(), neighbours_to_distort(), oxidation_states(),
+#              qtag(), save_cell(), screen_setup(), start_spin()
 def step_distort(p):
     try:
         from pymatgen.io.ase import AseAtomsAdaptor
@@ -5461,7 +5461,7 @@ def step_distort(p):
     warnings.filterwarnings("ignore")
     cands, prim, P = screen_setup(p)
     d = p.phase_dir("C") / "structures" / "distortions"
-    survivors = p.out("dopant_phases")["survivors"]
+    survivors = p.out("filter")["survivors"]
     defects = p.out("prerelax")["defects"]
     ox = oxidation_states(p, prim, cands)
     host = host_supercell(prim, P)
@@ -5476,15 +5476,16 @@ def step_distort(p):
     end = f"_{el['tag']}" if el else ""
     extra = {"matrix": el["matrix"], "cell": el["tag"]} if el else {}
     where = f" in the electronic cell ({el['tag']})" if el else ""
-    jobs = []
+    jobs, pool, spins = [], {}, {}       # C5's jobs; each survivor's structures for MACE
     for s in survivors:
         cid = s["cand"]
         comps, label = cands[cid]["comps"], f"{cid} ({cands[cid]['name']})"
         screened = {int(q): b for q, b in s["best"].items()}
+        pool[cid] = []
         for q in s["charges"]:
             src = screened.get(q) or screened[min(screened, key=lambda x: (abs(x - q), x))]
             atoms = load_cell(p, src["structure"])
-            S = start_spin(atoms, q, src["spin"] if src["q"] == q else None)
+            S = spins[(cid, q)] = start_spin(atoms, q, src["spin"] if src["q"] == q else None)
             info = defects[cid]
             if el:
                 atoms, info = carry_over(prim, comps, P, atoms, np.array(el["matrix"]),
@@ -5493,10 +5494,14 @@ def step_distort(p):
                 name = f"{cid}_{qtag(q)}{end}"
                 rel = save_cell(p, d / f"{name}.cell", atoms,
                                 f"{name}: {cands[cid]['name']}, q = {q:+d}, its screened "
-                                f"structure{where} (C5)")
+                                f"structure{where} (C4)")
                 jobs.append(dict({"name": name, "cand": cid, "q": q, "spin": S, "factor": None,
                                   "neighbours": None, "around": None, "structure": rel,
                                   "source": "screened, carried over"}, **extra))
+                pool[cid].append({"name": name, "structure": rel, "what": f"{q:+d} start"})
+            else:
+                pool[cid].append({"name": f"{cid}_{qtag(q)}_screened",
+                                  "structure": src["structure"], "what": f"{q:+d} screened"})
             nb = neighbours_to_distort(comps, q, ox)
             struct = AseAtomsAdaptor.get_structure(atoms)
             centres = distortion_centres(atoms, comps, info, p.s.distort_around, bond)
@@ -5514,15 +5519,74 @@ def step_distort(p):
                                     f"{name}: {cands[cid]['name']}, q = {q:+d}, "
                                     + ("rattled" if f == "rattled" else
                                        f"{nb} neighbours' bonds {f:+.2f}")
-                                    + f" around {around}{where} (C5)")
-                    jobs.append(dict({"name": name, "cand": cid, "q": q, "spin": S, "factor": f,
-                                      "neighbours": nb, "around": around, "structure": rel,
-                                      "source": f"distortion around {around}" if part
-                                      else "distortion"}, **extra))
+                                    + f" around {around}{where} (C4)")
+                    pool[cid].append({"name": name, "structure": rel, "what": f"{q:+d} "
+                                      + ("rattled" if f == "rattled" else f"{f:+.2f}")
+                                      + (f" around {around}" if part else "")})
+                    if not p.s.mace:
+                        jobs.append(dict({"name": name, "cand": cid, "q": q, "spin": S,
+                                          "factor": f, "neighbours": nb, "around": around,
+                                          "structure": rel,
+                                          "source": f"distortion around {around}" if part
+                                          else "distortion"}, **extra))
+    rows, nmin = [], 0
+    if p.s.mace:
+        files = p.phase_dir("C") / "mace"
+        tasks = [{"atoms": load_cell(p, e["structure"]), "cache": files / f"{e['name']}.json",
+                  "label": e["name"]} for es in pool.values() for e in es]
+        res = mace_relaxations(p, "distort", tasks)
+        if res is None:
+            return None
+        for s in survivors:
+            cid = s["cand"]
+            entries = []
+            for e in pool[cid]:
+                atoms, _, energy, steps = res[str(files / f"{e['name']}.json")]
+                entries.append(dict(e, atoms=atoms, energy=energy, steps=steps))
+            minima = mace_minima(entries)
+            e_low = minima[0][0]["energy"]
+            for k, (rep, members) in enumerate(minima):
+                kept = k < p.s.distort_starts
+                if kept:
+                    nmin += 1
+                    name = f"{cid}_m{k + 1}{end}"
+                    rel = save_cell(p, d / f"{name}.cell", rep["atoms"],
+                                    f"{name}: {cands[cid]['name']}, MACE minimum {k + 1} of its "
+                                    f"pooled distortions{where} (C4)")
+                    for q in s["charges"]:
+                        jobs.append(dict({"name": f"{cid}_{qtag(q)}_m{k + 1}{end}", "cand": cid,
+                                          "q": q, "spin": spins[(cid, q)], "factor": "mace",
+                                          "neighbours": None, "around": None, "structure": rel,
+                                          "source": f"MACE minimum {k + 1}",
+                                          "mace": {"rank": k + 1, "energy": rep["energy"],
+                                                   "from": [m["what"] for m in members]}},
+                                         **extra))
+                if k < max(p.s.distort_starts, MACE_TABLE_MINIMA):
+                    whats = [m["what"] for m in members]
+                    rows.append([cid, cands[cid]["name"], k + 1, rep["energy"] - e_low,
+                                 rep["energy"], len(members),
+                                 ", ".join(whats[:4]) + (f" (+{len(whats) - 4})"
+                                                         if len(whats) > 4 else ""),
+                                 "yes" if kept else ""])
+            shown = max(p.s.distort_starts, MACE_TABLE_MINIMA)
+            if len(minima) > shown:
+                rows.append([cid, "", "", "", "", "", f"{len(minima) - shown} more distinct "
+                             "minima", ""])
     cell = ({"tag": el["tag"], "matrix": el["matrix"]} if el else
             {"tag": p.out("choose")["tag"], "matrix": P.tolist()})
+    nstruct = sum(len(es) for es in pool.values())
+    table = format_table(
+        ["id", "defect", "minimum", "dE/eV", "E (MACE)/eV", "structures", "from", "kept"], rows,
+        f"MACE's search{where}: every charge state's distortions and starts, relaxed with MACE "
+        "and pooled by defect (MACE ignores the charge), the distinct minima lowest first (dE: "
+        f"above the lowest; from: charge state and distortion); the lowest {p.s.distort_starts} "
+        "go on to C5 in every charge state") if rows else None
     return {"jobs": jobs, "oxidation_states": ox, "cell": cell, "electronic": el is not None,
-            "_note": f"{len(jobs)} structures for {len(survivors)} survivors, in the "
+            "mace": bool(p.s.mace), "_table": table,
+            "_note": (f"{nstruct} structures relaxed with MACE for {len(survivors)} survivors, "
+                      f"{nmin} minima kept: " if p.s.mace else
+                      f"{nstruct} distortions for {len(survivors)} survivors (no MACE): ")
+                     + f"{len(jobs)} CASTEP relaxations for C5, in the "
                      + (f"electronic cell ({el['tag']})" if el else
                         f"screening cell ({cell['tag']})")
                      + " (oxidation states "
@@ -5533,9 +5597,9 @@ def step_distort(p):
 # screening settings in <phase>/jobs/<subdir> (C_screen/ for drelax, C_screen/ for rank), with the
 # runner settings of the step that runs them, and returns ({name: job_summary}, {cell tag: its
 # band edges}), the final structures saved in <phase>/structures/<structdir>. A job in another
-# cell than the screening cell (its 'matrix' and 'cell': C5's in the electronic cell) has its
+# cell than the screening cell (its 'matrix' and 'cell': C4's in the electronic cell) has its
 # defect found in that cell (build_defect) and its levels and band carriers measured against that
-# cell's own band edges at the same settings: those given for its cell in edges (C6's, for C7),
+# cell's own band edges at the same settings: those given for its cell in edges (C5's, for C6),
 # else from a single point of its pristine supercell in the same batch (host_<cell tag>).
 # (None, None) while the batch hasn't finished.
 #   Called by: step_drelax(), step_rank()
@@ -5606,32 +5670,34 @@ def step_energies(text, which="auto"):
     return out
 
 
-# C6's ranking, for summary.txt, so that what the distortions found can be looked at before the
-# model is trained: every relaxation of each survivor's charge states, lowest energy first, in the
-# cell C5 worked in, against the start they had to beat (the screened structure relaxed there, C5's
-# undistorted job; with distort_cell : screening, C2's screened run). Runs that relaxed into the
-# same structure (same_structures, tried only for energies within RANK_E_TOL) share a letter, A the
-# lowest. A charge state has a new minimum when its lowest structure is not the start's and is
-# lower by at least distortion_min_gain (C7's test). Runs without a usable energy come last, with
-# the lowest of their steps whose SCF converged (step_energies); a run with steps whose SCF did
-# not converge says how many. Returns (the tables, the charge states with a new minimum, all
-# charge states).
+# C5's ranking, for summary.txt, so that what C4's MACE minima (or, without MACE, its distortions)
+# found can be looked at before C6 shares them: every relaxation of each survivor's charge states,
+# lowest energy first, in the cell C4 worked in, against the start they had to beat (the screened
+# structure relaxed there, C4's undistorted job; with distort_cell : screening, C2's screened run).
+# Runs that relaxed into the same structure (same_structures, tried only for energies within
+# RANK_E_TOL) share a letter, A the lowest. A charge state has a new minimum when its lowest
+# structure is not the start's and is lower by at least distortion_min_gain (C6's test). Runs
+# without a usable energy come last, with the lowest of their steps whose SCF converged
+# (step_energies); a run with steps whose SCF did not converge says how many. Returns (the tables,
+# the charge states with a new minimum, all charge states).
 #   Called by: step_drelax()
 #   Calls:     format_table(), load_cell(), same_structures(), step_energies()
 def drelax_ranking(p, runs):
-    survivors = p.out("dopant_phases")["survivors"]
+    survivors = p.out("filter")["survivors"]
     cands = p.out("generate")["candidates"]
     c4 = p.out("distort")
     cell = c4["cell"]["tag"] if c4.get("electronic") else None
     gmin = p.s.distortion_min_gain
     jobs = p.phase_dir("C") / "jobs" / "drelax"
 
-    # A run's name in the tables: start, its distortion factor (with the point it was distorted
-    # around, when there are several) or rattled.
+    # A run's name in the tables: start, MACE and its minimum's rank, or (without MACE) its
+    # distortion factor (with the point it was distorted around, when there are several) or rattled.
     def label(r):
         f = r.get("factor")
         if f is None:
             return "start" + ("" if cell else " (C2)")
+        if f == "mace":
+            return f"MACE {r['mace']['rank']}"
         if f == "rattled":
             return "rattled"
         return f"{f:+.2f}" + (f" around {r['around']}"
@@ -5712,11 +5778,13 @@ def drelax_ranking(p, runs):
     return table, new, len(summary)
 
 
-# C6: relaxes every structure C5 made with the screening settings (C2's, Gamma point, no
-# restarts), in the cell C5 made it in, against that cell's band edges (run_screen_jobs). Its
-# summary ranks every relaxation of each charge state against its start (drelax_ranking), so
-# whether a distortion found a new minimum can be looked at before C7 (--until C6).
-#   Called by: main() (step C6)
+# C5: relaxes C4's jobs with the screening settings (C2's, Gamma point, no restarts): each
+# charge state from its start (the screened structure carried into C4's cell) and from each of
+# C4's MACE minima (without MACE, from each of its distortions), in the cell C4 worked in, against
+# that cell's band edges (run_screen_jobs). Its summary ranks every relaxation of each charge
+# state against its start (drelax_ranking), so whether a MACE minimum led to a new minimum can be
+# looked at before C6 (--until C5).
+#   Called by: main() (step C5)
 #   Calls:     drelax_ranking(), problem_table(), run_screen_jobs()
 def step_drelax(p):
     out, edges = run_screen_jobs(p, "drelax", "drelax", p.out("distort")["jobs"], "drelax")
@@ -5737,7 +5805,7 @@ def step_drelax(p):
 # atom (all come from the same cell with the same atom order). The tolerances are tight (stol 0.05,
 # i.e. about 0.1 A for a typical oxide): defect ground states can differ by a few tenths of an
 # Angstrom around the defect, which pymatgen's defaults would merge.
-#   Called by: distinct_states(), drelax_ranking(), duplicates(), step_rank()
+#   Called by: distinct_states(), drelax_ranking(), duplicates(), mace_minima(), step_rank()
 #   Calls:     sc.displacements()
 def same_structures(atoms_list):
     try:
@@ -5932,10 +6000,10 @@ def run_training(p, label, tasks):
 
 
 # --------------------------------------------------------------------------
-# C7: ground states (C6's relaxations, distortions shared between charge states)
+# C6: ground states (C5's relaxations, distortions shared between charge states)
 # --------------------------------------------------------------------------
-# The distinct relaxed structures of each candidate and charge state in the cell C5 worked in (cell:
-# its tag, None for the screening cell), lowest energy first: C6's relaxations there with a usable
+# The distinct relaxed structures of each candidate and charge state in the cell C4 worked in (cell:
+# its tag, None for the screening cell), lowest energy first: C5's relaxations there with a usable
 # energy (in the screening cell, the screened one, C2, too), identical ones merged
 # (same_structures, keeping the lowest). Returns {(cand, q): [entries]}.
 #   Called by: step_rank()
@@ -5971,27 +6039,27 @@ def distinct_states(p, survivors, results, cell):
     return out
 
 
-# C7: ranks the relaxed structures of each survivor and charge state in the cell C5 worked in
-# (distinct_states). A distortion counts as found when it beats the start by distortion_min_gain:
-# the screened structure (C2's run; in the electronic cell, its relaxation there, C5's undistorted
-# job). A structure found in one charge state that no other charge state has is then relaxed in
-# those charge states too, in the same cell (a batch per round, C_screen/jobs/share_<n>, measured
-# against C6's band edges), for up to share_rounds rounds or until nothing new turns up. The lowest
-# keep_structures distinct structures of each charge state go on to C8, and then to phase D, with
-# the run each came from, the electrons or holes it left in the bands (C9 leaves out band states)
-# and its cell ('matrix', 'cell').
-#   Called by: main() (step C7)
+# C6: ranks the relaxed structures of each survivor and charge state in the cell C4 worked in
+# (distinct_states). A structure (from a MACE minimum, or without MACE a distortion) counts as found
+# when it beats the start by distortion_min_gain: the screened structure (C2's run; in the
+# electronic cell, its relaxation there, C4's undistorted job). A structure found in one charge
+# state that no other charge state has is then relaxed in those charge states too, in the same cell
+# (a batch per round, C_screen/jobs/share_<n>, measured against C5's band edges), for up to
+# share_rounds rounds or until nothing new turns up. The lowest keep_structures distinct structures
+# of each charge state go on to C7, and then to phase D, with the run each came from, the electrons
+# or holes it left in the bands (C8 leaves out band states) and its cell ('matrix', 'cell').
+#   Called by: main() (step C6)
 #   Calls:     distinct_states(), format_table(), load_cell(), qtag(), run_screen_jobs(),
 #              same_structures(), start_spin()
 def step_rank(p):
-    survivors = p.out("dopant_phases")["survivors"]
+    survivors = p.out("filter")["survivors"]
     results = dict(p.out("drelax")["runs"])
     choose, c4 = p.out("choose"), p.out("distort")
     cell = c4["cell"]["tag"] if c4.get("electronic") else None
     matrix = c4["cell"]["matrix"] if cell else choose["matrix"]
 
     # The energy of a charge state's start, which a distortion has to beat: its screened run (C2),
-    # or in another cell its screened structure relaxed there (C5's undistorted job).
+    # or in another cell its screened structure relaxed there (C4's undistorted job).
     def start(cid, q):
         if cell is None:
             b = next(s for s in survivors if s["cand"] == cid)["best"].get(str(q))
@@ -6026,7 +6094,7 @@ def step_rank(p):
                                  **({"matrix": matrix, "cell": cell} if cell else {})))
         if not todo:
             break
-        log(f"C7 round {rnd}: trying {len(todo)} structures found in one charge state in the "
+        log(f"C6 round {rnd}: trying {len(todo)} structures found in one charge state in the "
             "others")
         out, _ = run_screen_jobs(p, "rank", f"share_{rnd}", todo, "share",
                                  edges=p.out("drelax").get("edges"))
@@ -6041,7 +6109,8 @@ def step_rank(p):
         e0 = best["energy"] if e0 is None else e0
         gain = e0 - best["energy"]
         rows.append([cid, f"{q:+d}", e0, best["energy"], gain,
-                     best["source"] + (f" {best['factor']}" if best["factor"] is not None else ""),
+                     best["source"] + (f" {best['factor']}" if best["factor"] not in (None, "mace")
+                                       else ""),
                      len(entries)])
         for k, e in enumerate(entries[:p.s.keep_structures]):
             atoms = load_cell(p, e["structure"])
@@ -6063,17 +6132,17 @@ def step_rank(p):
 
 
 # --------------------------------------------------------------------------
-# C8: excited states
+# C7: excited states
 # --------------------------------------------------------------------------
 # Whether a candidate is a native defect: every element it adds or removes is one of the host's
-# (vacancies, antisites, self-interstitials and complexes of them). C8 always passes these on to
+# (vacancies, antisites, self-interstitials and complexes of them). C7 always passes these on to
 # D, because E's formation energies and Fermi level need them, bright or not.
 #   Called by: step_excite(), step_filter()
 def is_native(cand, host_elements):
     return all(el in host_elements for el in cand["delta"])
 
 
-# The defect levels of a ground state at one k-point (Gamma in C8): every band within reach (eV)
+# The defect levels of a ground state at one k-point (Gamma in C7): every band within reach (eV)
 # of the host's band edges (vbm, cbm: a pristine run at the same settings) whose participation
 # number (participation, P) is at most fraction x nat (the cell's atoms): localised on the defect,
 # whether inside the gap or inside a band (a resonance, where a semilocal gap can push a level).
@@ -6095,7 +6164,7 @@ def defect_levels(b, P, nat, vbm, cbm, reach, fraction, k=0):
     return out
 
 
-# The excitations C8 and D2 try, from a ground state's defect levels (defect_levels): in each spin
+# The excitations C7 and D2 try, from a ground state's defect levels (defect_levels): in each spin
 # channel (spin-conserving, so a triplet stays a triplet), from its highest occupied defect level to
 # its lowest empty one at least KS_STEP_MIN higher (which skips a degenerate partner). The
 # Kohn-Sham step only picks the bands: what counts is the ΔSCF energy. Each: {spin, from_band,
@@ -6133,7 +6202,7 @@ def deltascf_block(ex, nspin):
             + "\n%endblock deltascf_constraints\n")
 
 
-# A C8 job for one structure in charge state q, starting with spin S: a screening job (screen_job:
+# A C7 job for one structure in charge state q, starting with spin S: a screening job (screen_job:
 # Gamma point, no symmetry, the screening keywords) with metals_method : dm (CASTEP's excitation
 # constraints need density mixing), %block excite_overrides, then extra. kind: 'sp' or 'geom'.
 #   Called by: step_excite()
@@ -6167,7 +6236,7 @@ def dscf_job(gs_job, gs, name, jobdir, ex, nspin, kind, param):
 
 
 # The settings every ΔSCF calculation of the production phases and its ground state share (D2,
-# F1), as C8's (excite_job): metals_method : dm (CASTEP's excitation constraints need density
+# F1), as C7's (excite_job): metals_method : dm (CASTEP's excitation constraints need density
 # mixing), then %block excite_overrides. Changes the job's overrides in place; returns the job.
 #   Called by: step_ccd(), step_zpl()
 def dscf_settings(p, job):
@@ -6268,7 +6337,7 @@ def dscf_result(p, r, calc, ex, e_gs, gs_atoms, nat, relaxed, structdir, emin, w
     return out
 
 
-# A C7 structure t as a structure of the electronic cell Pe (B4): as it is when it is already in
+# A C6 structure t as a structure of the electronic cell Pe (B4): as it is when it is already in
 # that cell (its 'matrix'; without one, the screening cell's), else carried over (carry_over).
 # Returns (Atoms, info: where its defect is, build_defect's).
 #   Called by: step_excite(), step_relaxations()
@@ -6282,10 +6351,10 @@ def into_cell(p, t, prim, cands, Pe):
     return carry_over(prim, comps, src, atoms, Pe, label=label)
 
 
-# C8: the screen of the excited states, in the electronic cell (B4) at the screening settings
+# C7: the screen of the excited states, in the electronic cell (B4) at the screening settings
 # (Gamma, screen_cutoff), in three batches (C_screen/jobs/excite_relax, excite_gs, excite):
-#  1. the pristine cell (its band edges), and every structure C7 kept, relaxed: the lowest that
-#     relaxes is the ground state (C7's order may change); it is flagged if it slid more than
+#  1. the pristine cell (its band edges), and every structure C6 kept, relaxed: the lowest that
+#     relaxes is the ground state (C6's order may change); it is flagged if it slid more than
 #     BASIN_TOL from where it started (same_basin). A band state (in_band) is 'pending': it can't
 #     be judged here (a hybrid can). With excite_spin (2, a triplet; 'any' for every spin), a
 #     ground state whose final spin is further than spin_tol from it goes no further ('spin').
@@ -6301,9 +6370,9 @@ def into_cell(p, t, prim, cands, Pe):
 # A charge state passes if one of its excitations does (dscf_result's verdicts; a failed run is
 # 'unknown' and counts as a pass, with a warning). A defect goes on to D with all its charge
 # states (their relaxed ground states here) if one passes, and every native defect (is_native)
-# goes on anyway (its ground states, for E). With excite : false, every structure C7 kept as its
+# goes on anyway (its ground states, for E). With excite : false, every structure C6 kept as its
 # lowest goes on to D as it is.
-#   Called by: main() (step C8)
+#   Called by: main() (step C7)
 #   Calls:     Project.batch(), Project.host(), Project.production_param(), band_edges(),
 #              carriers_text(), defect_levels(), dscf_job(), dscf_result(), excite_job(),
 #              format_table(), host_supercell(), in_band(), into_cell(), is_native(), job_summary(),
@@ -6314,7 +6383,7 @@ def step_excite(p):
     if not p.s.excite:
         out = [dict(t) for t in structures if t["k"] == 0]
         return {"structures": out, "states": {}, "kept": sorted({t["cand"] for t in out}),
-                "native": [], "_note": "excite is off: the lowest structure C7 kept of every "
+                "native": [], "_note": "excite is off: the lowest structure C6 kept of every "
                                        "charge state goes on to D"}
     d = p.phase_dir("C")
     cands, prim = p.out("generate")["candidates"], p.host()
@@ -6336,7 +6405,7 @@ def step_excite(p):
         return None
     hc = res["calcs"]["host"]
     if res["jobs"]["host"]["status"] != "done" or not (hc.dir / f"{hc.seed}.bands").exists():
-        die(f"C8: the pristine electronic cell did not finish ({hc.dir}); the band edges come "
+        die(f"C7: the pristine electronic cell did not finish ({hc.dir}); the band edges come "
             "from it")
     vbm, cbm = band_edges(read_bands(hc.dir / f"{hc.seed}.bands"))
     states, infos = {}, {}
@@ -6431,7 +6500,7 @@ def step_excite(p):
     for (cid, q), e in sorted(states.items()):
         goes = ("yes (native)" if cid in native else "yes") if cid in keep else "no"
         if e["verdict"] == "unknown":
-            log(f"WARNING: C8: {cid} {cands[cid]['name']} q {q:+d}: {e['why']} - kept")
+            log(f"WARNING: C7: {cid} {cands[cid]['name']} q {q:+d}: {e['why']} - kept")
         flags = ", ".join(x for x in (
             f"slid {e['moved']:.2f} A" if e.get("moved") and e["moved"] > BASIN_TOL else "",
             "reordered" if e.get("reordered") else "") if x)
@@ -6453,10 +6522,10 @@ def step_excite(p):
                          goes if i == 0 else ""])
         if cid in keep and e.get("structure"):
             out.append({"cand": cid, "q": q, "k": 0, "structure": e["structure"],
-                        "matrix": Pe.tolist(), "spin": e["spin"], "source": "C8",
+                        "matrix": Pe.tolist(), "spin": e["spin"], "source": "C7",
                         "excite": [{k: ex[k] for k in ("spin", "from_band", "to_band")}
                                    for ex in e["transitions"] if ex.get("verdict") == "pass"]})
-        elif cid in keep:                         # its relaxation failed: C7's structure
+        elif cid in keep:                         # its relaxation failed: C6's structure
             t0 = next(t for t in structures if t["cand"] == cid and t["q"] == q and t["k"] == 0)
             out.append(dict(t0, excite=[]))
     what = "ZPL" if p.s.excite_relax else "vertical E"
@@ -6484,7 +6553,7 @@ def step_excite(p):
 
 
 # --------------------------------------------------------------------------
-# C9: the finite-size check (optional)
+# C8: the finite-size check (optional)
 # --------------------------------------------------------------------------
 # The line E = E_inf + b/N (least squares) through some sizes' E (dicts with N and E). Returns
 # (E_inf, b, the largest distance of a point from the line), or for one size (its E, None, 0).
@@ -6499,13 +6568,13 @@ def tail_fit(points):
     return float(e_inf), float(b), float(np.abs(A @ [e_inf, b] - y).max())
 
 
-# C9 (optional, validate : true): whether the screening cell, with its corrections, gives the
+# C8 (optional, validate : true): whether the screening cell, with its corrections, gives the
 # formation energies and transition levels of much bigger cells, so that a size series can be
-# left out in later projects. For the lowest structure C7 kept of each defect (those in
-# validate_defects, or every one C7 kept) in each charge state that isn't a band state: a
+# left out in later projects. For the lowest structure C6 kept of each defect (those in
+# validate_defects, or every one C6 kept) in each charge state that isn't a band state: a
 # relaxation at the production settings (production_job, but without freeze_radius, so the far
 # field relaxes too) in the screening cell and in the next validate_sizes sizes of the ladder up
-# that fit it (C7's structure carried over, carry_over), with the pristine cell's single point in
+# that fit it (C6's structure carried over, carry_over), with the pristine cell's single point in
 # each size; all with calculate_stress. In each size, E = E_D - E_host + E_corr (the charge
 # correction, in that cell's shape); the reference E_inf is the line E_inf + b/N through the sizes
 # above the screening cell (tail_fit; N, the host cell's atoms, as in B2), and b is the tail the
@@ -6517,11 +6586,11 @@ def tail_fit(points):
 # charge states checked are compared the same way. A defect passes with an estimate when every
 # error is within validate_tol. The jobs run in C_screen/jobs/validate with the runner settings of
 # runner_production (or runner_validate); the relaxed structures go to C_screen/structures/validate.
-# C7's structure is carried from the cell it is in (its 'matrix': the screening cell, or the
+# C6's structure is carried from the cell it is in (its 'matrix': the screening cell, or the
 # electronic cell, distort_cell's). With validate_gamma (true), the same relaxed
 # structures also get Gamma-only single points (validate_gamma), to show what Gamma-only sampling
 # would change in each size. Nothing later uses the results: they are a test of the method.
-#   Called by: main() (step C9)
+#   Called by: main() (step C8)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              build_defect(), carry_over(), compliance(), correction(), elastic_energy(), fits(),
 #              format_table(), host_supercell(), in_band(), load_cell(), production_job(),
@@ -6536,7 +6605,7 @@ def step_validate(p):
     eps = p.out("dielectric").get("eps0")
     S = compliance(p.s.elastic_constants)
     if S is None:
-        log("C9: no %block elastic_constants, so the stress estimate is left out")
+        log("C8: no %block elastic_constants, so the stress estimate is left out")
     mace_c = {cid: (x.get("fit") or {}).get("c")
               for cid, x in p.out("scan").get("candidates", {}).items()}
     ground, skipped, sizes = {}, [], {}
@@ -6549,20 +6618,20 @@ def step_validate(p):
             ground.setdefault(t["cand"], {})[t["q"]] = t
     for x in p.s.validate_defects:
         if x not in ground:
-            log(f"WARNING: C9: {x} is in validate_defects but C7 kept no bound structure of it")
+            log(f"WARNING: C8: {x} is in validate_defects but C6 kept no bound structure of it")
     if skipped:
-        log("C9: left out (a band state, so there is no defect level to check): "
+        log("C8: left out (a band state, so there is no defect level to check): "
             + ", ".join(skipped))
     for cid in sorted(ground):
         up = [i for i in range(idx + 1, len(ladder)) if fits(cands[cid], ladder[i]["L"])]
         if not up:
-            log(f"WARNING: C9: {cid} not checked: no size of the ladder above the screening cell "
+            log(f"WARNING: C8: {cid} not checked: no size of the ladder above the screening cell "
                 "fits it (longer scan_lengths add sizes)")
             del ground[cid]
         else:
             sizes[cid] = [idx] + up[:p.s.validate_sizes]
     if not ground:
-        log("WARNING: C9: nothing to check (see above)")
+        log("WARNING: C8: nothing to check (see above)")
         return {"defects": {}, "runs": {}, "hosts": {}, "skipped": skipped,
                 "tol": p.s.validate_tol, "_note": "nothing to check"}
     extra = {"calculate_stress": "true"}
@@ -6573,7 +6642,7 @@ def step_validate(p):
             Q = np.array(ladder[i]["matrix"])
             for q, t in sorted(states.items()):
                 name = f"{cid}_{qtag(q)}_{ladder[i]['tag']}"
-                start = load_cell(p, t["structure"])          # C7's, in its own cell
+                start = load_cell(p, t["structure"])          # C6's, in its own cell
                 src = np.array(t.get("matrix") or P0)
                 atoms, info = ((start, build_defect(prim, Q, comps, label)[1])
                                if np.array_equal(src, Q) else
@@ -6598,7 +6667,7 @@ def step_validate(p):
         name = f"host_{ladder[i]['tag']}"
         r = res["jobs"][name]
         if r["status"] != "done" or r["energy"] is None:
-            die(f"C9: the pristine {ladder[i]['tag']} single point did not finish ({r['dir']})")
+            die(f"C8: the pristine {ladder[i]['tag']} single point did not finish ({r['dir']})")
         s, pr = read_stress(res["calcs"][name].output())
         hosts[i] = {"energy": r["energy"], "stress": None if s is None else s.tolist(),
                     "pressure": pr}
@@ -6612,7 +6681,7 @@ def step_validate(p):
         runs[name] = dict(r, cand=cid, q=q, cell=ladder[i]["tag"],
                           stress=None if s is None else s.tolist(), pressure=pr)
     if nostress:
-        log(f"WARNING: C9: no stress tensor in {len(nostress)} runs (e.g. {nostress[0]}): does "
+        log(f"WARNING: C8: no stress tensor in {len(nostress)} runs (e.g. {nostress[0]}): does "
             "this CASTEP honour calculate_stress, or print it in a unit other than GPa, MPa, Pa, "
             "bar or atm (pressure_unit)? The stress estimate is left out there")
     gamma = validate_gamma(p, prim, ladder, used, meta, infos, runs, hosts) \
@@ -6647,7 +6716,7 @@ def step_validate(p):
             if here is None or not above:
                 why = ("its screening-cell run failed" if here is None else
                        "no bigger size to compare with (the runs failed, or none fits)")
-                log(f"WARNING: C9: {cid} q {q:+d} not checked: {why}")
+                log(f"WARNING: C8: {cid} q {q:+d} not checked: {why}")
                 per_q[q] = {"checked": False, "why": why}
                 continue
             e_inf, b, worst = tail_fit(above)
@@ -6727,8 +6796,8 @@ def step_validate(p):
                         if gamma["worst"] else "")}
 
 
-# C9's check of Gamma-only sampling (validate_gamma : true): a single point at the production
-# cut-off with only the Gamma point, of every structure C9 relaxed at the production k-points and
+# C8's check of Gamma-only sampling (validate_gamma : true): a single point at the production
+# cut-off with only the Gamma point, of every structure C8 relaxed at the production k-points and
 # of the pristine cell in each size used (C_screen/jobs/validate_gamma). E = E_D - E_host with
 # each, and the difference: how far Gamma-only would move a formation energy (the charge correction
 # is the same in both, and cancels). Returns {'rows' (for the table), 'worst': {size tag: largest
@@ -6859,7 +6928,7 @@ def production_summary(p, res, name, structdir, frozen=0):
 
 
 # D1: the production relaxations, in the electronic cell (B4): every charge state of each defect
-# phase C passes on (C8's relaxed ground states there; with excite : false, the lowest structure C7
+# phase C passes on (C7's relaxed ground states there; with excite : false, the lowest structure C6
 # kept of each charge state, carried in: into_cell), relaxed at the production settings
 # (production_job: A1's cut-off and k-point spacing, %block production_overrides, freeze_radius),
 # with the pristine electronic cell's single point, whose band edges D2 measures levels against
@@ -6946,7 +7015,7 @@ def zpl_bands_ok(p, b, pw, nat, vbm, cbm, ex):
     return True, ""
 
 
-# D2: the production ΔSCF of every excitation C8 passed, in D1's relaxed ground state:
+# D2: the production ΔSCF of every excitation C7 passed, in D1's relaxed ground state:
 #  1. a single point at the production settings with the bands' weights (pdos_calculate_weights;
 #     its .check kept; metals_method : dm and %block excite_overrides, dscf_settings), against
 #     D1's pristine band edges: the excitation is found again in the same spin channel
@@ -6955,7 +7024,7 @@ def zpl_bands_ok(p, b, pw, nat, vbm, cbm, ex):
 #     excitation found again there);
 #  3. the ΔSCF (dscf_job) from whichever single point, relaxed with excite_relax : true: ZPL, the
 #     vertical absorption, dQ, the 1D Huang-Rhys and Debye-Waller estimates and whether the
-#     promoted electron stayed on the defect (dscf_result; its verdict uses C8's thresholds).
+#     promoted electron stayed on the defect (dscf_result; its verdict uses C7's thresholds).
 # The relaxed excited structures go to D_production/structures/zpl, for F.
 #   Called by: main() (step D2)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
@@ -6969,7 +7038,7 @@ def step_zpl(p):
     todo = [r for r in e1["runs"].values() if r["excite"] and r["energy"] is not None
             and r["final"]]
     if not todo:
-        return {"states": {}, "_note": "no excitation passed C8, so there is no ΔSCF to run"}
+        return {"states": {}, "_note": "no excitation passed C7, so there is no ΔSCF to run"}
     if not e1["edges"]:
         die("D2: D1's pristine single point wrote no .bands, so the defect levels can't be found")
     cands, prim = p.out("generate")["candidates"], p.host()
@@ -6994,7 +7063,7 @@ def step_zpl(p):
         infos[name] = r
         return job
 
-    # The excitations of a ground-state single point in the spin channels C8 passed, at its first
+    # The excitations of a ground-state single point in the spin channels C7 passed, at its first
     # k-point: [(ex, nspin)], with the .bands and .pdos_weights read (b, pw), or why there are none.
     def found(r, calc):
         bands = calc.dir / f"{calc.seed}.bands"
@@ -7125,8 +7194,8 @@ def d1_dopants(p):
 # k-point spacing (or a phase's own kspacing; give a metal e.g. smearing_width=0.1 on its line in
 # %block phases). Phases of the host's own composition are left out, as in A3.1: A2.1's host is
 # that phase (another copy of it, relaxed in another cell, could come out a little lower and stop
-# E1.2 with the host off the hull). A3.1 and C4 ran the same kind of phases at the screening
-# settings, for screening only. With %block chemical_potentials nothing runs.
+# E1.2 with the host off the hull). A3.1 ran the pure elements at the screening settings, for
+# screening only. With %block chemical_potentials nothing runs.
 #   Called by: main() (step E1.1)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              d1_dopants(), format_table(), phase_jobs(), phase_list(), phase_results(),
@@ -7493,7 +7562,7 @@ def stable_windows(ef0, gap):
 # level inside the gap (stable_windows, from E3): an excitation of a charge state that never
 # forms can't be seen. The table also gives, for each set of dopants E3 found a Fermi level for
 # (dopant_sets: the defect's own), whether that Fermi level falls in the range at each limit, the
-# deep levels (more than deep_level_margin from both band edges), and the band states C8 left
+# deep levels (more than deep_level_margin from both band edges), and the band states C7 left
 # pending (to characterise with a hybrid later).
 #   Called by: main() (step E4)
 #   Calls:     Project.host(), format_table(), stable_windows()
@@ -7539,7 +7608,7 @@ def step_interest(p):
                          "the limits whose self-consistent Fermi level (E3, the defect's own "
                          "dopants) falls in that range")
     if pending:
-        table += ("\nBand states C8 left pending (to characterise with a hybrid): "
+        table += ("\nBand states C7 left pending (to characterise with a hybrid): "
                   + ", ".join(pending) + "\n")
     return {"for_F": picks, "pending": pending, "_table": table,
             "_note": f"{len(picks)} excitation(s) for the lineshape phase (F)"}
@@ -8257,11 +8326,12 @@ STEPS = [
          keys=("dielectric", "dielectric_inf", "dielectric_task"),
          files=("dielectric_param", "dielectric_cell"), needs=("relax",),
          owns=("A_host/jobs/dielectric",)),
-    Step("ref_phases", "A3.1", "reference energies at the screening settings (the host, its "
-         "competing phases, the dopants' elements)", step_ref_phases,
+    Step("ref_phases", "A3.1", "reference energies at the screening settings (the host, and the "
+         "pure elements of the host and the dopants)", step_ref_phases,
          keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps",
                "phases_molecule_box", "dopants", "screen_cutoff", "screen_overrides", "energy"),
-         needs=("relax",), owns=("A_host/jobs/ref_phases",)),
+         needs=("relax",), owns=("A_host/jobs/ref_phases",),
+         version=1),                               # 1: the pure elements only
     Step("ref_limits", "A3.2", "chemical-potential limits at the screening settings",
          step_ref_limits, keys=("dopants",), needs=("ref_phases",)),
     # B: candidate defects and the screening cell
@@ -8290,40 +8360,38 @@ STEPS = [
          needs=("prerelax", "converge", "bands"),
          owns=("C_screen/jobs/screen", "C_screen/structures/screen"),
          version=1),                               # 1: the band carriers of each run
-    Step("filter", "C3", "defect hull, sites, least formation energy and property filters",
-         step_filter,
-         keys=SCREEN_KEYS + ("hull_margin", "site_margin", "max_formation_energy",
-                             "require_gap_states", "require_spin", "require_bound",
-                             "distort_charges", "charge_correction", "excite", "gap",
-                             "charge_margin", "carrier_reach", "carrier_fraction"),
+    Step("filter", "C3", "defect hull, sites and property filters", step_filter,
+         keys=SCREEN_KEYS + ("hull_margin", "site_margin", "require_gap_states", "require_spin",
+                             "require_bound", "distort_charges", "charge_correction", "excite",
+                             "gap", "charge_margin", "carrier_reach", "carrier_fraction"),
          needs=("screen", "dielectric", "prerelax", "ref_limits"),
          owns=("C_screen/jobs/filter",),
-         version=2),          # 1: the relevant charge states (band states judged); 2: the sites
-                              # and least formation energies (A3.2's limits)
-    Step("dopant_phases", "C4", "the dopants' competing phases at the screening settings, and "
-         "the defects they rule out", step_dopant_phases,
-         keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps",
-               "max_formation_energy", "screen_cutoff", "screen_overrides", "energy"),
-         needs=("filter", "ref_phases", "ref_limits", "generate", "relax"),
-         owns=("C_screen/jobs/dopant_phases",)),
-    Step("distort", "C5", "ShakeNBreak distortions of the survivors", step_distort,
+         version=4),          # 1: the relevant charge states (band states judged); 2: the sites
+                              # and least formation energies (A3.2's limits); 3: formation0 of
+                              # every candidate (for a C4 since gone); 4: no cut on the
+                              # formation energy
+    Step("distort", "C4", "ShakeNBreak's distortions of every charge state, relaxed with MACE "
+         "and pooled; the lowest distinct minima kept", step_distort,
          keys=("distortions", "distort_around", "rattle_stdev", "rattle_dmin",
-               "oxidation_states", "distort_cell"),
-         needs=("dopant_phases", "prerelax", "electronic"),
-         owns=("C_screen/structures/distortions",),
-         version=2),                         # 2: in the electronic cell (distort_cell)
-    Step("drelax", "C6", "Gamma-point CASTEP relaxations of the distortions", step_drelax,
+               "oxidation_states", "distort_cell", "distort_starts", "mace", "mace_model",
+               "mace_fmax", "mace_steps"),
+         needs=("filter", "prerelax", "electronic"),
+         owns=("C_screen/structures/distortions", "C_screen/mace", "C_screen/jobs/mace_distort"),
+         version=3),                         # 2: in the electronic cell (distort_cell); 3: MACE
+    Step("drelax", "C5", "Gamma-point CASTEP relaxations of each charge state from its screened "
+         "structure and C4's MACE minima", step_drelax,
          keys=SCREEN_KEYS + ("distortion_min_gain",),
-         needs=("distort", "dopant_phases", "generate"),
+         needs=("distort", "filter", "generate"),
          owns=("C_screen/jobs/drelax", "C_screen/structures/drelax"),
-         version=2),                         # 2: the ranking in summary.txt (the same results)
-    Step("rank", "C7", "rank the ground states (C6's relaxations, with sharing)", step_rank,
+         version=3),                         # 2: the ranking in summary.txt (the same results);
+                                             # 3: C4's MACE minima
+    Step("rank", "C6", "rank the ground states (C5's relaxations, with sharing)", step_rank,
          keys=SCREEN_KEYS + ("distortion_min_gain", "share_rounds", "keep_structures"),
-         needs=("distort", "drelax", "choose", "dopant_phases"),
+         needs=("distort", "drelax", "choose", "filter"),
          owns=("C_screen/jobs/share_*", "C_screen/structures/share"),
          version=4),        # 1: each kept structure's run and band carriers; 2: its cell's
-                            # matrix; 3: its cell's tag; 4: in C5's cell (distort_cell)
-    Step("excite", "C8", "triplet ground states and their excitations (ΔSCF) in the electronic "
+                            # matrix; 3: its cell's tag; 4: in C4's cell (distort_cell)
+    Step("excite", "C7", "triplet ground states and their excitations (ΔSCF) in the electronic "
          "cell", step_excite,
          keys=SCREEN_KEYS + ("excite", "excite_window", "excite_min", "excite_relax",
                              "excite_overrides", "excite_spin", "spin_tol", "local_fraction",
@@ -8332,7 +8400,7 @@ STEPS = [
          owns=("C_screen/jobs/excite_relax", "C_screen/jobs/excite_gs", "C_screen/jobs/excite",
                "C_screen/structures/excite_relax", "C_screen/structures/excite"),
          version=1),                         # 1: the electronic cell, localised levels, triplets
-    Step("validate", "C9", "finite-size check of the screening cell's corrections (optional)",
+    Step("validate", "C8", "finite-size check of the screening cell's corrections (optional)",
          step_validate, keys=("validate", "validate_tol", "validate_defects", "validate_sizes",
                               "validate_gamma", "elastic_constants", "production_overrides",
                               "charge_correction", "energy"),
@@ -8344,7 +8412,7 @@ STEPS = [
          step_relaxations, keys=("production_overrides", "freeze_radius", "energy"),
          needs=("excite", "electronic", "choose", "converge", "relax", "generate"),
          owns=("D_production/jobs/relaxations", "D_production/structures/relaxations")),
-    Step("zpl", "D2", "production ΔSCF of the excitations C8 passed (ZPL, dQ)", step_zpl,
+    Step("zpl", "D2", "production ΔSCF of the excitations C7 passed (ZPL, dQ)", step_zpl,
          keys=("production_overrides", "excite_overrides", "excite_relax", "excite_min",
                "excite_window", "excite_min_dw", "excite_reach", "local_fraction",
                "band_spread_tol", "energy"),
@@ -8407,7 +8475,8 @@ param     : CaO.param          # production settings (functional, cut-off, ...);
 !   1 -1  1
 !   1  1 -1
 !%endblock transform
-mace         : true            # MACE for the size scan (B2) and the pre-relaxations (C1)
+mace         : true            # MACE for the size scan (B2), the pre-relaxations (C1) and the
+                               #   distortions' search (C4); false: C5 relaxes the distortions
 !mace_model  : medium-mpa-0    # a mace_mp foundation model, or your own .model file
 
 # ======================================================================= A: host
@@ -8427,9 +8496,8 @@ dielectric_param   : CaO_ncp.param   # its own .param (NCP cut-off, fix_occupanc
 dielectric_cell    : CaO_ncp.cell    # its own .cell (species_pot: NCP)
 !dielectric        : 11.95     # static (electronic + ionic): skips the DFPT run
 # Competing phases for the chemical potentials: A3.1 runs the host's and the dopants' elements at
-# the screening settings (for C3), C4 the compounds of the dopants C3 keeps (also screening), and
-# E1.1 all of them, for the dopants that reach D, at the production settings (for E3). Your own
-# structure files...
+# the screening settings (for C3), and E1.1 all of them, compounds too, for the dopants that
+# reach D, at the production settings (for E3). Your own structure files...
 %block phases
 Ca      Ca.cell       metal  smearing_width=0.1  kspacing=0.03
 O2      O2.cell       molecule  spin=2  spin_polarized=true
@@ -8445,7 +8513,7 @@ phases_max_steps : 100         # geometry steps for each phase's relaxation (CAS
 !phases_molecule_box : 15 ang  # the box for doped's molecules (H2, N2, O2, F2, Cl2): doped's
                                #   own 30 A has eight times the volume (default: 15 A)
 # ...or E's limits themselves (eV per atom, absolute: the same reference as your production
-# runs; C3 and C4 then compare the defects within each composition only, unless phases are given)
+# runs; C3 then compares the defects within each composition only, unless phases are given)
 !%block chemical_potentials
 !O-rich   Ca=-1008.6  O=-432.6  Sb=-505.1
 !O-poor   Ca=-1002.0  O=-439.2  Sb=-503.0
@@ -8482,7 +8550,7 @@ scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this
 # deep level (deep_level_margin, below), from the band edges' effective masses (A2.2).
 !screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate
 !supercell : 14 ang            # fix the screening cell (a length, or n: n x transform)
-# B4: the electronic cell, where everything from C5 on runs (but C9's test of the screening cell):
+# B4: the electronic cell, where everything from C4 on runs (but C8's test of the screening cell):
 # the smallest size at least as big as the screening cell that folds every band-edge k-point
 # (each valley's symmetry-equivalent copies too) onto Gamma, so a Gamma-point run sees the real
 # gap, and is above the Gamma-only floor for a level electronic_depth from a band edge.
@@ -8501,10 +8569,10 @@ screen_spins     : triplet     # the starting spin: triplet (a doublet for an od
 !screen_cutoff   : 500 eV      # a lower cut-off for screening (default: production)
 screen_max_steps : 50          # geometry steps per screening relaxation
 %block screen_overrides        # any other .param keywords for the screening runs, and for
-                               #   A3.1's and C4's phases
+                               #   A3.1's phases
 elec_energy_tol : 1e-5
 !fine_gmax : 35 1/ang          # a finer density grid, for hard ultrasoft potentials at a low
-                               #   screen_cutoff: a cell relaxation in A3.1 or C4 that keeps
+                               #   screen_cutoff: a cell relaxation in A3.1 that keeps
                                #   reverting, as its energy jumps when the grid changes
 %endblock screen_overrides
 !configuration_margin : 1.0 eV # C1: drop arrangements this far above the lowest of their
@@ -8512,9 +8580,6 @@ elec_energy_tol : 1e-5
 hull_margin   : 0.2 eV         # C3: keep arrangements within this of the defect hull
 site_margin   : 0.5 eV         # C3: drop a defect this far above the lowest one with the
                                #   same dopant atoms at every growth condition and Fermi level
-max_formation_energy : 2.0 eV  # C3, C4: drop a defect whose formation energy is above this at
-                               #   every growth condition and Fermi level (C3: the dopants at
-                               #   their elements; C4: held by their compounds)
 require_gap_states : none      # none | occupied | empty | both (filled and empty levels)
 !require_spin : 2              # e.g. 2 = triplet ground state
 require_bound : false          # bound against its isolated components
@@ -8526,29 +8591,32 @@ distort_charges : relevant     # C3: the charge states carried on: relevant (the
                                #   with a shallow carrier on the defect) | stable (the stable
                                #   ones, plus any in a band) | screened (every one)
 charge_margin : 0.5 eV         #   a distortion may lower a charge state about this much
-                               #   (CaO:Sb's C6: 0.34 eV for a bound one)
+                               #   (CaO:Sb's C5: 0.34 eV for a bound one)
 !carrier_reach    : 1.0 eV     #   a band state's carrier at most this far inside its band ...
 !carrier_fraction : 0.2        #   ... and spread over at most this fraction of the cell's atoms
-distortions   : -0.4 -0.2 0.2 0.4  # C5: ShakeNBreak's bond distortions (its own default is
-                               #   -0.6 to 0.6 in steps of 0.1: for CaO:Sb these four found
-                               #   every lowest structure that one did)
+!distortions  : -0.4 -0.2 0.2 0.4  # C4: ShakeNBreak's bond distortions (default: its own,
+                               #   -0.6 to 0.6 in steps of 0.1), each charge state's with its own
+                               #   number of neighbours, all relaxed with MACE and pooled (with
+                               #   mace : false, these four by default, each relaxed in C5)
+distort_starts  : 2            # C5: the lowest distinct MACE minima each charge state is relaxed
+                               #   from in CASTEP, beside its screened structure
 distort_around  : auto         # auto: a single defect's site, a nearest-neighbour complex's
                                #   centre, else each component in turn | centre | each |
                                #   anchor (the first component, e.g. the dopant) | vacancy
 distort_cell    : electronic   # where everything after C3 works: electronic (B4's cell;
                                #   C1-C3 screen every candidate in the smaller screening
-                               #   cell) | screening (C5-C7 stay there)
+                               #   cell) | screening (C4-C6 stay there)
 !%block oxidation_states       # for the number of neighbours to distort
 !Ca +2
 !O  -2
 !Sb +3
 !%endblock oxidation_states
-# C7: the ground states: C6's relaxations, with a winning distortion tried in the other charge
+# C6: the ground states: C5's relaxations, with a winning structure tried in the other charge
 # states.
-distortion_min_gain : 0.05 eV  # a distortion counts if it beats the unperturbed by this
-share_rounds    : 2            # rounds of sharing distortions
-keep_structures : 1            # per charge state, on to C8
-# C8: in the electronic cell, at the screening settings. Each charge state's ground state is
+distortion_min_gain : 0.05 eV  # a structure counts if it beats the screened one by this
+share_rounds    : 2            # rounds of sharing winning structures between charge states
+keep_structures : 1            # per charge state, on to C7
+# C7: in the electronic cell, at the screening settings. Each charge state's ground state is
 # relaxed: a triplet (spin within spin_tol of excite_spin) goes on, a band state is left
 # 'pending' (PBE can't place it), any other only to E. Its defect levels are the bands localised
 # on the defect (participation number at most local_fraction of the atoms), in the gap or up to
@@ -8557,7 +8625,7 @@ keep_structures : 1            # per charge state, on to C8
 # inside excite_window), the promoted electron stays on the defect and the 1D Debye-Waller
 # estimate is at least excite_min_dw. Defects that pass go on to D with all their charge states,
 # and so does every native defect (for E). Test CASTEP's ΔSCF on one defect first.
-excite         : true          # false: everything C7 kept goes on to D as it is
+excite         : true          # false: everything C6 kept goes on to D as it is
 excite_spin    : 2             # CASTEP's spin: 2 = triplet; any: every spin state
 !spin_tol      : 0.3
 !local_fraction : 0.2
@@ -8566,11 +8634,11 @@ excite_min     : 0.4 eV
 !excite_window : 0.3 3.5 eV    # pass only if the ZPL is in this window
 !excite_min_dw : 0.05          # pass only if the 1D Debye-Waller estimate is at least this
 excite_relax   : true          # relax the excited state (the ZPL); false: vertical energy
-!%block excite_overrides       # any other .param keywords for C8's runs
+!%block excite_overrides       # any other .param keywords for C7's runs
 !deltascf_smearing : 0.01
 !%endblock excite_overrides
-# C9 (optional): a test of the screening cell's finite-size error, which C3's hull rests on.
-# Each defect named here is relaxed in each charge state C7 kept (its lowest structure; band
+# C8 (optional): a test of the screening cell's finite-size error, which C3's hull rests on.
+# Each defect named here is relaxed in each charge state C6 kept (its lowest structure; band
 # states left out) at the production settings (production_overrides, with the stress on) in the
 # screening cell and in the next validate_sizes sizes up. The line E_inf + b/N through the bigger
 # sizes is the reference for three estimates from the screening cell: its E as it is, less
@@ -8578,7 +8646,7 @@ excite_relax   : true          # relax the excited state (the ZPL); false: verti
 # validate_gamma, Gamma-point single points of the same structures show the Gamma-only error.
 # Costly: the ladder's biggest cells, so name two or three defects.
 !validate : true
-!validate_defects : d001 d002  # B1's ids (default: every defect C7 kept)
+!validate_defects : d001 d002  # B1's ids (default: every defect C6 kept)
 !validate_sizes   : 3          # how many sizes above the screening cell
 !validate_tol     : 0.05 eV    # how close each estimate must come (levels too)
 !validate_gamma   : true
@@ -8587,9 +8655,9 @@ excite_relax   : true          # relax the excited state (the ZPL); false: verti
 !%endblock elastic_constants   #   (e.g. PBE's) are better, as the stress comes from it
 
 # ======================================================================= D: production
-# D1: every charge state of each defect C8 passes (and of every native defect) relaxed at the
+# D1: every charge state of each defect C7 passes (and of every native defect) relaxed at the
 # production settings (A1's cut-off and k-points), in the electronic cell, with the pristine
-# cell's single point. D2: the production ΔSCF of C8's excitations. A single point with the
+# cell's single point. D2: the production ΔSCF of C7's excitations. A single point with the
 # bands' weights first checks that each constrained band keeps its number at every k-point
 # (inside the gap, spread less than band_spread_tol); where it doesn't, the ΔSCF runs at Gamma.
 %block production_overrides
@@ -8672,18 +8740,17 @@ max_restarts : 20              # a relaxation that runs out of time carries on t
 poll      : 300
 delete_check : true            # delete each .check once its calculation has finished
 # ... and for some steps only, in a runner block: runner_host for all of phase A's CASTEP
-# steps (A1 to A3.1) and the competing phases (C4, E1.1), runner_screen for the defects at the
-# screening settings (C2, C3's single points, C6, C7, C8) and runner_production for those at
-# the production settings (C9, D1, D2, F1, F2's single points); for one step: runner_converge
+# steps (A1 to A3.1) and the competing phases (E1.1), runner_screen for the defects at the
+# screening settings (C2, C3's single points, C5, C6, C7) and runner_production for those at
+# the production settings (C8, D1, D2, F1, F2's single points); for one step: runner_converge
 # (A1), runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3), runner_ref_phases
-# (A3.1), runner_filter (C3), runner_dopant_phases (C4), runner_drelax (C6), runner_rank (C7),
-# runner_excite (C8), runner_validate (C9), runner_relaxations (D1), runner_zpl (D2),
-# runner_phases (E1.1), runner_ccd (F1), runner_lineshape (F2); the MACE
-# jobs have blocks of their own (below). A step's own block wins over its group's, and that
-# wins over the settings above, for the keywords they give (a %block partitions in one replaces
-# the whole list).
+# (A3.1), runner_filter (C3), runner_drelax (C5), runner_rank (C6), runner_excite (C7),
+# runner_validate (C8), runner_relaxations (D1), runner_zpl (D2), runner_phases (E1.1),
+# runner_ccd (F1), runner_lineshape (F2); the MACE jobs have blocks of their own (below). A
+# step's own block wins over its group's, and that wins over the settings above, for the
+# keywords they give (a %block partitions in one replaces the whole list).
 # Starting points for CaO:Sb on Cirrus - set your own:
-%block runner_host             # A1 to A3.1, C4, E1.1: the primitive cell and the competing
+%block runner_host             # A1 to A3.1, E1.1: the primitive cell and the competing
                                #   phases
 max_cores    : 32
 max_walltime : 4:00:00
@@ -8692,14 +8759,14 @@ max_walltime : 4:00:00
 max_cores    : 16
 max_walltime : 0:20:00
 %endblock runner_converge
-%block runner_screen           # C2, C3, C6, C7, C8: Gamma-only screening jobs
+%block runner_screen           # C2, C3, C5, C6, C7: Gamma-only screening jobs
 max_restarts : 0               # (the default for screening: a job that fails is flagged)
 %endblock runner_screen
-%block runner_drelax           # C6: relaxations in the electronic cell, phase C's biggest
+%block runner_drelax           # C5: relaxations in the electronic cell, phase C's biggest
 max_cores    : 288
 max_walltime : 24:00:00
 %endblock runner_drelax
-%block runner_production       # C9, D1, D2, F1, F2: the production settings, electronic cell
+%block runner_production       # C8, D1, D2, F1, F2: the production settings, electronic cell
 max_cores    : 288             # up to a node (more: whole nodes, e.g. 576 for two)
 %endblock runner_production
 # On a machine that charges whole nodes, such as ARCHER2: jobscript : archer2.sh,
@@ -8721,9 +8788,9 @@ mace_jobscript : cirrus_mace.sh    # a Slurm template with a {COMMAND} line
                                #   as the compute nodes can't see /home)
 # B2 relaxes every candidate in every size it fits, which for a big screen is thousands of
 # relaxations, shared out over at most mace_max_jobs jobs: give it more jobs, and the time they
-# need, in its own block (runner_prerelax does the same for C1). Such a block may give
-# mace_jobscript, mace_pack, mace_max_jobs, mace_threads, mace_python, mace_device and
-# max_walltime, each job's --time (default: the template's):
+# need, in its own block (runner_prerelax and runner_distort do the same for C1 and C4). Such a
+# block may give mace_jobscript, mace_pack, mace_max_jobs, mace_threads, mace_python,
+# mace_device and max_walltime, each job's --time (default: the template's):
 !%block runner_scan
 !mace_max_jobs : 40
 !max_walltime  : 12:00:00

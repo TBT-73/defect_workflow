@@ -22,28 +22,29 @@ mem_per_core   : 4.5           # GB: the template's 180G per node; a job that ne
 !max_walltime  : 12:00:00      # the longest a job may run (default: the template's --time)
 dryrun_on        : compute     # the dry runs as jobs, up to dryrun_pack of a step's side by
 dryrun_time      : 0:30:00     #   side in one job, one process each (on one node)
-dryrun_pack      : 40
+dryrun_pack      : 80
 !dryrun_on       : login       # ... or where dwf.py runs, with CASTEP's module loaded there
 !dryrun_cmd      : castep.mpi --dryrun {seed}
-max_jobs  : 16                 # most jobs of one step queued at once
-max_restarts : 20              # a relaxation that runs out of time carries on this many times
+max_jobs  : 80                 # most jobs of one step queued at once
+max_restarts : 2              # a relaxation that runs out of time carries on this many times
 poll      : 30
 delete_check : true            # delete each .check once its calculation has finished
 # ... and for some steps only, in a runner block: runner_host for all of phase A's CASTEP
-# steps (A1 to A3.1), runner_screen for those at the screening settings (C2, C3's single
-# points, C5, C6, C7) and runner_production for those at the production settings (C8, D1, D2,
-# F1, F2's single points); for one step: runner_converge (A1), runner_relax (A2.1),
-# runner_bands (A2.2), runner_dielectric (A2.3), runner_phases (A3.1), runner_filter (C3),
-# runner_drelax (C5), runner_rank (C6), runner_excite (C7), runner_validate (C8),
-# runner_relaxations (D1), runner_zpl (D2), runner_ccd (F1), runner_lineshape (F2); the MACE
-# jobs have blocks of their own (below). A step's own block wins over its group's, and that
-# wins over the settings above, for the keywords they give (a %block partitions in one replaces
-# the whole list).
+# steps (A1 to A3.1) and the competing phases (E1.1), runner_screen for the defects at the
+# screening settings (C2, C3's single points, C5, C6, C7) and runner_production for those at
+# the production settings (C8, D1, D2, F1, F2's single points); for one step: runner_converge
+# (A1), runner_relax (A2.1), runner_bands (A2.2), runner_dielectric (A2.3), runner_ref_phases
+# (A3.1), runner_filter (C3), runner_drelax (C5), runner_rank (C6), runner_excite (C7),
+# runner_validate (C8), runner_relaxations (D1), runner_zpl (D2), runner_phases (E1.1),
+# runner_ccd (F1), runner_lineshape (F2); the MACE jobs have blocks of their own (below). A
+# step's own block wins over its group's, and that wins over the settings above, for the
+# keywords they give (a %block partitions in one replaces the whole list).
 # Starting points for CaO:Sb on young-ng - set your own. Young's documentation suggests jobs
 # of 2 to 5 nodes; a Cirrus job of 288 cores would be about 7 of Young's nodes.
-%block runner_host             # A1 to A3.1: the primitive cell and the competing phases
-max_nodes    : 2
-max_walltime : 2:00:00
+%block runner_host             # A1 to A3.1, E1.1: the primitive cell and the competing
+                               #   phases
+max_nodes    : 1
+max_walltime : 1:00:00
 %endblock runner_host
 %block runner_converge         # A1: single points of the 2-atom primitive cell
 max_nodes    : 1
@@ -61,10 +62,11 @@ max_walltime : 0:20:00
 %block runner_screen           # C2, C3, C5, C6, C7: Gamma-only screening jobs
 max_restarts : 1
 max_nodes    : 1
-max_walltime : 2:00:00
-array        : 500             # jobs planned alike in Slurm job arrays of up to 500 tasks
-max_jobs     : 500             # at most 500 tasks queued at once (UCL caps an array at 1,000)
-!array_min   : 125             # send another array once this many places are free (default: a
+max_walltime : 4:00:00
+pack         : 20
+array        : 50             # jobs planned alike in Slurm job arrays of up to 500 tasks
+max_jobs     : 50             # at most 500 tasks queued at once (UCL caps an array at 1,000)
+!array_min   : 10             # send another array once this many places are free (default: a
                                #   quarter of array, 125 here): bigger means fewer, bigger
                                #   arrays, but a queue that runs lower while the runner waits.
                                #   C5, C6 and C7 would inherit it too (capped at their 16)
@@ -75,7 +77,7 @@ max_restarts : 3               # a relaxation that runs out of its 24 hours carr
 max_walltime : 24:00:00
 max_jobs     : 16              # runner_screen's 500 is for C2's thousands
 %endblock runner_drelax
-%block runner_rank             # C6: distortions tried in other charge states
+%block runner_rank             # C6: winning structures tried in other charge states
 max_nodes    : 4
 max_restarts : 3
 max_walltime : 24:00:00
@@ -103,7 +105,7 @@ max_nodes    : 4
 # partition rejects whole-node jobs); pack : N then runs N small jobs side by side on a node.
 
 # ======================================================================= MACE jobs
-mace_threads : 8               # threads per MACE relaxation
+mace_threads : 1               # threads per MACE relaxation
 # The MACE relaxations run where dwf.py runs, unless mace_jobscript is given: then as jobs on
 # compute nodes, each running up to mace_pack relaxations side by side (default
 # cores_per_node / mace_threads, 5 here) on a whole node (young-ng doesn't share CPU nodes),
@@ -116,13 +118,19 @@ mace_jobscript : young_ng_mace.sh  # a Slurm template with a {COMMAND} line
 # B2 relaxes every candidate in every size it fits: here 4,709 candidates in up to seven sizes,
 # tens of thousands of relaxations, shared out over at most mace_max_jobs jobs of mace_pack (5)
 # side by side, so the 4 jobs above run 20 at a time. Give B2 more jobs (each is a node: check
-# what Young lets you queue), and the time they need, in its own block (runner_prerelax does the
-# same for C1). Such a block may give mace_jobscript, mace_pack, mace_max_jobs, mace_threads,
-# mace_python, mace_device and max_walltime, each job's --time (default: the template's):
-!%block runner_scan
-!mace_max_jobs : 40
-!max_walltime  : 24:00:00
-!%endblock runner_scan
+# what Young lets you queue), and the time they need, in its own block (runner_prerelax and
+# runner_distort do the same for C1 and C4, whose relaxations are in the electronic cell). Such
+# a block may give mace_jobscript, mace_pack, mace_max_jobs, mace_threads, mace_python,
+# mace_device and max_walltime, each job's --time (default: the template's):
+%block runner_scan
+mace_max_jobs : 50
+mace_pack     : 40
+max_walltime  : 4:00:00
+%endblock runner_scan
+%block runner_distort         # C4: every survivor's distortions in the electronic cell:
+mace_max_jobs : 20            #   fewer relaxations than B2's but bigger ones; size it
+max_walltime  : 1:00:00      #   once you know how many survive C3
+%endblock runner_distort
 
 # ======================================================================= F2's model jobs
 model_jobscript : young_ng_gpu.sh  # F2's trainings and phonons as jobs on one of
