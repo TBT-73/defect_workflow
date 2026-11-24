@@ -75,6 +75,7 @@ The example folder holds the project's two files and every file they name:
 | `cirrus_mace.sh` | jobscript template for the MACE jobs (B2, C1, C4) on Cirrus |
 | `cirrus_gpu.sh` | jobscript template for the model jobs (F2's trainings and phonons) on a Cirrus GPU |
 | `archer2.sh`, `archer2_mace.sh` | the same for ARCHER2 (`CaO_Sb.run` says what else to change) |
+| `young_ng.sh`, `young_ng_mace.sh`, `young_ng_gpu.sh` | the same for UCL's Young (young-ng); `young_ng_gpu.sh` runs the MACE jobs on its A100s, and F2's model jobs |
 | `CaO_ncp.cell`, `CaO_ncp.param` | the DFPT dielectric run (A2.3): norm-conserving potentials, fixed occupancies |
 | `Ca.cell`, `O2.cell`, `Sb.cell`, `Sb2O3.cell` | competing phases (the elements in A3.1, all four in E1.1): fcc Ca, O₂ in a box, A7 Sb, senarmontite Sb₂O₃, near their experimental structures |
 
@@ -159,8 +160,12 @@ Every step uses its batch mode, which runs the structures `dwf.py` builds.
 **The MACE jobs.** With `mace_jobscript`, the MACE relaxations (B2, C1, C4) run as Slurm jobs made
 from that template: its `{COMMAND}` line becomes up to `mace_pack` workers side by side
 (default `cores_per_node` / `mace_threads`: 36 on Cirrus, 16 on ARCHER2), each running
-`python3 dwf.py --mace-worker tasks_NN.json` with `mace_threads` threads, and the relaxations are
-shared out between at most `mace_max_jobs` jobs, biggest first. A `{NCORES}` in the template becomes
+`python3 dwf.py --mace-worker tasks.json` with `mace_threads` threads. The relaxations are shared
+out between at most `mace_max_jobs` jobs, biggest first, and a job's workers share its queue,
+`tasks.json`: each takes the next relaxation no other worker has taken (a claim file in the job's
+`claims/`), until none are left. A job holds its node until its last worker ends, so this keeps
+the node busy to the end: with a list fixed for each worker beforehand, the node waited for the
+slowest list, as a relaxation's cost goes with its steps, which nothing knows in advance. A `{NCORES}` in the template becomes
 the cores the job's workers use (workers × `mace_threads`), so on Cirrus a job asks for, and is
 charged for, just those. Each result goes into its own cache file as soon as it is done, so a job
 that runs out of time loses only the relaxations it hadn't finished: they go into a new job, three
@@ -1867,15 +1872,25 @@ module load cray-python
 On ARCHER2 (`archer2_mace.sh`), which hands out whole nodes, it asks for `--nodes=1` and
 `--exclusive` instead.
 
+**On GPUs**, where there are any, the MACE relaxations run far faster than on CPU cores. Give the
+step's block `mace_device : cuda` and a GPU template, a small `mace_pack` (about 4, each worker
+holding its own cell on the GPU) and `mace_threads` (2): the workers share the job's one GPU
+(`dwf.py` gives them no GPUs of their own, so ask for one GPU a job) and its queue. The example's
+for young-ng's A100s, `young_ng_gpu.sh`, which F2's model jobs (`model_jobscript`) use too: the
+header asks for `--cpus-per-task={NCORES}` and `--gres=gpu:1`, and `CaO_screen.run` has B2's
+GPU block, commented out, beside its CPU one.
+
 | Placeholder | Replaced by |
 |---|---|
-| `{COMMAND}` | its line becomes one line per worker, `mace_pack` of them, each in the background, then `wait`: `env OMP_NUM_THREADS=<mace_threads> <mace_python> <dwf.py> --mace-worker tasks_NN.json > worker_NN.log 2>&1 &`. Anything in front of `{COMMAND}` on its line goes in front of each (e.g. `srun --exact --ntasks=1 --cpus-per-task=8 {COMMAND}` starts each worker with its own `srun`; without it the workers run on the job's node directly, which is enough for one node) |
+| `{COMMAND}` | its line becomes one line per worker, `mace_pack` of them, each in the background, then `wait`: `env OMP_NUM_THREADS=<mace_threads> <mace_python> <dwf.py> --mace-worker tasks.json > worker_NN.log 2>&1 &` (every worker the same queue, `tasks.json`). Anything in front of `{COMMAND}` on its line goes in front of each (e.g. `srun --exact --ntasks=1 --cpus-per-task=8 {COMMAND}` starts each worker with its own `srun`; without it the workers run on the job's node directly, which is enough for one node) |
 | `{JOBNAME}` | `dwf_mace_<step>_job_NNN` |
 | `{NCORES}` | the cores the job's workers use: workers × `mace_threads` (at most `mace_pack` × `mace_threads`) |
 
-The job's folder (`<phase>/jobs/mace_<step>/job_NNN/`) holds `job.sh`, the task files (the
-structures and settings), each worker's log, `slurm-<id>.out` and, once every worker has finished,
-`finished`. Each worker writes every relaxation's result to its file in `B_candidates/mace/` (C4's
+The job's folder (`<phase>/jobs/mace_<step>/job_NNN/`) holds `job.sh`, the job's queue
+`tasks.json` (the structures and settings, biggest first), `claims/` (one file for each
+relaxation a worker has taken: which node, process and time), each worker's log (a line for each
+relaxation it finished, and a last line once nothing was left for it: how many it did, and how
+long it worked), `slurm-<id>.out` and, once every worker has finished, `finished`. Each worker writes every relaxation's result to its file in `B_candidates/mace/` (C4's
 in `C_screen/mace/`) as soon as it has it. A step's own block in `NAME.run` (`%block runner_scan`
 for B2, `runner_prerelax` for C1, `runner_distort` for C4) can give its jobs a template of their own
 (`mace_jobscript`) and a `max_walltime`, which becomes their `--time` in place of the template's

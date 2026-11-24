@@ -2695,16 +2695,21 @@ def mace_python(p, step=None):
 
 # The MACE relaxations a step still needs (mace_relaxations), run as batch jobs on compute nodes, in
 # <phase>/jobs/mace_<step>/job_NNN/, with the step's MACE settings (mace_settings: the .run file's,
-# or its own block's, %block runner_scan or runner_prerelax). Each job is its mace_jobscript
-# template with its {COMMAND} line made into mace_pack workers, each running  <python> dwf.py
-# --mace-worker tasks_KK.json  (the python from mace_python()) in the background with mace_threads
-# threads (whatever is in front of {COMMAND} on its line, e.g. srun ..., goes in front of each),
-# then wait; a {NCORES} in the template becomes the cores those workers use (workers x
-# mace_threads), so on a machine that charges by the core (charging : core) a job asks for just
-# those, and the block's max_walltime becomes its --time. The relaxations are shared out between
-# at most mace_max_jobs jobs, biggest first, onto whichever worker has the fewest atoms so far, so
-# the workers finish together. The jobs go in jobs.json there; waiting polls the queue
-# (status_cmd) every poll seconds, like the CASTEP jobs, and the project's STOP file stops it. A
+# or its own block's, %block runner_scan or runner_prerelax). The relaxations are shared out
+# between at most mace_max_jobs jobs, biggest first, onto whichever job has the fewest atoms so
+# far. Each job is its mace_jobscript template with its {COMMAND} line made into up to mace_pack
+# workers, each running  <python> dwf.py --mace-worker tasks.json  (the python from mace_python())
+# in the background with mace_threads threads (whatever is in front of {COMMAND} on its line, e.g.
+# srun ..., goes in front of each), then wait; a {NCORES} in the template becomes the cores those
+# workers use (workers x mace_threads), so on a machine that charges by the core (charging : core)
+# a job asks for just those, and the block's max_walltime becomes its --time. The job's workers
+# share its one queue, tasks.json, biggest first: each takes the next relaxation no other has
+# taken (mace_worker, mace_claim), so none sits idle while another still has a list to work
+# through. (A job holds its node until its last worker ends. With a list fixed for each worker
+# beforehand, that was the slowest list, as a relaxation's cost goes with its steps, which nothing
+# knows in advance; with the shared queue it is only the last relaxation or two.) The jobs go in
+# jobs.json there; waiting polls Slurm's queue (status_cmd) every poll seconds, like the CASTEP
+# jobs, and the project's STOP file stops it. A
 # relaxation still missing once its job has ended (e.g. it ran out of time) goes into a new job, at
 # most MACE_ATTEMPTS times; then the run stops, with how the last of its jobs ended (why_ended).
 # --resubmit-failed gives those relaxations another MACE_ATTEMPTS jobs. Returns True when every
@@ -2757,33 +2762,32 @@ def mace_jobs(p, step, todo):
                 return f"{f.name} ends with: {lines[-1][:300]}"
         return "its workers' logs and Slurm output are empty"
 
-    # Writes the scripts of new jobs for some relaxations into a folder each (its task files, one
-    # per worker, and job.sh); returns [(folder, [cache files])].
+    # Writes the scripts of new jobs for some relaxations into a folder each (job.sh and the job's
+    # queue, tasks.json, biggest first, which its workers share); returns
+    # [(folder, [cache files])].
     def write_jobs(tasks, where):
         n_jobs = min(run.mace_max_jobs, math.ceil(len(tasks) / pack))
-        slots = [{"tasks": [], "atoms": 0} for _ in range(min(len(tasks), n_jobs * pack))]
+        shares = [{"tasks": [], "atoms": 0} for _ in range(n_jobs)]
         for t in sorted(tasks, key=lambda t: -len(t["atoms"])):
-            s = min(slots, key=lambda s: s["atoms"])
+            s = min(shares, key=lambda s: s["atoms"])
             s["tasks"].append(t)
             s["atoms"] += len(t["atoms"])
         made = []
-        for j in range(n_jobs):
+        for j, s in enumerate(shares):
             jdir = where(j)
             jdir.mkdir(parents=True, exist_ok=True)
-            files, caches = [], []
-            for k, s in enumerate(slots[j::n_jobs]):
-                f = jdir / f"tasks_{k + 1:02d}.json"
-                f.write_text(json.dumps({
-                    "model": model, "device": run.mace_device, "threads": run.mace_threads,
-                    "fmax": p.s.mace_fmax, "steps": p.s.mace_steps,
-                    "tasks": [dict({"cache": str(Path(t["cache"]).resolve()), "key": t["key"],
-                                    "label": t["label"], "atoms": atoms_to_dict(t["atoms"])},
-                                   **{k: (str(Path(p.model_path(t[k])).resolve())
-                                          if k == "model" else t[k])
-                                      for k in EXTRA_TASK_KEYS if t.get(k) is not None})
-                              for t in s["tasks"]]}))
-                files.append(f)
-                caches += [str(t["cache"]) for t in s["tasks"]]
+            f = jdir / "tasks.json"
+            f.write_text(json.dumps({
+                "model": model, "device": run.mace_device, "threads": run.mace_threads,
+                "fmax": p.s.mace_fmax, "steps": p.s.mace_steps,
+                "tasks": [dict({"cache": str(Path(t["cache"]).resolve()), "key": t["key"],
+                                "label": t["label"], "atoms": atoms_to_dict(t["atoms"])},
+                               **{k: (str(Path(p.model_path(t[k])).resolve())
+                                      if k == "model" else t[k])
+                                  for k in EXTRA_TASK_KEYS if t.get(k) is not None})
+                          for t in s["tasks"]]}))
+            caches = [str(t["cache"]) for t in s["tasks"]]
+            workers = min(pack, len(s["tasks"]))
             lines = template.splitlines()
             i = next(k for k, line in enumerate(lines)
                      if "{COMMAND}" in line and not line.lstrip().startswith("#"))
@@ -2792,13 +2796,13 @@ def mace_jobs(p, step, todo):
             cmds = [f"{pre}env OMP_NUM_THREADS={run.mace_threads} {shlex.quote(py)} "
                    f"{shlex.quote(me)} --mace-worker {shlex.quote(str(f.resolve()))}{post} > "
                    f"{shlex.quote(str((jdir / f'worker_{k + 1:02d}.log').resolve()))} 2>&1 &"
-                   for k, f in enumerate(files)]
+                   for k in range(workers)]
             cmds += ["wait", f"echo finished > {shlex.quote(str((jdir / 'finished').resolve()))}"]
             text = "\n".join(lines[:i] + cmds + lines[i + 1:]) + "\n"
             if run.max_walltime:                           # the step's own block: the jobs' time
                 text = sc.add_sbatch_option(text, f"--time={run.max_walltime}")
             name = f"dwf_mace_{step}_{jdir.name}"
-            cores = len(files) * run.mace_threads          # (for a template that asks for cores)
+            cores = workers * run.mace_threads             # (for a template that asks for cores)
             (jdir / "job.sh").write_text(text.replace("{JOBNAME}", name)
                                          .replace("{NCORES}", str(cores)))
             made.append((jdir, caches))
@@ -2863,18 +2867,39 @@ def mace_jobs(p, step, todo):
         time.sleep(args.poll)
 
 
-# What a MACE job's worker does (python3 dwf.py --mace-worker <tasks>.json, written by
-# mace_jobs): relaxes each structure in the file (mace_run, with the model file and settings given
-# there, or a task's own model, head, charge, fmax and steps) that its cache file doesn't hold
-# yet, and writes each result to its cache file as soon as it has it (save_mace_result); an error
-# goes into the cache file instead, for the workflow to report.
+# Takes a relaxation of a MACE job's queue for this worker: creates its claim file in the job's
+# claims/ folder, which only one worker can do (O_CREAT | O_EXCL is atomic, Lustre's too).
+# Returns whether this worker got it.
+#   Called by: mace_worker()
+def mace_claim(folder, cache):
+    f = folder / hashlib.md5(str(cache).encode()).hexdigest()[:16]
+    try:
+        fd = os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w") as fh:
+        fh.write(f"{socket.gethostname()} {os.getpid()} {time.strftime('%H:%M:%S')} {cache}\n")
+    return True
+
+
+# What a MACE job's worker does (python3 dwf.py --mace-worker tasks.json, written by mace_jobs):
+# works through the job's queue, biggest first, with the job's other workers: each relaxation
+# that its cache file doesn't hold yet and no other worker has taken (mace_claim) it relaxes
+# (mace_run, with the model file and settings given there, or a task's own model, head, charge,
+# fmax and steps), and writes the result to its cache file as soon as it has it
+# (save_mace_result); an error goes into the cache file instead, for the workflow to report. Ends
+# when nothing is left to take, saying how many it did. (A job written by an older dwf.py gives
+# each worker a file of its own, tasks_KK.json, which it works through the same way.)
 #   Called by: main()
-#   Calls:     atoms_from_dict(), mace_run(), save_mace_result()
+#   Calls:     atoms_from_dict(), mace_claim(), mace_run(), save_mace_result()
 def mace_worker(path):
-    spec = json.loads(Path(path).read_text())
-    calcs = {}
-    log(f"MACE worker: {len(spec['tasks'])} relaxations, model {spec['model']}, "
-        f"{spec['threads']} threads")
+    path = Path(path)
+    spec = json.loads(path.read_text())
+    claims = path.parent / "claims"
+    claims.mkdir(exist_ok=True)
+    calcs, mine, began = {}, 0, time.time()
+    log(f"MACE worker: {len(spec['tasks'])} relaxations in {path.name}, shared with the job's "
+        f"other workers; model {spec['model']}, {spec['threads']} threads")
     for t in spec["tasks"]:
         cache = Path(t["cache"])
         try:
@@ -2882,6 +2907,9 @@ def mace_worker(path):
                 continue                          # done already (an earlier job)
         except (OSError, ValueError):
             pass
+        if not mace_claim(claims, cache):
+            continue                              # another worker has it
+        mine += 1
         start = time.time()
         try:
             model, head = t.get("model") or spec["model"], t.get("head")
@@ -2904,6 +2932,8 @@ def mace_worker(path):
         except Exception as err:                  # anything MACE or torch raises
             save_mace_result(cache, t["key"], error=f"{type(err).__name__}: {err}")
             log(f"{t['label']}: FAILED: {type(err).__name__}: {err}")
+    log(f"MACE worker: nothing left to take; {mine} relaxations here in "
+        f"{time.time() - began:.0f} s")
 
 
 # --------------------------------------------------------------------------

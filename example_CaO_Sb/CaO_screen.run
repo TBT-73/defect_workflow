@@ -127,6 +127,16 @@ mace_max_jobs : 50
 mace_pack     : 40
 max_walltime  : 4:00:00
 %endblock runner_scan
+# ...or B2 on young-ng's A100s (instead of the block above): a few workers share each job's one
+# GPU (young_ng_gpu.sh), taking relaxations from the job's queue until none are left
+!%block runner_scan
+!mace_jobscript : young_ng_gpu.sh
+!mace_device    : cuda
+!mace_pack      : 4
+!mace_threads   : 2
+!mace_max_jobs  : 8
+!max_walltime   : 4:00:00
+!%endblock runner_scan
 %block runner_distort         # C4: every survivor's distortions in the electronic cell:
 mace_max_jobs : 20            #   fewer relaxations than B2's but bigger ones; size it
 max_walltime  : 1:00:00      #   once you know how many survive C3
