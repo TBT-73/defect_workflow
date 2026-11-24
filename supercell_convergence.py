@@ -345,9 +345,11 @@ TOTAL_TIME = re.compile(r"^\s*Total time\s*=\s*([\d.]+)\s*s", re.M)
 GEOM_STEP = re.compile(r"finished iteration\s+\d+")
 OUT_OF_TIME = "Insufficient time for another iteration"   # CASTEP stopped at run_time
 # How long before its walltime a relaxation's run_time stops CASTEP (s; doubled after a job is
-# killed at the time limit anyway). CASTEP checks run_time before each SCF iteration, so this only
-# has to cover what that check doesn't: the job's start-up before CASTEP's clock starts, forces
-# and stress after an SCF that converges near the limit, writing the .check, and shutting down
+# killed at the time limit anyway). As each geometry iteration starts, CASTEP checks it has time
+# for one as long as the last ("Insufficient time for another iteration" if not), so it stops
+# between geometry steps on its own; this only has to cover what that check doesn't: the job's
+# start-up before CASTEP's clock starts, an iteration that runs longer than the last (a line
+# search's extra steps), writing the .check, and shutting down
 RUN_TIME_MARGIN = 300.0
 # CASTEP failed to read the .check file it was asked to carry on from
 CHECK_UNREADABLE = re.compile(r"model_continuation|model_read|wave_read|Error reading[^\n]*check",
@@ -1602,8 +1604,8 @@ def plan_walltime(calc, script, dr, procs, ctx, args):
 
 
 # CASTEP's run_time for a job with a given walltime (s).
-# The walltime minus RUN_TIME_MARGIN, so CASTEP stops cleanly (it checks run_time before each SCF
-# iteration, stopping mid-SCF if need be) and writes its .check before Slurm stops the job; the
+# The walltime minus RUN_TIME_MARGIN, so CASTEP stops cleanly (it won't start a geometry iteration
+# that the last one's time says won't fit) and writes its .check before Slurm stops the job; the
 # continuation picks up from there. The margin is multiplied by a factor that restart doubles
 # after a job is killed anyway, and is never more than half the walltime.
 #   Called by: finalize(), restart(), share_walltime()

@@ -561,7 +561,7 @@ The reference calculations every later phase depends on.
 | A2.1 | `relax` | variable-cell relaxation of the host | it doesn't finish |
 | A2.2 | `bands` | single point on a denser Γ-centred grid: VBM, CBM, gap | no `.bands` file |
 | A2.3 | `dielectric` | DFPT for the static and optical dielectric constants, or the value you give | no permittivity in the output, or only the optical one |
-| A3.1 | `ref_phases` | the reference energies at the screening settings: a single point of the host, and the pure elements of the host and each dopant relaxed (the compounds run only in E1.1) | a phase doesn't finish |
+| A3.1 | `ref_phases` | the reference energies at the screening settings: single points of the host and of the pure elements of the host and each dopant (the smallest polymorph within `ref_polymorph_window`, at `ref_kspacing_factor` × A1's spacing; `ref_relax` to relax them; the compounds run only in E1.1) | a phase doesn't finish |
 | A3.2 | `ref_limits` | the chemical-potential limits at the screening settings, against the elements alone, each dopant at its element | a pure element of the host is missing |
 
 Every job copies the host `.cell`'s `species_pot` (and anything else in it apart from the
@@ -615,8 +615,15 @@ D. They come from `%block phases` (your structure files, one per line, with opti
 neither (no limits: C3 then compares defects only within their composition groups, and E3 leaves out
 the μ terms). `%block chemical_potentials` gives E1.2 its limits itself (E1.1 runs nothing), on the
 production settings' energy scale, which the screening runs don't share: A3 still runs the phases of
-`%block phases` or doped, if given. Solids relax lattice and positions; molecules relax in their
-fixed box at Γ. doped puts its molecules (H₂, N₂, O₂, F₂, Cl₂) in 30 Å boxes, and `dwf.py` moves
+`%block phases` or doped, if given. In E1.1 solids relax lattice and positions (in A3.1 they are
+single points, unless `ref_relax` says otherwise); molecules relax in their fixed box at Γ.
+doped's phases are run as the Materials Project's structures are best run: each solid as its
+primitive cell, made exactly symmetric (pymatgen's `SpacegroupAnalyzer`), so `symmetry_generate`
+finds every operation; and without the moments the Materials Project's own runs ended with below
+0.1 μB, which are noise (−0.001 μB on one atom of non-magnetic Na made CASTEP take that atom for
+another species and keep 6 of its 24 symmetry operations). A phase with no moment left runs
+without spin polarisation (`spin_polarized : false`), half the cost, which a non-magnetic phase
+doesn't need; O₂ keeps its triplet. Your own structure files (`%block phases`) are run as they are. doped puts its molecules (H₂, N₂, O₂, F₂, Cl₂) in 30 Å boxes, and `dwf.py` moves
 each into a box of `phases_molecule_box` (15 Å) instead: in a plane-wave code the vacuum costs as
 much as the atoms, and a 30 Å box has eight times the volume, so about eight times the plane waves,
 memory and time. The molecules of `%block phases` keep their files' boxes.
@@ -641,16 +648,35 @@ that they match C2's runs (`screen_cutoff` and `%block screen_overrides`, but no
 `screen_max_steps`, which is for the defects; `A_host/jobs/ref_phases/`): a single point of the host
 on A2.1's relaxed cell, the cell the defect supercells are built from, and the defects'
 constituents, the pure elements of the host and of each dopant. A compound, even the host's own
-(CaO₂ for CaO), is run only in E1.1, at the production settings. From doped, each element only once,
-the phase lowest above the hull. A cell relaxed at a lower cut-off than production comes out a
-little off in volume (Pulay stress), which changes its energy only to second order. Each relaxation
-(here and in E1.1) gets `phases_max_steps` (100) geometry steps: CASTEP's own 30 can be too few for
-a soft metal's cell. At a low `screen_cutoff`, a hard ultrasoft potential (O, or Be with its 1s
-electrons in valence) may need a finer density grid than CASTEP's default: its energy then jumps
-whenever the grid changes as the cell relaxes, and the relaxation keeps "reverting to earlier
-configuration" until it runs out of steps. `fine_gmax : 35 1/ang` in `%block screen_overrides` gives
-the screening runs and these phases a finer grid alike. Without `%block phases` or
-`phases_from : doped` nothing runs, and C3 makes no cuts across composition groups.
+(CaO₂ for CaO), is run only in E1.1, at the production settings. Of these only the host and its
+own elements decide anything (C3's cut across a dopant's sites, where the dopant's chemical
+potential cancels); the dopants' elements give the least formation energy C3's table shows. So
+they are needed to tens of meV/atom, not to A1's 1 meV/atom, and A3.1 keeps them cheap:
+
+- **One polymorph of each element, a small one.** Of doped's polymorphs within
+  `ref_polymorph_window` (0.02 eV/atom) of the lowest above the hull, the one with the fewest
+  atoms. Polymorphs can lie within meV/atom of each other, where which comes lowest is noise:
+  doped's lowest Na was α-Mn's structure, 29 atoms in its primitive cell, against hcp's 2. The
+  table says which were taken over a lower one.
+- **Single points** (`ref_relax : none`, the default) of the structures as given: doped's are the
+  Materials Project's, already relaxed with PBE. Relaxing the cell at a low `screen_cutoff` can run
+  away: the Pulay stress of an unconverged basis is not the derivative of the energy being
+  minimised, and a soft metal's cell follows it (Na's grew by two thirds while its energy rose
+  0.18 eV/atom, a 2-hour job at a time). `ref_relax : positions` relaxes the positions in the given
+  cell, `cell` lattice and positions, with `phases_max_steps` geometry steps each.
+- **A coarser k-point spacing**: A1's (or a phase's own `kspacing=`) times `ref_kspacing_factor`;
+  2 gives half the k-points in each direction, an eighth in all. The host's single point too;
+  molecules stay at Γ. The table gives each phase's grid. The factor scales A1's spacing, which
+  was converged for the host: if an insulating host converged on a coarse grid, check the metals'
+  grids in the table.
+
+At a low `screen_cutoff`, a hard ultrasoft potential (O, or Be with its 1s electrons in valence)
+may need a finer density grid than CASTEP's default: its energy then jumps whenever the grid
+changes as a cell relaxes, and the relaxation keeps "reverting to earlier configuration" until it
+runs out of steps. `fine_gmax : 35 1/ang` in `%block screen_overrides` gives the screening runs and
+these phases a finer grid alike (it was needed for relaxed cells; for single points it only costs
+time). Without `%block phases` or `phases_from : doped` nothing runs, and C3 makes no cuts across
+composition groups.
 
 **A3.2 ref_limits.** A pymatgen phase diagram of A3.1's host and its pure elements (it needs one of
 each). Each corner of the host's stability region is a limit, named after the phases there
@@ -1416,7 +1442,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **O**: [`omp_threads`](#runner-settings) (runner) · [`%block oxidation_states`](#c-screening-ground-and-excited-states) (C)
 - **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-the-screening-and-electronic-cells) (B) · [`pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`phases_max_steps`](#a-host) (A) · [`phases_molecule_box`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
 - **Q**: [`quench_temperature`](#e-thermodynamics) (E)
-- **R**: [`rattle_dmin`](#c-screening-ground-and-excited-states) (C) · [`rattle_stdev`](#c-screening-ground-and-excited-states) (C) · [`require_bound`](#c-screening-ground-and-excited-states) (C) · [`require_gap_states`](#c-screening-ground-and-excited-states) (C) · [`require_spin`](#c-screening-ground-and-excited-states) (C) · [`%block runner_scan`, `runner_prerelax`, `runner_distort`](#mace) (MACE) · [`%block runner_host`, `runner_screen`, `runner_production`, `runner_<step>`](#runner-settings) (runner)
+- **R**: [`rattle_dmin`](#c-screening-ground-and-excited-states) (C) · [`rattle_stdev`](#c-screening-ground-and-excited-states) (C) · [`ref_kspacing_factor`](#a-host) (A) · [`ref_polymorph_window`](#a-host) (A) · [`ref_relax`](#a-host) (A) · [`require_bound`](#c-screening-ground-and-excited-states) (C) · [`require_gap_states`](#c-screening-ground-and-excited-states) (C) · [`require_spin`](#c-screening-ground-and-excited-states) (C) · [`%block runner_scan`, `runner_prerelax`, `runner_distort`](#mace) (MACE) · [`%block runner_host`, `runner_screen`, `runner_production`, `runner_<step>`](#runner-settings) (runner)
 - **S**: [`scan`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_edge_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_lengths`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_test`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`screen_charges`](#c-screening-ground-and-excited-states) (C) · [`screen_cutoff`](#c-screening-ground-and-excited-states) (C) · [`screen_max_steps`](#c-screening-ground-and-excited-states) (C) · [`screen_min_image`](#b-candidates-the-screening-and-electronic-cells) (B) · [`%block screen_overrides`](#c-screening-ground-and-excited-states) (C) · [`screen_spins`](#c-screening-ground-and-excited-states) (C) · [`share_rounds`](#c-screening-ground-and-excited-states) (C) · [`site_margin`](#c-screening-ground-and-excited-states) (C) · [`sp_walltime`](#runner-settings) (runner) · [`spin_tol`](#c-screening-ground-and-excited-states) (C) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-the-screening-and-electronic-cells) (B)
 - **T**: [`tolerate_failures`](#runner-settings) (runner) · [`transform`](#general) (general)
 - **V**: [`vacancies`](#b-candidates-the-screening-and-electronic-cells) (B) · [`validate`](#c-screening-ground-and-excited-states) (C) · [`validate_defects`](#c-screening-ground-and-excited-states) (C) · [`validate_gamma`](#c-screening-ground-and-excited-states) (C) · [`validate_sizes`](#c-screening-ground-and-excited-states) (C) · [`validate_tol`](#c-screening-ground-and-excited-states) (C)
@@ -1488,7 +1514,10 @@ Details: [Phase A](#phase-a-the-host).
 | `phases_from` | `none` | A3.1, E1.1 | `doped`: when there is no `%block phases`, take the competing phases from the Materials Project through doped (needs doped and `mp_api_key`). The phases doped chooses are kept in `A_host/phases_doped.json` for later runs ([Phase A](#phase-a-the-host)). |
 | `mp_api_key` | — | — | Materials Project API key for `phases_from : doped`: the 32 characters on your dashboard, without quotes. Given here, it is used rather than doped's own (`PMG_MAPI_KEY` in `~/.pmgrc.yaml`). It needs doped 3 and pymatgen 2026.9.23 or later (so Python 3.11 or later; older pymatgen can't read the Materials Project's replies): doped 2.x takes only the legacy keys, whose API the Materials Project was closing in September 2025; 3.0 takes the current ones but also needs `mp-api` and `emmet-core`, 3.1 and later nothing more. |
 | `phases_e_above_hull` | `0.05 eV/atom` | A3.1, E1.1 | `phases_from : doped` takes the Materials Project entries up to this far above the hull. A3.1 relaxes only the lowest of each element, E1.1 every one. |
-| `phases_max_steps` | `100` | A3.1, E1.1 | `geom_max_iter` of each competing phase's relaxation (CASTEP's own is 30, which can be too few for a soft metal's cell). A `%block phases` line's own `geom_max_iter=` wins for that phase. |
+| `phases_max_steps` | `100` | E1.1, A3.1 | `geom_max_iter` of each competing phase's relaxation (CASTEP's own is 30, which can be too few for a soft metal's cell): E1.1's, A3.1's molecules, and A3.1's solids with `ref_relax : positions` or `cell`. A `%block phases` line's own `geom_max_iter=` wins for that phase. |
+| `ref_relax` | `none` | A3.1 | How A3.1 runs its solids (the host and the pure elements): `none`, single points of the structures as given (doped's: the Materials Project's, PBE-relaxed, as symmetrised primitive cells); `positions`, the positions relaxed in the given cell; `cell`, lattice and positions (at a low `screen_cutoff` the Pulay stress can make a soft metal's cell run away). Molecules always relax in their box. |
+| `ref_kspacing_factor` | `1` | A3.1 | A3.1's k-point spacing as a multiple of A1's (or of a phase's own `kspacing=`): 2 gives half the k-points in each direction, an eighth in all. C3's cuts need these energies to tens of meV/atom, not A1's 1 meV/atom. The factor scales A1's spacing, converged for the host; the table gives every phase's grid. |
+| `ref_polymorph_window` | `0.02 eV/atom` | A3.1 | Of an element's polymorphs (doped's) within this of the lowest above the hull, A3.1 runs the one with the fewest atoms in its primitive cell (then the lowest); `0` takes the lowest. Polymorphs can lie within meV/atom of each other, and the lowest can be a far bigger cell. It moves that element's reference by at most this much. |
 | `phases_molecule_box` | `15 ang` | A3.1, E1.1 | The side of the box each of `phases_from : doped`'s molecules (H₂, N₂, O₂, F₂, Cl₂) relaxes in: doped's shape, that +0.01, that and −0.01 Å along x, y and z, with the molecule as doped made it, centred. doped's own box is 30 Å, eight times the volume, so about eight times the plane waves, memory and time. `30 ang` keeps doped's structures as they are; a box that leaves less than 5 Å between a molecule and its images is refused. A `%block phases` molecule keeps its file's box. |
 | `%block chemical_potentials` | — | E1.1, E1.2 | The limits themselves, one per line: `name  El=value ...`, in absolute eV per atom on the energy scale of your production runs, for every element of the host and the dopants. E1.1 then relaxes nothing, and E1.2 records them: it takes precedence over `%block phases` and `phases_from` there. They are not on the screening settings' scale, so A3 still runs `%block phases` or doped's phases, if given (without them, C3 makes no cut across a dopant's sites). |
 

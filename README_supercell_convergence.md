@@ -359,12 +359,15 @@ memory.
 ### Clean stops
 
 Each relaxation gets CASTEP's `run_time` 5 minutes below its walltime (`RUN_TIME_MARGIN`).
-CASTEP checks `run_time` before each SCF iteration and stops, mid-SCF if need be, when the
-next one won't fit; it then writes its `.check` before Slurm would kill the job, and the
-continuation carries on from there. The 5 minutes cover what CASTEP's own check doesn't: the
-job's start-up before CASTEP's clock starts, forces and stress after an SCF that converges near
-the limit, writing the `.check`, and shutting down. A job killed at the limit anyway gets twice
-the margin on each restart (at most half the walltime).
+As each geometry iteration starts, CASTEP checks that it has time for one as long as the last
+("Insufficient time for another iteration" if not); it then writes its `.check` and stops, so
+it stops between geometry steps on its own, and the continuation carries on from there. The 5
+minutes cover what CASTEP's own check doesn't: the job's start-up before CASTEP's clock starts,
+an iteration that runs longer than the last (a line search's extra steps), writing the
+`.check`, and shutting down. A job killed at the limit anyway gets twice the margin on each
+restart (at most half the walltime). The check also means a relaxation whose geometry
+iterations are long gives back up to one iteration's time at the end of each job: make each
+iteration cheaper (fewer atoms, k-points) rather than the margin smaller.
 
 ### Automatic restarts (`max_restarts`, default 10)
 

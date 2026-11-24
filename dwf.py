@@ -312,6 +312,9 @@ PROJECT_KEYWORDS = {
     "mp_api_key": (_t, None), "phases_e_above_hull": (sc._num("eV/atom", "eV"), 0.05),
     "phases_max_steps": (sc._num(cast=int), 100),
     "phases_molecule_box": (sc._num("ang", "A"), 15.0), "chemical_potentials": ("lines", None),
+    "ref_relax": (sc._choice("none", "positions", "cell"), "none"),
+    "ref_kspacing_factor": (sc._num(), 1.0),
+    "ref_polymorph_window": (sc._num("eV/atom", "eV"), 0.02),
     # B: candidates and the screening cell
     "dopants": (_w, []), "defects": ("lines", None), "vacancies": (_b, True),
     "antisites": (_b, False),
@@ -663,7 +666,7 @@ def read_project(path, run_path):
     for key in ("pair_max_distance", "scan_tol", "scan_edge_tol", "band_spread_tol",
                 "configuration_margin", "converge_tol", "mace_fmax", "excite_min",
                 "validate_tol", "lineshape_sigma", "lineshape_gamma", "lineshape_amplitude",
-                "lineshape_delta", "decay_length_multiple"):
+                "lineshape_delta", "decay_length_multiple", "ref_kspacing_factor"):
         if getattr(s, key) is not None and getattr(s, key) <= 0:
             die(f"{name}: {key} must be greater than 0")
     for key in ("mace_threads", "mace_steps", "mace_pack", "mace_max_jobs", "validate_sizes",
@@ -681,6 +684,8 @@ def read_project(path, run_path):
         s.distortions = list(CASTEP_DISTORTIONS)
     if s.phases_molecule_box <= 0:
         die(f"{name}: phases_molecule_box, the side of the molecules' box, must be above 0")
+    if s.ref_polymorph_window < 0:
+        die(f"{name}: ref_polymorph_window can't be negative (0: always the lowest polymorph)")
     if not 0 < s.carrier_fraction <= 1:
         die(f"{name}: carrier_fraction is a fraction of the cell's atoms, greater than 0 and at "
             "most 1")
@@ -3243,10 +3248,12 @@ def step_dielectric(p):
 # (fix_occupancy : false unless the line says otherwise), kspacing=..., anything else a .param
 # keyword) or from doped (phases_from : doped, with the Materials Project: every phase it
 # chooses for the host and each dopant, each with eah, its energy above the hull; its molecules
-# in boxes of phases_molecule_box, molecule_in_box). A3.1 and E1.1 each take their part of it
-# (phases_for). Returns a list of (name, Atoms, options dict).
+# in boxes of phases_molecule_box, molecule_in_box; every one tidied as tidy_phase tidies it: the
+# moments' noise gone, the solids as symmetrised primitive cells). A3.1 and E1.1 each take their
+# part of it (phases_for). Returns a list of (name, Atoms, options dict).
 #   Called by: step_phases(), step_ref_phases()
-#   Calls:     doped_phases(), molecule_in_box(), read_structure_file(), sc.canonical_key()
+#   Calls:     doped_phases(), molecule_in_box(), read_structure_file(), sc.canonical_key(),
+#              tidy_phase()
 def phase_list(p):
     if p.s.phases:
         out = []
@@ -3272,9 +3279,61 @@ def phase_list(p):
         if mols:
             log(f"doped's molecules ({', '.join(mols)}) in boxes of {size:g} A "
                 "(phases_molecule_box)")
-        return [(name, molecule_in_box(name, atoms, size) if opts.get("molecule") else atoms,
-                 opts) for name, atoms, opts in out]
+        return [tidy_phase(name, molecule_in_box(name, atoms, size) if opts.get("molecule")
+                           else atoms, opts) for name, atoms, opts in out]
     return []
+
+
+# tidy_phase: moments smaller than this (muB) are the Materials Project's numerical noise, and
+# spglib's tolerance (Ang) when a solid is made symmetric
+MAGMOM_MIN = 0.1
+PHASE_SYMPREC = 0.01
+
+
+# A phase from doped as it is best run. The Materials Project's structures keep the magnetic
+# moments its own runs ended with, which AseAtomsAdaptor makes initial moments and write_cell
+# SPIN= lines: noise of a thousandth of a muB on one atom of a non-magnetic metal is enough for
+# CASTEP to take that atom for another species and lose most of the symmetry (Na in alpha-Mn's
+# structure kept 6 of its 24 operations). So the moments are rounded to 0.1 muB and those below
+# MAGMOM_MIN dropped; a phase with none left runs without spin polarisation (spin_polarized :
+# false, unless its options set it, as O2's do). A solid then becomes its primitive cell, its
+# positions and lattice made exactly symmetric (pymatgen's SpacegroupAnalyzer, PHASE_SYMPREC,
+# get_primitive_standard_structure), so CASTEP's symmetry_generate finds every operation; a
+# Materials Project structure needn't be primitive. Its options get the space group and the atoms
+# the Materials Project's cell had. Without pymatgen, or if it fails, the structure stays as it
+# is. Molecules keep their boxes (they run without symmetry).
+#   Called by: phase_list()
+def tidy_phase(name, atoms, opts):
+    out, opts = atoms.copy(), copy.deepcopy(opts)
+    m = np.round(out.get_initial_magnetic_moments(), 1)
+    m[np.abs(m) < MAGMOM_MIN] = 0.0
+    out.set_initial_magnetic_moments(m)
+    if not m.any():
+        opts["overrides"].setdefault("spin_polarized", "false")
+    if opts.get("molecule"):
+        return name, out, opts
+    try:
+        from pymatgen.core import Structure
+        from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+    except ImportError:
+        return name, out, opts
+    props = {"magmom": m.tolist()} if m.any() else None
+    try:
+        s = Structure(np.asarray(out.cell), out.get_chemical_symbols(),
+                      out.get_scaled_positions(), site_properties=props)
+        sga = SpacegroupAnalyzer(s, symprec=PHASE_SYMPREC)
+        prim = sga.get_primitive_standard_structure(keep_site_properties=bool(props))
+        group = sga.get_space_group_symbol()
+    except Exception as err:                       # (an older pymatgen, a structure spglib
+        log(f"note: {name} could not be symmetrised ({err}), so it runs as the Materials "
+            "Project gave it")                     #  can't handle)
+        return name, out, opts
+    new = Atoms([str(sp) for sp in prim.species], cell=prim.lattice.matrix,
+                scaled_positions=prim.frac_coords, pbc=True)
+    if props:
+        new.set_initial_magnetic_moments(np.asarray(prim.site_properties["magmom"], float))
+    opts.update(spacegroup=group, given_atoms=len(atoms))
+    return name, new, opts
 
 
 # The least vacuum (A) molecule_in_box leaves between a molecule and its periodic images.
@@ -3657,54 +3716,65 @@ def reduced(atoms):
 
 # Of the competing phases (phase_list's), those made of the host's elements (host_el) and at most
 # one of the dopants given: a phase with two dopants limits neither on its own, and
-# chemical_limits leaves it out. lowest: each composition only once, the phase lowest above the
-# hull (doped's eah); a phase without one (%block phases) is always kept.
+# chemical_limits leaves it out. lowest: each composition only once: of its phases within window
+# (eV/atom) of the lowest above the hull (doped's eah), the one with the fewest atoms in its cell
+# (then the lowest). Polymorphs can lie within meV/atom of each other, where which comes lowest
+# is noise, and the lowest can be a far bigger cell (doped's lowest Na was alpha-Mn's structure:
+# 29 atoms, against hcp's 2); window 0 takes the lowest. A phase without an eah
+# (%block phases) is always kept.
 #   Called by: step_phases(), step_ref_phases()
 #   Calls:     reduced()
-def phases_for(phases, host_el, dopants, lowest=False):
+def phases_for(phases, host_el, dopants, lowest=False, window=0.0):
     keep = [(n, a, o) for n, a, o in phases
             if len(set(a.get_chemical_symbols()) - host_el) <= 1
             and set(a.get_chemical_symbols()) - host_el <= set(dopants)]
     if not lowest:
         return keep
-    best = {}
-    for n, a, o in keep:
-        key = reduced(a)
-        if o.get("eah") is not None and (key not in best or o["eah"] < best[key][1]):
-            best[key] = (n, o["eah"])
-    chosen = {n for n, _ in best.values()}
+    groups = {}
+    for x in keep:
+        if x[2].get("eah") is not None:
+            groups.setdefault(reduced(x[1]), []).append(x)
+    chosen = set()
+    for group in groups.values():
+        low = min(o["eah"] for _, _, o in group)
+        near = [x for x in group if x[2]["eah"] <= low + window + 1e-9]
+        chosen.add(min(near, key=lambda x: (len(x[1]), x[2]["eah"]))[0])
     return [x for x in keep if x[2].get("eah") is None or x[0] in chosen]
 
 
 # The .param keywords of a bulk run at the screening settings (A3.1): screen_cutoff and
-# %block screen_overrides, but not screen_max_steps (it is for the defects' relaxations). A cell
-# relaxed at a lower cut-off than production comes out a little off in volume (Pulay stress),
-# which changes its energy only to second order.
+# %block screen_overrides, but not screen_max_steps (it is for the defects' relaxations). (With
+# ref_relax : cell, a cell relaxed at a cut-off well short of converged can feel a Pulay stress big
+# enough to run away, a soft metal's most of all; the default single points relax nothing.)
 #   Called by: step_ref_phases()
 #   Calls:     screen_overrides()
 def screen_bulk(p):
     return {k: v for k, v in screen_overrides(p).items() if k != "geom_max_iter"}
 
 
-# The jobs that relax competing phases: solids, lattice and positions, with symmetry, at the batch's
-# k-point spacing (or the phase's own kspacing); molecules ('molecule'), positions only in a fixed
-# box, Gamma point, no symmetry. Each gets steps geometry steps (phases_max_steps: CASTEP's own 30
-# can be too few for a soft metal's cell). extra: .param keywords for every one (the screening
-# settings); a phase's own (%block phases, doped's: fix_occupancy : false for a metal, the spin of
-# O2) win.
+# The jobs of the competing phases: solids with symmetry, at the batch's k-point spacing (or the
+# phase's own kspacing, times kfactor: A3.1's ref_kspacing_factor), as relax says: cell (E1.1's,
+# and ref_relax : cell) relaxes lattice and positions, positions keeps the cell, none is a single
+# point of the structure as given (A3.1's default); molecules ('molecule') relax their positions in
+# their fixed box, at Gamma, without symmetry. Each relaxation gets steps geometry steps
+# (phases_max_steps: CASTEP's own 30 can be too few for a soft metal's cell). extra: .param
+# keywords for every one (the screening settings); a phase's own (%block phases, doped's:
+# fix_occupancy : false for a metal, the spin of O2, tidy_phase's spin_polarized) win.
 #   Called by: step_phases(), step_ref_phases()
 #   Calls:     sc.kgrid()
-def phase_jobs(phases, steps, extra=None):
+def phase_jobs(phases, steps, extra=None, kfactor=1.0, relax="cell"):
     jobs = []
     for name, atoms, o in phases:
         mol = bool(o.get("molecule"))
-        job = {"name": name, "atoms": atoms, "kind": "geom", "fix_cell": mol,
-               "symmetry": not mol, "overrides": dict(HOST_OVERRIDES, geom_max_iter=steps,
-                                                      **(extra or {}), **o["overrides"])}
+        sp = relax == "none" and not mol
+        job = {"name": name, "atoms": atoms, "kind": "sp" if sp else "geom",
+               "fix_cell": mol or relax != "cell", "symmetry": not mol,
+               "overrides": dict(HOST_OVERRIDES, **({} if sp else {"geom_max_iter": steps}),
+                                 **(extra or {}), **o["overrides"])}
         if mol:
             job["kgrid"] = [1, 1, 1]
         elif o.get("kspacing"):
-            job["kgrid"] = sc.kgrid(atoms.cell, o["kspacing"])
+            job["kgrid"] = sc.kgrid(atoms.cell, o["kspacing"] * kfactor)
         jobs.append(job)
     return jobs
 
@@ -3728,18 +3798,27 @@ def phase_results(res, phases):
 
 # A3.1: the reference energies C3 uses, at the screening settings (screen_bulk), so they match
 # C2's screening runs: the host itself, a single point of A2.1's relaxed cell (the cell the defect
-# supercells are built from), and relaxed, the defects' constituents: the pure elements of the
-# host and of each dopant, each only once (phases_for, lowest). C3 compares formation energies
-# across a dopant's sites over the host's region against its elements (the dopant's chemical
-# potential cancels) and gives each defect's least formation energy with the dopants at their
-# elements (a bound from below, for its table). The compounds (the host's, e.g. CaO2 for CaO, and
-# the dopants') are run only in E1.1, at the production settings. From %block phases, or doped
-# (phases_from : doped); with neither, nothing runs and C3 compares within composition groups
-# only. The production energies E needs are E1.1's.
+# supercells are built from), and the defects' constituents: the pure elements of the host and of
+# each dopant, each only once (phases_for, lowest: the smallest cell within ref_polymorph_window
+# of the lowest). C3 compares formation energies across a dopant's sites over the host's region
+# against its elements (the dopant's chemical potential cancels: of these only the host's
+# elements decide anything) and gives each defect's least formation energy with the dopants at
+# their elements (a bound from below, shown in its table only). They are needed to tens of
+# meV/atom, not to A1's 1 meV/atom, so by default (ref_relax : none) each solid is a single point
+# of its structure as given: doped's are the Materials Project's, already relaxed with PBE, as
+# symmetrised primitive cells (tidy_phase). Relaxing the cell at the low screening cut-off can run
+# away besides (the Pulay stress: Na's grew by two thirds as its energy rose). ref_relax :
+# positions relaxes the positions in that cell, cell lattice and positions (molecules always
+# relax in their box). The k-point spacing is A1's (or a phase's own kspacing) times
+# ref_kspacing_factor (2: an eighth of the k-points), the host's too; molecules stay at Gamma. The
+# compounds (the host's, e.g. CaO2 for CaO, and the dopants') are run only in E1.1, at the
+# production settings. From %block phases, or doped (phases_from : doped); with neither, nothing
+# runs and C3 compares within composition groups only. The production energies E needs are
+# E1.1's. The table gives each phase's grid, and which polymorphs were taken over a lower one.
 #   Called by: main() (step A3.1)
 #   Calls:     Project.batch(), Project.host(), Project.kspacing(), Project.production_param(),
 #              counts(), format_table(), phase_jobs(), phase_list(), phase_results(), phases_for(),
-#              screen_bulk()
+#              reduced(), screen_bulk()
 def step_ref_phases(p):
     if not (p.s.phases or p.s.phases_from == "doped"):
         return {"host": None, "phases": {}, "_note": "no competing phases (%block phases or "
@@ -3747,33 +3826,57 @@ def step_ref_phases(p):
     host = p.host()
     own = set(host.get_chemical_symbols())
     every = phase_list(p)
-    phases = [x for x in phases_for(every, own, [], lowest=True)
+    window = p.s.ref_polymorph_window
+    phases = [x for x in phases_for(every, own, [], lowest=True, window=window)
               if len(set(x[1].get_chemical_symbols())) == 1]
-    phases += [x for x in phases_for(every, own, p.s.dopants, lowest=True)
+    phases += [x for x in phases_for(every, own, p.s.dopants, lowest=True, window=window)
                if len(set(x[1].get_chemical_symbols())) == 1
                and not set(x[1].get_chemical_symbols()) <= own]
     if any(n == "host" for n, _, _ in phases):
         die("a competing phase can't be called 'host' (A3.1 runs the host under that name)")
-    extra = screen_bulk(p)
+    taken = []                     # polymorphs taken over a lower one, for the table
+    for n, a, o in phases:
+        alike = [x for x in every if x[2].get("eah") is not None and reduced(x[1]) == reduced(a)]
+        if o.get("eah") is not None and alike:
+            low = min(alike, key=lambda x: x[2]["eah"])
+            if low[0] != n:
+                taken.append(f"{n} ({len(a)} atoms) rather than {low[0]} ({len(low[1])} atoms, "
+                             f"{1000 * (o['eah'] - low[2]['eah']):.0f} meV/atom lower)")
+    extra, factor = screen_bulk(p), p.s.ref_kspacing_factor
+    spacing = p.kspacing() * factor
     jobs = [{"name": "host", "atoms": host, "kind": "sp", "symmetry": True,
              "overrides": dict(HOST_OVERRIDES, **extra)}]
-    jobs += phase_jobs(phases, p.s.phases_max_steps, extra)
+    jobs += phase_jobs(phases, p.s.phases_max_steps, extra, factor, p.s.ref_relax)
     res = p.batch("A_host/jobs/ref_phases", jobs, "ref_phases", p.production_param(),
-                  spacing=p.kspacing())
+                  spacing=spacing)
     if not res["complete"]:
         return None
     r = res["jobs"]["host"]
     if r["status"] != "done" or r["energy"] is None:
         die(f"A3.1's host single point did not finish: {r['reason'] or 'see ' + r['dir']}")
+
+    def grid(name):                # the k-point grid a job ran with
+        g = res["calcs"][name].info().get("kgrid")
+        return "x".join(str(k) for k in g) if g else ""
+
     out, rows = phase_results(res, phases)
-    rows.insert(0, ["host (A2.1's cell)", host.get_chemical_formula(), len(host), r["energy"],
-                    r["energy"] / len(host)])
+    rows = [row[:3] + [grid(n)] + row[3:] for row, (n, _, _) in zip(rows, phases)]
+    rows.insert(0, ["host (A2.1's cell)", host.get_chemical_formula(), len(host), grid("host"),
+                    r["energy"], r["energy"] / len(host)])
     cut = f"{p.s.screen_cutoff:g} eV" if p.s.screen_cutoff else "the production cut-off"
+    how = {"none": "single points", "positions": "positions relaxed",
+           "cell": "lattice and positions relaxed"}[p.s.ref_relax]
+    table = format_table(["phase", "formula", "atoms", "k-points", "E/eV", "E/atom (eV)"], rows,
+                         f"Reference energies at the screening settings ({cut}; solids: {how}; "
+                         f"k-point spacing {spacing:.4f} 1/A, {factor:g} x A1's)")
+    if taken:
+        table += ("\nThe smallest cell within ref_polymorph_window "
+                  f"({1000 * window:g} meV/atom) of an element's lowest polymorph: "
+                  + "; ".join(taken) + "\n")
     return {"host": {"energy": r["energy"], "counts": counts(host), "natoms": len(host)},
-            "phases": out, "_note": f"the host and {len(out)} pure elements at the screening "
-                                    "settings",
-            "_table": format_table(["phase", "formula", "atoms", "E/eV", "E/atom (eV)"], rows,
-                                   f"Reference energies at the screening settings ({cut})")}
+            "phases": out, "kspacing": spacing, "relax": p.s.ref_relax,
+            "_note": f"the host and {len(out)} pure elements at the screening settings ({how})",
+            "_table": table}
 
 
 # The chemical-potential limits from the energies of the host and its competing phases.
@@ -8329,9 +8432,12 @@ STEPS = [
     Step("ref_phases", "A3.1", "reference energies at the screening settings (the host, and the "
          "pure elements of the host and the dopants)", step_ref_phases,
          keys=("phases", "phases_from", "phases_e_above_hull", "phases_max_steps",
-               "phases_molecule_box", "dopants", "screen_cutoff", "screen_overrides", "energy"),
+               "phases_molecule_box", "dopants", "screen_cutoff", "screen_overrides", "energy",
+               "ref_relax", "ref_kspacing_factor", "ref_polymorph_window"),
          needs=("relax",), owns=("A_host/jobs/ref_phases",),
-         version=1),                               # 1: the pure elements only
+         version=2),          # 1: the pure elements only; 2: doped's phases as symmetrised
+                              # primitive cells without the moments' noise, the smallest
+                              # polymorph within ref_polymorph_window, single points (ref_relax)
     Step("ref_limits", "A3.2", "chemical-potential limits at the screening settings",
          step_ref_limits, keys=("dopants",), needs=("ref_phases",)),
     # B: candidate defects and the screening cell
@@ -8512,6 +8618,12 @@ phases_max_steps : 100         # geometry steps for each phase's relaxation (CAS
                                #   can be too few for a soft metal's cell)
 !phases_molecule_box : 15 ang  # the box for doped's molecules (H2, N2, O2, F2, Cl2): doped's
                                #   own 30 A has eight times the volume (default: 15 A)
+# A3.1's pure elements are for C3's cuts only, which need them to tens of meV/atom:
+!ref_relax : none              # none: single points of the structures as given (doped's: the
+                               #   Materials Project's, PBE-relaxed); positions; cell
+!ref_kspacing_factor : 2       # their k-point spacing, x A1's (2: an eighth of the k-points)
+!ref_polymorph_window : 0.02 eV/atom   # of an element's polymorphs within this of the lowest
+                               #   (doped's), the smallest cell
 # ...or E's limits themselves (eV per atom, absolute: the same reference as your production
 # runs; C3 then compares the defects within each composition only, unless phases are given)
 !%block chemical_potentials

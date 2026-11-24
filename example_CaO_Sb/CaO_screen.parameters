@@ -64,6 +64,12 @@ phases_max_steps : 100         # geometry steps for each phase's relaxation (CAS
                                #   can be too few for a soft metal's cell)
 phases_molecule_box : 15 ang   # the box for doped's molecules (H2, N2, O2, F2, Cl2): doped's
                                #   own 30 A has eight times the volume (default: 15 A)
+# A3.1's pure elements are for C3's cuts only, which need them to tens of meV/atom:
+ref_relax : none               # none: single points of the structures as given (doped's: the
+                               #   Materials Project's, PBE-relaxed); positions; cell
+ref_kspacing_factor : 2        # their k-point spacing, x A1's (2: an eighth of the k-points)
+ref_polymorph_window : 0.02 eV/atom   # of an element's polymorphs within this of the lowest
+                               #   (doped's), the smallest cell
 # ...or E's limits themselves (eV per atom, absolute: the same reference as your production
 # runs; C3 then compares the defects within each composition only, unless phases are given)
 !%block chemical_potentials
