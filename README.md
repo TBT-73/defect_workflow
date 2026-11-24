@@ -6,12 +6,11 @@ levels, the excited states of the defects that could be colour centres, and thei
 lineshapes. `dwf_workflow_report.pdf` explains every step, and why it is there, in more detail
 than the flowchart can.
 
-Two files go in one directory:
-
-- `dwf.py`: the workflow;
-- `supercell_convergence.py`: runs the CASTEP jobs (dry runs, cores or nodes, memory,
-  walltimes, restarts), on machines that charge by the core (Cirrus) or by the node (ARCHER2).
-  It has its own README, `README_supercell_convergence.md`.
+It is one file, `dwf.py`: the workflow (PART 2 of the file) and the job runner that runs its
+CASTEP jobs (PART 1: dry runs, cores or nodes, memory, walltimes, restarts), on machines that
+charge by the core (Cirrus) or by the node (ARCHER2). The runner, a script of its own until
+November 2026 (`supercell_convergence.py`), also works on its own (`python3 dwf.py --conv NAME`,
+`--batch FILE`), and has its own README, `README_runner.md`.
 
 The MACE relaxations (B2, C1, C4) run in `dwf.py` itself, or as jobs on compute nodes that run
 `dwf.py` as a worker (`mace_jobscript`, with blocks of their own for B2, C1 and C4); so do F2's
@@ -39,7 +38,7 @@ example project.
 
 ## Quick start
 
-With `DWF` the directory that holds `dwf.py` and `supercell_convergence.py`:
+With `DWF` the directory that holds `dwf.py`:
 
 ```bash
 cd example_CaO_Sb
@@ -152,7 +151,7 @@ that already ran with different inputs stops the run, so results from two sets o
 mix: start that step again with `--redo STEP` (its old folders are kept, renamed
 `<name>.old-<time>`), or keep the old results with `--force`.
 
-**The CASTEP jobs** all go through `supercell_convergence.py`, which plans each job (dry run,
+**The CASTEP jobs** all go through the job runner (`run_batch`), which plans each job (dry run,
 cores or nodes, memory, walltime), submits it, waits and restarts a relaxation that runs out of
 time.
 Every step uses its batch mode, which runs the structures `dwf.py` builds.
@@ -395,6 +394,9 @@ python3 dwf.py --split OLD.dwf
 | `--resubmit-failed` | start failed CASTEP jobs again, and MACE relaxations whose jobs gave up |
 | `--force` | keep the results of jobs whose inputs have changed |
 | `--migrate` | bring a work directory made by an older `dwf.py` (from when phase D held the ground and excited states) to this layout (below) |
+| `--conv NAME` | the job runner on its own, without a project: the supercell size series of one defect in `NAME.conv` (with `--prepare-only`, `--no-wait`, `--resubmit-failed` or `--force`; [9](#9-the-job-runner-on-its-own-conv-and-batch-files), `README_runner.md`) |
+| `--conv-example` | print an annotated `.conv` file, with every runner keyword |
+| `--batch FILE` | the job runner on its own: the CASTEP calculations a batch file lists |
 
 The project can be given as `CaO_Sb`, `CaO_Sb.parameters` or `CaO_Sb.run`: either way `dwf.py`
 reads both. (`--mace-worker <tasks>.json` and `--phonon-worker spec.json` are what a MACE job and
@@ -702,7 +704,7 @@ which C3 uses. E1.2 works out the limits again from E1.1's production energies, 
 |---|---|---|---|
 | B1 | `generate` | the candidate defects | `%block defects` given (flowchart "yes"), or generate them ("no") |
 | B2 | `scan` | the size ladder (a supercell for each of `scan_lengths`); with MACE, every candidate relaxed in every size | where each candidate's MACE relaxation has converged (`scan_tol`, `scan_edge_tol`) |
-| B3 | `choose` | the screening cell for phase C | the smallest size that holds every candidate and is at least the Γ-only floor, or `supercell` |
+| B3 | `choose` | the screening cell for phase C, after `configuration_margin`'s cut | the smallest size that holds every candidate the cut keeps and is at least the Γ-only floor, or `supercell` |
 | B4 | `electronic` | the electronic cell, where the survivors go from C4 on | the smallest size from the screening cell up that folds every band-edge valley onto Γ and meets the floor for a level `electronic_depth` deep, or `electronic_cell` |
 
 **B1 generate.** Your defects, one per line of `%block defects`, components joined by `+`:
@@ -763,11 +765,17 @@ candidate's relaxation energy in every size. With `mace : false` or `scan : fals
 is made, and B3 goes by the floor (or `supercell`).
 
 **B3 choose: the screening cell.** Every candidate is built in this one cell in phase C, so the
-energies of arrangements of one composition can be compared directly. It is the smallest size of
-the ladder that is at least as big as
+energies of arrangements of one composition can be compared directly. First, with
+`configuration_margin`, B3 cuts the arrangements whose MACE energy is more than the margin above
+the lowest of their composition, each composition's arrangements compared in the biggest size B2
+relaxed them all in (its energies the nearest to an isolated defect's); C1 leaves them out. The
+cell is sized for the rest, so an arrangement that strains the crystal but is cut can't make
+every C2 run pay for a bigger cell: `summary.txt` lists the cut and, when it made the cell
+smaller, the cell it would have been. The screening cell is the smallest size of the ladder that
+is at least as big as
 
-- every candidate's converged size (B2): the worst case sets it, and `summary.txt` names the
-  candidate that did, and
+- every surviving candidate's converged size (B2): the worst case sets it, and `summary.txt`
+  names the candidate that did, and
 - the **Γ-only floor**: the image distance a cell needs for Γ-point screening to see a defect's
   levels as an isolated defect has them. A level E_b inside the gap decays away from the defect as
   exp(−r/ξ), with 1/ξ² = (2m*/ħ²) E_b (1 − E_b/E_g) in a two-band (Kane) model, and neighbouring
@@ -784,7 +792,9 @@ the ladder that is at least as big as
   floor yourself (0: none).
 
 A floor beyond the ladder gets a cell of its own. `supercell` fixes the screening cell instead (a
-length, `supercell : 14 ang`, or n × transform, `supercell : 3`). B3 also checks whether A2.2's
+length, `supercell : 14 ang`, or n × transform, `supercell : 3`). `summary.txt` also lists the
+pairs whose components are more than half the chosen cell's image distance apart, which C1
+leaves out: a smaller cell leaves out more of the far pairs (`pair_max_distance`). B3 also checks whether A2.2's
 band edges fold onto Γ of the screening cell: a k-point k folds if k Pᵀ is a whole-number vector
 (P the supercell matrix). One that doesn't (e.g. an edge at X, and n × n × n copies of the FCC
 primitive cell with n odd) means the Γ-point screening sees a wider gap, and its levels near that
@@ -835,7 +845,7 @@ finite-size error of the screening cell that C3 relied on.
 
 | Label | Step | What it does | Decision |
 |---|---|---|---|
-| C1 | `prerelax` | builds every candidate in the screening cell and relaxes it with MACE (B2's relaxation there, if it ran) | pairs too far apart for the cell are left out; `configuration_margin` drops arrangements far above the lowest |
+| C1 | `prerelax` | builds every candidate in the screening cell and relaxes it with MACE (B2's relaxation there, if it ran) | pairs too far apart for the cell are left out, and the arrangements B3's `configuration_margin` cut (C1 makes the cut itself only without B2's scan) |
 | C2 | `screen` | one cheap Γ-point CASTEP relaxation per candidate and charge state, from a triplet (a doublet for an odd electron count) | — (warns if the band edges don't fold onto Γ) |
 | C3 | `filter` | defect hull, the formation energies across a dopant's sites, duplicates, property filters, and the charge states each survivor carries on, with a Γ single point of each band state it judges | within `hull_margin` of the hull; within `site_margin` of the lowest defect with its dopant atoms somewhere; the `require_*` filters; which charge states (`distort_charges`, `charge_margin`, `carrier_reach`, `carrier_fraction`) |
 | C4 | `distort` | each survivor's screened structures carried into the electronic cell, and ShakeNBreak's distortions of every charge state there, all relaxed with MACE and pooled by defect | by how much (`distortions`), around which points (`distort_around`), in which cell (`distort_cell`); the `distort_starts` lowest distinct MACE minima go on |
@@ -854,10 +864,11 @@ as B2's and C1's do, with `%block runner_distort` for settings of their own.
 than half the shortest image distance apart is left out. With `mace : true` it is relaxed with
 MACE (positions only, `mace_model`): when the screening cell is one of B2's sizes, that is B2's
 relaxation, read from its file in `B_candidates/mace/`; otherwise C1 runs it (on compute nodes
-with `mace_jobscript`). With `configuration_margin`, arrangements whose configurational energy
-(MACE energy above the lowest arrangement of the same composition) is more than the margin are
-dropped before any CASTEP run (MACE knows nothing of charge or spin, so keep the margin
-generous).
+with `mace_jobscript`). The arrangements B3's `configuration_margin` cut are left out, unbuilt.
+Without B2's scan (`scan : false`) B3 has no energies to cut with, and C1 makes the cut itself:
+arrangements whose configurational energy (MACE energy above the lowest arrangement of the same
+composition) in the screening cell is more than the margin are dropped before any CASTEP run
+(MACE knows nothing of charge or spin, so keep the margin generous).
 
 **C2 screen.** For each candidate, charge state (its own `q=` from `%block defects`, else
 `screen_charges`) and starting spin, one CASTEP relaxation at Γ, without symmetry, at
@@ -1397,7 +1408,7 @@ Sections: [1. The project's two files](#1-the-projects-two-files-nameparameters-
 [6. The jobscript](#6-the-jobscript-template-jobscript) ·
 [7. The MACE jobscript](#7-the-mace-jobscript-template-mace_jobscript) ·
 [8. The model jobscript](#8-the-model-jobscript-template-model_jobscript) ·
-[9. The runner's own files](#9-supercell_convergencepy-on-its-own-conv-and-batch-files)
+[9. The runner's own files](#9-the-job-runner-on-its-own-conv-and-batch-files)
 
 ### 1. The project's two files (`NAME.parameters` and `NAME.run`)
 
@@ -1483,7 +1494,7 @@ candidate in every size are by far the most, `%block runner_prerelax` for C1 and
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
-| `mace` | `true` | B2, C1, C4 | Use MACE for the scan of every candidate (B2), the pre-relaxation and configurational-energy filter of the candidates (C1) and the search of the distortions (C4). With `false`, B2 makes only the size ladder, B3 goes by the Γ-only floor (or `supercell`), C1 builds unrelaxed structures, `configuration_margin` does nothing, and C5 relaxes every distortion in CASTEP (`distortions` then `-0.4 -0.2 0.2 0.4` unless you give it). |
+| `mace` | `true` | B2, B3, C1, C4 | Use MACE for the scan of every candidate (B2), the configurational-energy cut (B3, on B2's energies), the pre-relaxation of the candidates (C1) and the search of the distortions (C4). With `false`, B2 makes only the size ladder, B3 goes by the Γ-only floor (or `supercell`), C1 builds unrelaxed structures, `configuration_margin` does nothing, and C5 relaxes every distortion in CASTEP (`distortions` then `-0.4 -0.2 0.2 0.4` unless you give it). |
 | `mace_model` | `medium-mpa-0` | B2, C1, C4 | The model: the name of a `mace_mp` foundation model, or a model file of your own. A new model makes B2, C1 and C4 run again (their MACE relaxations are kept per model, so going back to an earlier one reuses them). |
 | `mace_fmax` | `0.05 eV/ang` | B2, C1, C4 | A MACE relaxation stops when the largest force is below this. |
 | `mace_steps` | `500` | B2, C1, C4 | ... or after this many optimiser (LBFGS) steps. |
@@ -1562,7 +1573,7 @@ phase D redoes the survivors properly. The screening settings (`screen_cutoff`, 
 
 | Keyword | Default | Steps | What it does |
 |---|---|---|---|
-| `configuration_margin` | — | C1 | Before any CASTEP run, drop arrangements whose configurational energy (MACE energy above the lowest arrangement of the same composition) is more than this, e.g. `1.0 eV`. Off unless given; needs `mace : true`. MACE has no charge or spin, so keep it generous. Replaces `triage` and `triage_window`. |
+| `configuration_margin` | — | B3 (C1 without B2's scan) | Before any CASTEP run, and before B3 chooses the screening cell, drop arrangements whose configurational energy (MACE energy above the lowest arrangement of the same composition, compared in the biggest size B2 relaxed them all in) is more than this, e.g. `1.0 eV`; the screening cell is then sized for the rest. Without B2's scan, C1 makes the cut in the screening cell. Off unless given; needs `mace : true`. MACE has no charge or spin, so keep it generous. Replaces `triage` and `triage_window`. |
 | `screen_charges` | `-1 0 1` (*list*) | C2 | The charge states every candidate is screened in, except one with its own `q=` in `%block defects`. |
 | `screen_spins` | `triplet` | C2 | The starting spin (unpaired electrons): `triplet` runs once from 2, or from 1 (a doublet) when the electron count is odd; `low` runs once from the lowest the electron count allows (0 or 1); `both` runs from that and from that + 2. A starting value: the results keep the final spin. |
 | `screen_cutoff` | the production cut-off | A3.1, C2, C3, C5, C6, C7 | The cut-off of the screening runs, and of A3.1's reference phases, so that their energies are on one scale. |
@@ -1655,8 +1666,8 @@ Details: [Phase F](#phase-f-optical-lineshapes). F2's model of each defect is tr
 
 #### Runner settings
 
-These are `supercell_convergence.py`'s keywords for how the CASTEP jobs run (see
-`README_supercell_convergence.md` for the details). They go in `NAME.run`, where they apply to every
+These are the job runner's keywords for how the CASTEP jobs run (see `README_runner.md` for the
+details). They go in `NAME.run`, where they apply to every
 CASTEP step. A runner block changes them for some steps: `%block runner_host` for every CASTEP step
 of phase A and the competing phases (A3.1, E1.1), `%block runner_screen` for C2, C3, C5, C6 and C7,
 `%block runner_production` for C8, D1, D2, F1 and F2, and `%block runner_converge`, `runner_relax`,
@@ -1924,10 +1935,11 @@ partition, QoS and GPU request against the Cirrus documentation):
 
 Each job's folder holds `job.sh`, `job.json` (its Slurm id) and its log.
 
-### 9. `supercell_convergence.py` on its own: `.conv` and batch files
+### 9. The job runner on its own: `.conv` and batch files
 
-Outside the workflow, `supercell_convergence.py` reads its own input files; the full description
-is in `README_supercell_convergence.md`. Its runner keywords are those under
+Outside the workflow, the job runner reads its own input files: `python3 dwf.py --conv NAME` (a
+size series, `NAME.conv`; `python3 dwf.py --conv-example` writes an annotated one) and
+`python3 dwf.py --batch FILE`; the full description is in `README_runner.md`. Its runner keywords are those under
 [Runner settings](#runner-settings) above (`max_jobs` and `tolerate_failures` only in batch
 mode). The others:
 

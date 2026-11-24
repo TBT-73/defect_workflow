@@ -129,8 +129,9 @@ elec_energy_tol : 1e-5
 fine_gmax : 35 1/ang           # a finer density grid (the default is 20 1/ang at 500 eV): Be's
                                #   and CaO2's energies jumped as the grid changed
 %endblock screen_overrides
-configuration_margin : 1.0 eV # C1: drop arrangements this far above the lowest of their
-                               # composition by MACE energy (off unless given)
+configuration_margin : 1.0 eV # B3: drop arrangements this far above the lowest of their
+                               # composition by MACE energy (B2's), before the screening cell
+                               # is chosen (off unless given)
 hull_margin   : 0.2 eV         # C3: keep arrangements within this of the defect hull
 site_margin   : 0.5 eV         # C3: drop a defect this far above the lowest one with the
                                #   same dopant atoms at every growth condition and Fermi level

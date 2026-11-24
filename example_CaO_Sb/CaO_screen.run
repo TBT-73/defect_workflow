@@ -8,7 +8,7 @@
 !workdir  : dwf_CaO_Sb         # where everything goes (default dwf_<name>, beside these files)
 
 # ======================================================================= CASTEP jobs
-# How the CASTEP jobs run: any supercell_convergence.py runner keyword (see its --example).
+# How the CASTEP jobs run: any runner keyword (python3 dwf.py --conv-example lists them).
 # These are for Young's new environment, young-ng, whose standard nodes (40 cores, 188 GB
 # usable) are never shared between jobs: every job fills whole nodes. Its Free jobs (all of
 # them, until project allocations are enabled there) may run for up to 24 hours.
