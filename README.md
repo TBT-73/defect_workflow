@@ -170,7 +170,11 @@ charged for, just those. Each result goes into its own cache file as soon as it 
 that runs out of time loses only the relaxations it hadn't finished: they go into a new job, three
 times at most. After that the run stops and says how the last of those jobs ended (Slurm's time
 limit, or the last line of a worker's log, e.g. a Python error); once that is fixed,
-`--resubmit-failed` gives them three more jobs. The jobs wait in the queue, and `--no-wait`,
+`--resubmit-failed` gives them three more jobs. Each job's `progress.txt` counts its relaxations
+as they finish: its first line, e.g. `200/398 relaxations done, the last at 14:02:11`, then a line
+for each with the count so far (`[14:02:11] 200/398  d555 ...: 432 atoms, 11 steps, 326 s`), so
+`tail -f` follows it. While it waits, `dwf.py` logs how many of the step's are done every 10
+minutes (`B2: 5,231/19,920 MACE relaxations done (26%); 50 jobs queued or running`). The jobs wait in the queue, and `--no-wait`,
 `--prepare-only` and the `STOP` file work, as for the CASTEP jobs. A foundation model is downloaded
 where `dwf.py` runs and copied into `<workdir>/mace_models/`, where the compute nodes can read it.
 B2, C1 and C4 can each have settings of their own for these jobs, in `%block runner_scan`,
@@ -523,7 +527,11 @@ Each phase has one folder with the same layout:
   format with `ase convert` (e.g. to `.cif`).
 - **`jobs/<step>/<job>/`**: one CASTEP calculation each: `.cell`, `.param`, `.castep`,
   `-out.cell`, `.check` (unless `delete_check`), `job.sh`, `dryrun.sh` and `job_info.json`
-  (what the runner decided and how it went). Each `jobs/<step>/` has a `batch_results.json`,
+  (what the runner decided and how it went). Each `jobs/<step>/` has a `batch_results.json`, a
+  `progress.txt` (the count of its finished calculations as its first line, e.g.
+  `1,201/4,980 calculations done (3 failed), the last at 14:02:11`, then a line for each as it
+  finishes, with the count so far, e.g. `[14:02:11] 1,201/4,980  d555_q-1: done`, so
+  `tail -f C_screen/jobs/screen/progress.txt` follows C2; the log has the count every 10 minutes),
   and with `pack` or `dryrun_pack` a `packs/` folder with the job script of each pack.
 
 What each phase's `results.json` holds:
@@ -1901,7 +1909,10 @@ The job's folder (`<phase>/jobs/mace_<step>/job_NNN/`) holds `job.sh`, the job's
 `tasks.json` (the structures and settings, biggest first), `claims/` (one file for each
 relaxation a worker has taken: which node, process and time), each worker's log (a line for each
 relaxation it finished, and a last line once nothing was left for it: how many it did, and how
-long it worked), `slurm-<id>.out` and, once every worker has finished, `finished`. Each worker writes every relaxation's result to its file in `B_candidates/mace/` (C4's
+long it worked), `progress.txt` (every worker's finished relaxations in one list, in the order
+they finished, each with the count so far, under the count: `200/398 relaxations done (1 failed),
+the last at 14:02:11`; `tail -f` follows it, and `grep -m1 done job_*/progress.txt` gives every
+job's count), `slurm-<id>.out` and, once every worker has finished, `finished`. Each worker writes every relaxation's result to its file in `B_candidates/mace/` (C4's
 in `C_screen/mace/`) as soon as it has it. A step's own block in `NAME.run` (`%block runner_scan`
 for B2, `runner_prerelax` for C1, `runner_distort` for C4) can give its jobs a template of their own
 (`mace_jobscript`) and a `max_walltime`, which becomes their `--time` in place of the template's

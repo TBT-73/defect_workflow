@@ -417,6 +417,11 @@ OUT_OF_TIME = "Insufficient time for another iteration"   # CASTEP stopped at ru
 # start-up before CASTEP's clock starts, an iteration that runs longer than the last (a line
 # search's extra steps), writing the .check, and shutting down
 RUN_TIME_MARGIN = 300.0
+# How often the count of a batch's finished jobs, or of a MACE step's relaxations, goes in the log
+# (s), and the width of a progress.txt's first line, its count (padded, so it can be written over
+# in place): write_progress
+PROGRESS_EVERY = 600
+PROGRESS_WIDTH = 79
 # CASTEP failed to read the .check file it was asked to carry on from
 CHECK_UNREADABLE = re.compile(r"model_continuation|model_read|wave_read|Error reading[^\n]*check",
                               re.I)
@@ -449,6 +454,43 @@ END_STATES = ("COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "OUT_OF_MEMORY",
 #   Called by: almost every function
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# Writes a progress.txt (a CASTEP batch's: run_batch; a MACE job's: mace_progress): head, the
+# count, as its first line, written over in place (padded to PROGRESS_WIDTH), an empty line, and
+# then lines, added to the end, so that tail -f shows each as it comes. Makes the file if it isn't
+# there, and starts it again under head if its first line isn't one of these (keeping the lines).
+# Anything that stops it leaves the file as it was: nothing reads it but you.
+#   Called by: mace_progress(), run_batch()
+def write_progress(f, head, lines=()):
+    head = head[:PROGRESS_WIDTH].ljust(PROGRESS_WIDTH).encode()
+    add = "".join(x + "\n" for x in lines).encode()
+    try:
+        try:
+            fh = open(f, "r+b")
+        except FileNotFoundError:
+            Path(f).write_bytes(head + b"\n\n" + add)
+            return
+        with fh:
+            if fh.read(PROGRESS_WIDTH + 1)[PROGRESS_WIDTH:] != b"\n":
+                fh.seek(0)
+                rest = (fh.read().split(b"\n", 2) + [b""])[2]
+                if rest and not rest.endswith(b"\n"):
+                    rest += b"\n"
+                fh.seek(0)
+                fh.truncate()
+                fh.write(head + b"\n\n" + rest + add)
+                return
+            if add:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":            # a line cut short (a job killed writing it)
+                    add = b"\n" + add
+                fh.seek(0, os.SEEK_END)
+                fh.write(add)
+            fh.seek(0)
+            fh.write(head)
+    except OSError:
+        pass
 
 
 # Stops the script with 'ERROR: <message>'.
@@ -1070,6 +1112,13 @@ class Calc:
         if not self._done:                     # once done it stays done: not read again
             out = self.output()
             self._done = bool(FINISHED.search(out)) and (self.kind != "geom" or GEOM_DONE in out)
+        return self._done
+
+    # done() as far as it is known already, without reading the .castep: True once done() has
+    # found the calculation done. For run_batch's progress.txt, which looks at every job on every
+    # poll, after run_batch and wait_for have checked them.
+    #   Called by: run_batch()
+    def known_done(self):
         return self._done
 
     # CASTEP's error files (<seed>*.err), written when CASTEP aborts.
@@ -3157,11 +3206,12 @@ def handle_failure(calc, args, resubmitted, key="jobid"):
 # returns as soon as one of the jobs has finished (so run_batch can submit the next), and with
 # tolerate_failures a job handle_failure would stop the script for is marked failed instead
 # (mark_failed) and counts as finished. With array : N the queue is read once a poll for all the
-# jobs (queue_states) instead of a squeue call for each.
+# jobs (queue_states) instead of a squeue call for each. progress (run_batch's) is called on every
+# poll, once the jobs have been checked.
 #   Called by: series_main(), prepare_all(), run_batch()
 #   Calls:     Calc.done(), Calc.err_files(), dryrun_output(), handle_failure(), job_active(),
 #              mark_failed(), queue_states(), remove_check()
-def wait_for(calcs, args, key="jobid", any_done=False):
+def wait_for(calcs, args, key="jobid", any_done=False, progress=None):
     """Poll until every calc's job (key='jobid') or dry run (key='dryrun_jobid') is done
     (with any_done, until at least one is). Returns False if --no-wait and some are still
     queued or running."""
@@ -3205,6 +3255,8 @@ def wait_for(calcs, args, key="jobid", any_done=False):
                     gone[c.name] = 0
             else:
                 gone[c.name] = 0
+        if progress:
+            progress()
         if not waiting:
             return True
         if any_done and len(waiting) < len(calcs):
@@ -3463,8 +3515,10 @@ def job_spec(job, base):
 # from batch_args or read_input), cell_text (the .cell every job copies species_pot and the rest
 # from), param_text and geom_param_text (the .param for 'sp' and 'geom' jobs; the task is set per
 # job), spacing (k-point spacing, 1/Ang, for jobs without a kgrid), energy (as the energy keyword),
-# share_dryruns (one dry run for all jobs that would give the same one: dryrun_key) and stop_file
-# (default <workdir>/STOP).
+# share_dryruns (one dry run for all jobs that would give the same one: dryrun_key), stop_file
+# (default <workdir>/STOP) and label (what the count in the log is of: default 'batch <workdir
+# name>'). While it waits, <workdir>/progress.txt lists the jobs as they finish, under their count
+# (write_progress), and the log has the count every PROGRESS_EVERY seconds.
 # It works as the size series does: inputs, dry runs and plans first (prepare_all, at most max_jobs
 # dry-run jobs queued at once; with dryrun_pack : N, N dry runs to a job), then the jobs, submitted
 # at most max_jobs at a time, each planned again just before it goes (so it uses the timings and
@@ -3494,9 +3548,9 @@ def job_spec(job, base):
 #              check_templates(), even_groups(), finalize(), job_result(), job_spec(),
 #              measure_times(), pack_castep_line(), pack_parts(), parse_castep_input(),
 #              prepare_all(), remove_check(), submit(), submit_array(), submit_pack(),
-#              submit_pack_array(), wait_for()
+#              submit_pack_array(), wait_for(), write_progress()
 def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, spacing=None,
-              energy="auto", share_dryruns=True, stop_file=None):
+              energy="auto", share_dryruns=True, stop_file=None, label=None):
     workdir = Path(workdir)
     names = [job["name"] for job in jobs]
     twice = sorted({n for n in names if names.count(n) > 1})
@@ -3576,6 +3630,50 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
     # Finished, or marked failed (tolerate_failures).
     def finished(c):
         return c.done() or bool(c.peek().get("failed"))
+
+    # Keeps <workdir>/progress.txt up to date (write_progress): a line for each job that has
+    # finished, or failed (tolerate_failures), since it was last written, e.g. '[14:02:11]
+    # 1,201/4,980  d555_q-1: done', under the count; and while jobs are queued or running, the count
+    # in the log every PROGRESS_EVERY seconds. It looks only at what has been read already
+    # (Calc.known_done, job_info.json in memory), so it reads no .castep itself. A job the file
+    # lists already (an earlier run's) isn't listed again, unless it has gone from failed to done.
+    pfile, name = workdir / "progress.txt", label or f"batch {workdir.name}"
+    listed, shown = {}, {"done": None, "time": 0.0}
+    try:
+        for line in pfile.read_text(errors="replace").splitlines()[2:]:
+            m = re.match(r"\[[\d:]{8}\] [\d,]+/[\d,]+  (.+?): (done|FAILED)", line)
+            if m:
+                listed[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+
+    def progress():
+        state = {c.name: "done" if c.known_done() else "FAILED" if c.peek().get("failed")
+                 else None for c in todo}
+        done = sum(s == "done" for s in state.values())
+        failed = sum(s == "FAILED" for s in state.values())
+        new = [c for c in todo if state[c.name] and listed.get(c.name) != state[c.name]]
+        if new or not pfile.exists():
+            now, lines = time.strftime("%H:%M:%S"), []
+            count = done - sum(state[c.name] == "done" for c in new)
+            for c in new:
+                if state[c.name] == "done":
+                    count += 1
+                    r = c.peek().get("restarts", 0)
+                    what = "done" + (f" ({r} restart{'s' if r > 1 else ''})" if r else "")
+                else:
+                    what = "FAILED: " + " ".join(str(c.peek()["failed"]).split())[:250]
+                lines.append(f"[{now}] {count:,}/{len(todo):,}  {c.name}: {what}")
+                listed[c.name] = state[c.name]
+            write_progress(pfile, f"{done:,}/{len(todo):,} calculations done"
+                           + (f" ({failed:,} failed)" if failed else "")
+                           + (f", the last at {now}" if new else ""), lines)
+        busy = sum(1 for c in todo if not state[c.name] and c.peek().get("jobid"))
+        if busy and done != shown["done"] and time.time() - shown["time"] >= PROGRESS_EVERY:
+            log(f"{name}: {done:,}/{len(todo):,} CASTEP calculations done "
+                f"({100 * done / len(todo):.0f}%)" + (f", {failed:,} failed" if failed else "")
+                + f"; {busy:,} queued or running (each listed in {pfile.name} as it finishes)")
+            shown.update(done=done, time=time.time())
 
     if args.resubmit_failed:                       # start failed jobs again from the beginning
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -3675,6 +3773,7 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
         active = [c for c in todo if c.peek().get("jobid") and not finished(c)]
         queue = [c for c in todo if not c.peek().get("jobid") and not finished(c)]
         running = {c.peek()["jobid"] for c in active}          # jobs, not calculations
+        progress()
         if getattr(args, "array", 1) > 1:          # array : N - the queue as job arrays
             free = (args.max_jobs - len(running)) if args.max_jobs else len(queue)
             top = min(args.array, args.max_jobs or args.array)
@@ -3723,7 +3822,7 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
             running.add(c.info()["jobid"])
         if not active:
             return results(True)
-        if not wait_for(active, args, any_done=bool(queue)):
+        if not wait_for(active, args, any_done=bool(queue), progress=progress):
             return results(False)
 
 
@@ -5677,7 +5776,8 @@ class Project:
             args.delete_check = False
         return run_batch(self.dir / subdir, jobs, args,
                             cell_text or self.cell_text(), param_text, spacing=spacing,
-                            energy=self.s.energy, stop_file=self.dir / "STOP")
+                            energy=self.s.energy, stop_file=self.dir / "STOP",
+                            label=STEP_INDEX[step].label)
 
     # The host .cell as given (species_pot, symmetry_generate and anything else every job copies).
     #   Called by: Project.batch(), Project.kspacing(), step_dielectric(), step_relax()
@@ -7476,7 +7576,7 @@ def mace_relaxations(p, step, tasks):
             todo.append(t)
     run = p.mace_settings(step)
     if todo and run.mace_jobscript:
-        if not mace_jobs(p, step, todo):
+        if not mace_jobs(p, step, todo, len(tasks) - len(todo)):
             return None
         for t in todo:
             out[str(t["cache"])] = mace_cached(t["cache"], t["key"])
@@ -7519,7 +7619,9 @@ def mace_python(p, step=None):
 # beforehand, that was the slowest list, as a relaxation's cost goes with its steps, which nothing
 # knows in advance; with the shared queue it is only the last relaxation or two.) The jobs go in
 # jobs.json there; waiting polls Slurm's queue (status_cmd) every poll seconds, like the CASTEP
-# jobs, and the project's STOP file stops it. A
+# jobs, and the project's STOP file stops it; every PROGRESS_EVERY seconds the log says how
+# many of the step's relaxations are done (done_before: those done before this call, which aren't
+# in todo), and each job's progress.txt how many of its own are (mace_progress). A
 # relaxation still missing once its job has ended (e.g. it ran out of time) goes into a new job, at
 # most MACE_ATTEMPTS times; then the run stops, with how the last of its jobs ended (why_ended).
 # --resubmit-failed gives those relaxations another MACE_ATTEMPTS jobs. Returns True when every
@@ -7529,7 +7631,7 @@ def mace_python(p, step=None):
 #   Calls:     Project.mace_model_file(), Project.mace_runner(), Project.mace_settings(),
 #              Project.mace_template(), Project.model_path(), atoms_to_dict(), mace_cached(),
 #              mace_python(), add_sbatch_option(), job_active(), send_job(), write_json()
-def mace_jobs(p, step, todo):
+def mace_jobs(p, step, todo, done_before=0):
     args = p.mace_runner()
     d = p.phase_dir(STEP_INDEX[step].phase) / "jobs" / f"mace_{step}"
     d.mkdir(parents=True, exist_ok=True)
@@ -7541,7 +7643,8 @@ def mace_jobs(p, step, todo):
     pack = run.mace_pack or max(1, (args.cores_per_node or run.mace_threads) // run.mace_threads)
     label = STEP_INDEX[step].label
     model = p.mace_model_file() if any(not t.get("model") for t in todo) else None
-    announced = False
+    announced, last_done, last_time = False, None, 0.0
+    total = done_before + len(todo)                   # the step's relaxations, all of them
     worn = [t for t in todo if state["tries"].get(str(t["cache"]), 0) >= MACE_ATTEMPTS]
     if worn and getattr(p.cl, "resubmit_failed", False):       # the cause fixed: try again
         for t in worn:
@@ -7622,7 +7725,7 @@ def mace_jobs(p, step, todo):
         left = [t for t in todo if mace_cached(t["cache"], t["key"]) is None]
         if not left:
             if announced:
-                log(f"{label}: the MACE jobs have finished")
+                log(f"{label}: the MACE jobs have finished ({total:,}/{total:,} relaxations done)")
             return True
         for job in state["jobs"]:
             if not job.get("ended") and ended(job):
@@ -7672,8 +7775,14 @@ def mace_jobs(p, step, todo):
             sys.exit(0)
         if not announced:
             log(f"{label}: waiting for {len(left)} MACE relaxations (jobs "
-                + ", ".join(j["jobid"] for j in active) + f"; polling every {args.poll} s)")
+                + ", ".join(j["jobid"] for j in active) + f"; polling every {args.poll} s; "
+                "each job's progress.txt counts its own)")
             announced = True
+        done = total - len(left)
+        if done != last_done and time.time() - last_time >= PROGRESS_EVERY:
+            log(f"{label}: {done:,}/{total:,} MACE relaxations done ({100 * done / total:.0f}%); "
+                f"{len(active)} job{'s' if len(active) != 1 else ''} queued or running")
+            last_done, last_time = done, time.time()
         time.sleep(args.poll)
 
 
@@ -7692,16 +7801,63 @@ def mace_claim(folder, cache):
     return True
 
 
+# Adds a relaxation a worker has finished (or that failed) to its MACE job's progress.txt
+# (write_progress): a line at the end, e.g. '[14:02:11] 201/398  d555 ...: 432 atoms, 11 steps,
+# 326 s' (the count so far: tail -f follows it), and the count as the first line, e.g. '201/398
+# relaxations done (1 failed), the last at 14:02:11'. The job's workers take turns (a lock file,
+# made as a claim is: O_CREAT | O_EXCL; one older than a minute was left by a worker killed holding
+# it). A few small file operations per relaxation, which takes minutes. Anything that stops it
+# costs only this file: the result is already in its cache file.
+#   Called by: mace_worker()
+#   Calls:     write_progress()
+def mace_progress(folder, total, entry):
+    lock, f = folder / "progress.lock", folder / "progress.txt"
+    entry = " ".join(str(entry).split())[:300]    # one line, however long the error
+    for _ in range(600):                          # about a minute at most
+        try:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > 60:
+                    lock.unlink()
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.1)
+        except OSError:
+            return
+    else:
+        return
+    try:
+        try:
+            old = [x for x in f.read_text(errors="replace").splitlines()[2:] if x.strip()]
+        except OSError:
+            old = []
+        failed = sum(": FAILED: " in x for x in old + [entry])
+        done, now = len(old) + 1 - failed, time.strftime("%H:%M:%S")
+        write_progress(f, f"{done:,}/{total:,} relaxations done"
+                       + (f" ({failed:,} failed)" if failed else "") + f", the last at {now}",
+                       [f"[{now}] {done:,}/{total:,}  {entry}"])
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
 # What a MACE job's worker does (python3 dwf.py --mace-worker tasks.json, written by mace_jobs):
 # works through the job's queue, biggest first, with the job's other workers: each relaxation
 # that its cache file doesn't hold yet and no other worker has taken (mace_claim) it relaxes
 # (mace_run, with the model file and settings given there, or a task's own model, head, charge,
 # fmax and steps), and writes the result to its cache file as soon as it has it
-# (save_mace_result); an error goes into the cache file instead, for the workflow to report. Ends
+# (save_mace_result); an error goes into the cache file instead, for the workflow to report. Each
+# one it finishes, or that fails, it then adds to the job's progress.txt (mace_progress). Ends
 # when nothing is left to take, saying how many it did. (A job written by an older dwf.py gives
-# each worker a file of its own, tasks_KK.json, which it works through the same way.)
+# each worker a file of its own, tasks_KK.json, which it works through the same way, without
+# progress.txt.)
 #   Called by: main()
-#   Calls:     atoms_from_dict(), mace_claim(), mace_run(), save_mace_result()
+#   Calls:     atoms_from_dict(), mace_claim(), mace_progress(), mace_run(), save_mace_result()
 def mace_worker(path):
     path = Path(path)
     spec = json.loads(path.read_text())
@@ -7737,11 +7893,13 @@ def mace_worker(path):
                            t.get("fmax") or spec["fmax"], t.get("steps") or spec["steps"],
                            t.get("charge"))
             save_mace_result(cache, t["key"], res)
-            log(f"{t['label']}: {len(res[0])} atoms, {res[3]} steps, "
-                f"{time.time() - start:.0f} s")
+            what = f"{len(res[0])} atoms, {res[3]} steps, {time.time() - start:.0f} s"
         except Exception as err:                  # anything MACE or torch raises
             save_mace_result(cache, t["key"], error=f"{type(err).__name__}: {err}")
-            log(f"{t['label']}: FAILED: {type(err).__name__}: {err}")
+            what = f"FAILED: {type(err).__name__}: {err}"
+        log(f"{t['label']}: {what}")
+        if path.name == "tasks.json":             # the job's shared queue
+            mace_progress(path.parent, len(spec["tasks"]), f"{t['label']}: {what}")
     log(f"MACE worker: nothing left to take; {mine} relaxations here in "
         f"{time.time() - began:.0f} s")
 

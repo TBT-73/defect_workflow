@@ -555,7 +555,10 @@ Each job gets its own directory, dry run, plan, walltime and restarts, as in a s
 jobs that would give the same dry run share one. A job whose inputs change after it was set up
 is set up again if it never ran; if it has run, the script stops (`--force` keeps its results).
 `--resubmit-failed` starts failed jobs again from the beginning. The results are printed as a
-table at the end and written to `batch_results.json` in the work directory. The script keeps each
+table at the end and written to `batch_results.json` in the work directory. While it waits,
+`progress.txt` there lists the jobs as they finish, each with the count so far
+(`[14:02:11] 1,201/4,980  job_17: done`), under the count as its first line, so `tail -f` follows
+it, and the log has the count every 10 minutes. The script keeps each
 job's `job_info.json` in memory once it has read it (it is the only thing that writes them, so
 don't edit one while it runs) and doesn't read a finished job's output again, so its own work grows
 only in step with the number of jobs, thousands of them included. From Python, call
