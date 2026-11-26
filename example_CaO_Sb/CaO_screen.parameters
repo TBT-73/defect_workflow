@@ -29,6 +29,8 @@ param     : CaO.param          # production settings (functional, cut-off, ...);
 mace         : true            # MACE for the size scan (B2), the pre-relaxations (C1) and the
                                #   distortions' search (C4); false: C5 relaxes the distortions
 mace_model  : mace-matpes-pbe-0    # a mace_mp foundation model, or your own .model file
+!mace_rattle : 0.02 ang        # B2, C1: the atoms within 4 A of the defect start moved at
+                               #   random by about this, so that a symmetric start can relax
 # ======================================================================= A: host
 converge : true                # A1: converge the cut-off and k-point spacing first
 converge_kgrid_min  : 10        # 4x4x4, 6x6x6, ... 14x14x14
@@ -98,14 +100,15 @@ dopant_pairs  : same           # two defects of one dopant, e.g. Sb_Ca + Sb_O (t
 # the MACE scan of every candidate in each. A candidate is converged at the smallest size from
 # which its MACE relaxation energy R lies on a line R_inf - c/N (N: the cell's atoms): that size
 # and at least 3 bigger ones within scan_tol of it. c/N is the energy of the stress the fixed cell
-# holds. The largest length is the most B3 will use (and the line test needs 3 sizes above the
-# one it picks); B4 goes beyond it if it must.
+# holds. B3 uses at most the fourth-largest (the line test needs 3 sizes above the one it
+# picks), and drops a candidate that doesn't converge; B4 goes beyond the largest if it must.
 scan          : true
 scan_lengths  : 8 10 12 14 16 18 20 ang
 scan_tol      : 0.05 eV
 scan_test     : line           # line | flat: R within scan_tol of every bigger size's, and the
 scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this (flat only)
-# B3: the screening cell is the smallest size that holds every candidate (B2) and is at least
+!scan_unconverged : drop       # drop | largest: what B3 does with a candidate B2 didn't converge
+# B3: the screening cell is the smallest size that holds every converged candidate (B2), at least
 # the Gamma-only floor, estimated from the band edges' effective masses (A2.2) for the
 # shallowest deep level (deep_level_margin, below).
 !screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate

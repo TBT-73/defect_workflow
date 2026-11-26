@@ -5098,9 +5098,13 @@ MODEL_E_WINDOW, MODEL_MIN_DIST, MODEL_MAX_FORCE = 3.0, 1.5, 10.0
 MODEL_TEST_FRACTION, MODEL_SEED = 0.2, 7
 CHARGE_OFFSET, CHARGE_CLASSES = 10, 21
 # The settings a MACE relaxation task may carry of its own (a model other than mace_model, one of
-# a multi-head model's heads, a total charge, fmax, steps), in this order (mace_key's,
-# mace_relax's)
-EXTRA_TASK_KEYS = ("model", "head", "charge", "fmax", "steps")
+# a multi-head model's heads, a total charge, fmax, steps, the rattle of its start: rattle_spec),
+# in this order (mace_key's, mace_relax's)
+EXTRA_TASK_KEYS = ("model", "head", "charge", "fmax", "steps", "rattle")
+# The rattle of a MACE relaxation from a defect's ideal structure (B2, C1; rattle_spec): the atoms
+# within this of one of the defect's components are moved (Ang), and the random displacements are
+# the same every time (this seed)
+MACE_RATTLE_RADIUS, MACE_RATTLE_SEED = 4.0, 11
 # C7, D2: the smallest Kohn-Sham step taken as an excitation (it skips a degenerate partner level),
 # eV; and a mode's energy from a curvature, hbar sqrt(eV / (amu Ang^2)), in eV
 KS_STEP_MIN = 0.1
@@ -5194,7 +5198,7 @@ PROJECT_KEYWORDS = {
     "transform": (_ints(9), None), "energy": (_choice("auto", "final", "free", "0K"), "auto"),
     "mace": (_b, True), "mace_model": (_t, "medium-mpa-0"), "mace_device": (_t, "cpu"),
     "mace_threads": (_num(cast=int), 8), "mace_fmax": (_num("eV/ang", "eV/A"), 0.05),
-    "mace_steps": (_num(cast=int), 500),
+    "mace_steps": (_num(cast=int), 500), "mace_rattle": (_num("ang", "A"), 0.02),
     "mace_jobscript": ("template", None), "mace_pack": (_num(cast=int), None),
     "mace_max_jobs": (_num(cast=int), 4), "mace_python": (_t, None),
     # A: host
@@ -5575,7 +5579,7 @@ def read_project(path, run_path):
             die(f"{run_path.name if key in RUN_PROJECT_KEYS else name}: {key} must be at least 1")
     if min(s.scan_lengths) <= 0:
         die(f"{name}: scan_lengths are lengths in Ang, greater than 0")
-    for key in ("charge_margin", "carrier_reach"):
+    for key in ("charge_margin", "carrier_reach", "mace_rattle"):
         if getattr(s, key) < 0:
             die(f"{name}: {key} can't be negative")
     if s.distort_starts < 1:
@@ -7466,14 +7470,16 @@ def correction(q, cell, eps, method):
 # --------------------------------------------------------------------------
 # What identifies one MACE relaxation in the caches: the structure, the model (Project.model_id)
 # and the optimiser's settings (mace_fmax, mace_steps, or a relaxation's own fmax and steps), and
-# for a task with its own head or total charge (EXTRA_TASK_KEYS) those too.
-#   Called by: mace_relax(), mace_relaxations()
+# for a task with its own head, total charge or rattle (EXTRA_TASK_KEYS) those too.
+#   Called by: mace_relax(), mace_relaxations(), step_prerelax()
 #   Calls:     Project.model_id(), atoms_to_dict()
-def mace_key(p, atoms, model=None, head=None, charge=None, fmax=None, steps=None):
+def mace_key(p, atoms, model=None, head=None, charge=None, fmax=None, steps=None, rattle=None):
     data = {"atoms": atoms_to_dict(atoms), "model": p.model_id(model),
             "fmax": fmax or p.s.mace_fmax, "steps": steps or p.s.mace_steps}
     if head is not None or charge is not None:            # (keeps the older caches valid)
         data.update(head=head, charge=charge)
+    if rattle:
+        data["rattle"] = rattle
     return hashlib.md5(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
@@ -7532,18 +7538,51 @@ def save_mace_result(cache, key, result=None, error=None):
     tmp.replace(cache)
 
 
+# The rattle of a relaxation from a defect's ideal structure (B2, C1), for its task: the atoms within
+# MACE_RATTLE_RADIUS of one of the defect's components (info: build_defect's) moved at random,
+# mace_rattle (Ang) the standard deviation of each coordinate, the same displacements every time
+# (apply_rattle). A defect on a symmetric site (e.g. an interstitial in a void) feels no force off
+# it there, its forces cancelling by symmetry, so a relaxation from the ideal structure would keep
+# the symmetry even where breaking it goes lower; the rattle lets it go. None with
+# mace_rattle : 0.
+#   Called by: step_prerelax(), step_scan()
+def rattle_spec(p, info):
+    if not p.s.mace_rattle:
+        return None
+    return {"stdev": p.s.mace_rattle, "radius": MACE_RATTLE_RADIUS,
+            "points": [[round(float(x), 6) for x in pt] for pt in info["points"]]}
+
+
+# Moves a structure's atoms by a rattle_spec, in place: those within its radius of one of its points
+# (through the periodic images), by normal random displacements (MACE_RATTLE_SEED: the same every
+# time for the same structure).
+#   Called by: mace_run()
+def apply_rattle(atoms, spec):
+    _, d = get_distances(np.asarray(spec["points"], float), atoms.positions, cell=atoms.cell,
+                         pbc=True)
+    near = d.min(axis=0) < spec["radius"]
+    u = np.random.RandomState(MACE_RATTLE_SEED).normal(scale=spec["stdev"], size=(len(atoms), 3))
+    pos = atoms.get_positions()
+    pos[near] += u[near]
+    atoms.set_positions(pos)
+
+
 # Relaxes the positions of a structure with a MACE calculator, the cell fixed (ASE's LBFGS, to
-# fmax, in at most steps steps), in total charge charge for a model that takes it. Returns
-# (relaxed Atoms, energy before, energy after, steps); the starting spins are kept (MACE ignores
-# them). The same here (mace_relax) and in the MACE jobs (mace_worker).
+# fmax, in at most steps steps), in total charge charge for a model that takes it; with rattle (a
+# rattle_spec), from the structure rattled (apply_rattle), the energy before still the structure's
+# as given. Returns (relaxed Atoms, energy before, energy after, steps); the starting spins are kept
+# (MACE ignores them). The same here (mace_relax) and in the MACE jobs (mace_worker).
 #   Called by: mace_relax(), mace_worker(), phonon_worker()
-def mace_run(calc, atoms, fmax, steps, charge=None):
+#   Calls:     apply_rattle()
+def mace_run(calc, atoms, fmax, steps, charge=None, rattle=None):
     from ase.optimize import LBFGS
     work = atoms.copy()
     if charge is not None:
         work.info["charge"] = charge               # the model's total-charge embedding reads it
     work.calc = calc
     e0 = float(work.get_potential_energy())
+    if rattle:
+        apply_rattle(work, rattle)
     opt = LBFGS(work, logfile=None)
     opt.run(fmax=fmax, steps=steps)
     e1 = float(work.get_potential_energy())
@@ -7553,19 +7592,19 @@ def mace_run(calc, atoms, fmax, steps, charge=None):
 
 
 # Relaxes a structure with MACE here, in this process (model: default mace_model; a task's own
-# head, charge, fmax and steps, EXTRA_TASK_KEYS), with a MACE step's threads and device (run:
+# head, charge, fmax, steps and rattle, EXTRA_TASK_KEYS), with a MACE step's threads and device (run:
 # its mace_settings), unless its cache file already holds the result (mace_cached). Returns
 # (relaxed Atoms, energy before, energy after, steps).
 #   Called by: mace_relaxations()
 #   Calls:     Project.mace(), mace_cached(), mace_key(), mace_run(), save_mace_result()
 def mace_relax(p, atoms, cache, model=None, head=None, charge=None, fmax=None, steps=None,
-               run=None):
-    key = mace_key(p, atoms, model, head, charge, fmax, steps)
+               rattle=None, run=None):
+    key = mace_key(p, atoms, model, head, charge, fmax, steps, rattle)
     hit = mace_cached(cache, key)
     if hit:
         return hit
     result = mace_run(p.mace(model, head, run), atoms, fmax or p.s.mace_fmax,
-                      steps or p.s.mace_steps, charge)
+                      steps or p.s.mace_steps, charge, rattle)
     save_mace_result(cache, key, result)
     return result
 
@@ -7573,7 +7612,7 @@ def mace_relax(p, atoms, cache, model=None, head=None, charge=None, fmax=None, s
 # A step's MACE relaxations (mace_model; step: B2 scan, C1 prerelax or C4 distort, MACE_STEPS):
 # {cache file: (relaxed Atoms, energy before, energy after, steps)}, or None while MACE jobs are
 # still queued (--no-wait) or after --prepare-only. tasks: [{'atoms', 'cache', 'label'}, and
-# optionally a task's own 'model', 'head', 'charge', 'fmax', 'steps' (EXTRA_TASK_KEYS)]. A
+# optionally a task's own 'model', 'head', 'charge', 'fmax', 'steps', 'rattle' (EXTRA_TASK_KEYS)]. A
 # relaxation whose cache file already holds it (the same structure, model and settings: mace_key) is
 # not run again. The others run as jobs on compute nodes with the step's mace_jobscript
 # (mace_settings: the .run file's, or its own block's; mace_jobs), else here, one after the other
@@ -7865,7 +7904,7 @@ def mace_progress(folder, total, entry):
 # works through the job's queue, biggest first, with the job's other workers: each relaxation
 # that its cache file doesn't hold yet and no other worker has taken (mace_claim) it relaxes
 # (mace_run, with the model file and settings given there, or a task's own model, head, charge,
-# fmax and steps), and writes the result to its cache file as soon as it has it
+# fmax, steps and rattle), and writes the result to its cache file as soon as it has it
 # (save_mace_result); an error goes into the cache file instead, for the workflow to report. Each
 # one it finishes, or that fails, it then adds to the job's progress.txt (mace_progress). Ends
 # when nothing is left to take, saying how many it did. (A job written by an older dwf.py gives
@@ -7906,7 +7945,7 @@ def mace_worker(path):
                     mace_mp(model=model, device=spec["device"], default_dtype="float64"))
             res = mace_run(calcs[(model, head)], atoms_from_dict(t["atoms"]),
                            t.get("fmax") or spec["fmax"], t.get("steps") or spec["steps"],
-                           t.get("charge"))
+                           t.get("charge"), t.get("rattle"))
             save_mace_result(cache, t["key"], res)
             what = f"{len(res[0])} atoms, {res[3]} steps, {time.time() - start:.0f} s"
         except Exception as err:                  # anything MACE or torch raises
@@ -9389,7 +9428,9 @@ def inverse_n_fit(points):
 # B2: the size ladder (size_ladder: the supercell for each of scan_lengths) and, with mace : true
 # and scan : true, the MACE scan of every candidate. Each candidate is built in every size it fits
 # (fits) and relaxed with MACE (positions only, the host's lattice vectors kept, as in C and D;
-# mace_model; mace_relaxations, on compute nodes with mace_jobscript). Its relaxation energy R
+# mace_model; mace_relaxations, on compute nodes with mace_jobscript), from the ideal structure
+# rattled near the defect (mace_rattle, rattle_spec), so that no relaxation is held at a
+# symmetric start by its own symmetry; R is still measured from the ideal structure. Its relaxation energy R
 # (unrelaxed - relaxed) shows whether the cell holds the relaxation. With scan_test : line (the
 # default) a candidate is converged at the smallest size from which R lies on a line
 # R_inf - c/N: that size and every bigger one (at least SCAN_CONFIRM of them) within scan_tol of
@@ -9406,15 +9447,16 @@ def inverse_n_fit(points):
 # One that fails the test although it has the sizes has usually reached different minima in
 # different sizes (R jumps between neighbouring sizes) rather than not converged with size: it is
 # relaxed again in its other sizes from the deepest minimum it reached (the size whose R is
-# furthest above the trend with size, its structure carried into the others: carry_over), each
+# furthest above the trend with size, its structure carried into the others, not rattled again:
+# carry_over), each
 # size keeps the deeper of its two relaxations (mace_seed_cache), and the test is made again. One
 # still not converged is dropped in B3 (scan_unconverged : drop, the default), or counted as needing
 # the largest size (largest). Relaxations that stopped at mace_steps are named in the log.
 #   Called by: main() (step B2)
 #   Calls:     Project.host(), build_defect(), carry_over(), displacement_field(), fits(),
 #              format_table(), inverse_n_fit(), ladder_table(), mace_cache(), mace_relaxations(),
-#              mace_seed_cache(), atoms_from_dict(), atoms_to_dict(), displacements(),
-#              get_distances(), size_ladder()
+#              mace_seed_cache(), rattle_spec(), atoms_from_dict(), atoms_to_dict(),
+#              displacements(), get_distances(), size_ladder()
 def step_scan(p):
     prim = p.host()
     ladder = size_ladder(p, prim)
@@ -9435,7 +9477,7 @@ def step_scan(p):
             atoms, info = build_defect(prim, np.array(cell["matrix"]), c["comps"],
                                        f"{cid} ({c['name']})")
             cache = mace_cache(p, cid, cell["tag"])
-            tasks.append({"atoms": atoms, "cache": cache,
+            tasks.append({"atoms": atoms, "cache": cache, "rattle": rattle_spec(p, info),
                           "label": f"{cid} {c['name']} in {cell['tag']}"})
             plan[(cid, cell["tag"])] = (atoms, info, cache)
     few = sorted(cid for cid in cands if sum((cid, t) in plan for t in by_tag) < need)
@@ -10053,7 +10095,8 @@ def problem_table(runs):
 # C1, C2
 # --------------------------------------------------------------------------
 # C1: builds every candidate in the screening cell (B3; build_defect) and, with mace : true,
-# relaxes it with MACE (positions only, the cell fixed, mace_model): B2's relaxation in that cell
+# relaxes it with MACE (positions only, the cell fixed, mace_model, from the structure rattled
+# near the defect: mace_rattle, rattle_spec): B2's relaxation in that cell
 # when it ran there (the same cache file), else a new one (mace_relaxations, on compute nodes with
 # mace_jobscript). A candidate B2 re-seeded (its size test failed at first) is also relaxed from
 # the deepest minimum B2 found for it, carried into this cell (carry_over; B2's own relaxation in
@@ -10069,7 +10112,8 @@ def problem_table(runs):
 # and its MACE energy.
 #   Called by: main() (step C1)
 #   Calls:     build_defect(), carry_over(), fits(), format_table(), mace_cache(), mace_cached(),
-#              mace_key(), mace_relaxations(), mace_seed_cache(), save_cell(), screen_setup()
+#              mace_key(), mace_relaxations(), mace_seed_cache(), rattle_spec(), save_cell(),
+#              screen_setup()
 def step_prerelax(p):
     cands, prim, P = screen_setup(p)
     d = p.phase_dir("C")
@@ -10090,9 +10134,9 @@ def step_prerelax(p):
         built[cid] = build_defect(prim, P, c["comps"], f"{cid} ({c['name']})")
     seeded, deeper = {}, []
     if p.s.mace:
-        tasks = [{"atoms": atoms, "cache": mace_cache(p, cid, tag),
+        tasks = [{"atoms": atoms, "cache": mace_cache(p, cid, tag), "rattle": rattle_spec(p, info),
                   "label": f"{cid} {cands[cid]['name']} in {tag}"}
-                 for cid, (atoms, _) in built.items()]
+                 for cid, (atoms, info) in built.items()]
         scan = p.out("scan").get("candidates") or {}
         for cid in built:                    # B2's deepest minimum, carried into this cell
             seed = scan.get(cid, {}).get("seed")
@@ -10100,8 +10144,9 @@ def step_prerelax(p):
                 continue
             c, src_P = cands[cid], np.array(seed["matrix"])
             label = f"{cid} ({c['name']})"
-            ideal, _ = build_defect(prim, src_P, c["comps"], label)
-            hit = mace_cached(mace_cache(p, cid, seed["from"]), mace_key(p, ideal))
+            ideal, src_info = build_defect(prim, src_P, c["comps"], label)
+            hit = mace_cached(mace_cache(p, cid, seed["from"]),
+                              mace_key(p, ideal, rattle=rattle_spec(p, src_info)))
             if hit is None:                  # (B2's file is gone: the relaxation from ideal only)
                 continue
             start, _ = carry_over(prim, c["comps"], src_P, hit[0], P, label=label)
@@ -13705,7 +13750,8 @@ STEPS = [
                "pair_max_distance", "native_pairs", "dopant_pairs"), needs=("relax",)),
     Step("scan", "B2", "supercell sizes, and the MACE scan of every candidate", step_scan,
          keys=("mace", "scan", "scan_lengths", "scan_tol", "scan_edge_tol", "scan_test",
-               "mace_model", "mace_fmax", "mace_steps", "transform"), needs=("generate", "relax"),
+               "mace_model", "mace_fmax", "mace_steps", "mace_rattle", "transform"),
+         needs=("generate", "relax"),
          owns=("B_candidates/mace", "B_candidates/jobs/mace_scan", "B_candidates/ladder.json"),
          version=2),                         # 1: each size's relaxed MACE energy (B3's cut);
                                              # 2: the unconverged re-seeded from their deepest
@@ -13722,7 +13768,8 @@ STEPS = [
          needs=("choose", "bands", "relax")),
     # C: screening, ground and excited states
     Step("prerelax", "C1", "build the candidates and pre-relax them with MACE", step_prerelax,
-         keys=("mace", "mace_model", "mace_fmax", "mace_steps", "configuration_margin"),
+         keys=("mace", "mace_model", "mace_fmax", "mace_steps", "mace_rattle",
+               "configuration_margin"),
          needs=("generate", "scan", "choose", "relax"),
          owns=("C_screen/structures/candidates", "C_screen/jobs/mace_prerelax")),
     Step("screen", "C2", "cheap CASTEP screening of every candidate", step_screen,
@@ -13848,6 +13895,8 @@ param     : CaO.param          # production settings (functional, cut-off, ...);
 mace         : true            # MACE for the size scan (B2), the pre-relaxations (C1) and the
                                #   distortions' search (C4); false: C5 relaxes the distortions
 !mace_model  : medium-mpa-0    # a mace_mp foundation model, or your own .model file
+!mace_rattle : 0.02 ang        # B2, C1: the atoms within 4 A of the defect start moved at
+                               #   random by about this, so that a symmetric start can relax
 
 # ======================================================================= A: host
 converge : true                # A1: converge the k-point grid, then the cut-off
@@ -13914,14 +13963,15 @@ dopant_pairs  : false          # true: any two dopant defects | same: two of the
 # the MACE scan of every candidate in each. A candidate is converged at the smallest size from
 # which its MACE relaxation energy R lies on a line R_inf - c/N (N: the cell's atoms): that size
 # and at least 3 bigger ones within scan_tol of it. c/N is the energy of the stress the fixed cell
-# holds. The largest length is the most B3 will use (and the line test needs 3 sizes above the
-# one it picks); B4 goes beyond it if it must.
+# holds. B3 uses at most the fourth-largest (the line test needs 3 sizes above the one it
+# picks), and drops a candidate that doesn't converge; B4 goes beyond the largest if it must.
 scan          : true
 scan_lengths  : 8 10 12 14 16 18 20 ang
 scan_tol      : 0.02 eV
 scan_test     : line           # line | flat: R within scan_tol of every bigger size's, and the
 scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this (flat only)
-# B3: the screening cell is the smallest size that holds every candidate (B2) and is at least
+!scan_unconverged : drop       # drop | largest: what B3 does with a candidate B2 didn't converge
+# B3: the screening cell is the smallest size that holds every converged candidate (B2), at least
 # the Gamma-only floor: decay_length_multiple (below) times the decay length of the shallowest
 # deep level (deep_level_margin, below), from the band edges' effective masses (A2.2).
 !screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate

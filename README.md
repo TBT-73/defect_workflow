@@ -752,8 +752,13 @@ the biggest cell B3 will use (B4 goes beyond it if it must).
 
 **B2 scan** (`mace`, `scan`): every candidate, built in every size it fits (a pair needs its
 components less than half the image distance apart), relaxed with MACE (positions only, in the
-host's lattice, as in C and D; `mace_model`), on compute nodes with `mace_jobscript`. Two numbers
-per relaxation: its relaxation energy R (unrelaxed − relaxed) and the largest displacement of the
+host's lattice, as in C and D; `mace_model`), on compute nodes with `mace_jobscript`. Each starts
+from the ideal structure with the atoms within 4 Å of the defect's components moved at random
+(`mace_rattle`, 0.02 Å by default; the same displacements every time): on a symmetric site (an
+interstitial in a void, say) the forces on a defect cancel exactly, so a relaxation from the ideal
+structure could never leave it, even where breaking the symmetry goes lower. Two numbers
+per relaxation: its relaxation energy R (ideal − relaxed, the rattle left out) and the largest
+displacement of the
 atoms at the cell's edge (further than 35 % of the image distance from the defect). With
 `scan_test : line` (the default) a candidate is converged at the smallest size from which R lies on
 a line R∞ − c/N, N being the cell's number of atoms: that size and every bigger one, at least three
@@ -777,11 +782,13 @@ image distance of its fourth-largest size, less 0.05 Å; 6.99 Å for 8 10 12 14 
 
 A candidate that fails the test although it has the sizes has usually reached different minima in
 different sizes, not converged slowly with size: its R jumps between neighbouring sizes (by more
-than 0.3 eV for most of the failures of a CaO run), as each size is relaxed once, from the ideal
-structure, and a cell's shape and symmetry tip the relaxation into one basin or another. So B2
+than 0.3 eV for most of the failures of a CaO run, before the rattle), as each size is relaxed once,
+from (nearly) the ideal structure, and a cell's shape and symmetry tip the relaxation into one basin
+or another. So B2
 relaxes it again in each of its other sizes from the deepest minimum it reached (the relaxed
 structure of the size whose R is furthest above the trend with size, the line through all its
-sizes, carried into each other cell around the defect), keeps in each size whichever relaxation
+sizes, carried into each other cell around the defect, not rattled again), keeps in each size
+whichever relaxation
 went deeper (by more than 5 meV; `^` in `summary.txt`'s table) and tests it again; the log says how
 many that converged. This is one more round of MACE jobs, for the failures only. It only puts every
 size in the same minimum: a candidate in the same shallow minimum in every size passes as it is,
@@ -898,7 +905,8 @@ as B2's and C1's do, with `%block runner_distort` for settings of their own.
 
 **C1 prerelax.** Each candidate is built in the screening cell; a pair whose components are more
 than half the shortest image distance apart is left out. With `mace : true` it is relaxed with
-MACE (positions only, `mace_model`): when the screening cell is one of B2's sizes, that is B2's
+MACE (positions only, `mace_model`, rattled as in B2): when the screening cell is one of B2's sizes,
+that is B2's
 relaxation, read from its file in `B_candidates/mace/`; otherwise C1 runs it (on compute nodes
 with `mace_jobscript`). A candidate B2 re-seeded is also relaxed from the deepest minimum B2 found
 for it, carried into the screening cell (B2's own relaxation there when the cell is one of its
@@ -1492,7 +1500,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **J**: [`jobscript`](#runner-settings) (runner)
 - **K**: [`keep_structures`](#c-screening-ground-and-excited-states) (C) · [`kspacing`](#a-host) (A)
 - **L**: [`level_margin`](#c-screening-ground-and-excited-states) (C) · [`lineshape`](#f-lineshapes) (F) · [`lineshape_amplitude`](#f-lineshapes) (F) · [`lineshape_delta`](#f-lineshapes) (F) · [`lineshape_displacements`](#f-lineshapes) (F) · [`lineshape_gamma`](#f-lineshapes) (F) · [`lineshape_host`](#f-lineshapes) (F) · [`lineshape_length`](#f-lineshapes) (F) · [`lineshape_method`](#f-lineshapes) (F) · [`lineshape_sigma`](#f-lineshapes) (F) · [`lineshape_temperature`](#f-lineshapes) (F) · [`local_fraction`](#c-screening-ground-and-excited-states) (C)
-- **M**: [`mace`](#mace) (MACE) · [`mace_device`](#mace) (MACE) · [`mace_fmax`](#mace) (MACE) · [`mace_jobscript`](#mace) (MACE) · [`mace_max_jobs`](#mace) (MACE) · [`mace_model`](#mace) (MACE) · [`mace_pack`](#mace) (MACE) · [`mace_python`](#mace) (MACE) · [`mace_steps`](#mace) (MACE) · [`mace_threads`](#mace) (MACE) · [`max_cores`](#runner-settings) (runner) · [`max_jobs`](#runner-settings) (runner) · [`max_nodes`](#runner-settings) (runner) · [`max_restarts`](#runner-settings) (runner) · [`max_walltime`](#runner-settings) (runner) · [`mem_per_core`](#runner-settings) (runner) · [`mem_replicated`](#runner-settings) (runner) · [`mem_safety`](#runner-settings) (runner) · [`model_batch`](#f-lineshapes) (F) · [`model_channels`](#f-lineshapes) (F) · [`model_command`](#f-lineshapes) (F) · [`model_device`](#f-lineshapes) (F) · [`model_epochs`](#f-lineshapes) (F) · [`model_jobscript`](#f-lineshapes) (F) · [`model_max_L`](#f-lineshapes) (F) · [`model_r_max`](#f-lineshapes) (F) · [`model_train_args`](#f-lineshapes) (F) · [`mp_api_key`](#a-host) (A)
+- **M**: [`mace`](#mace) (MACE) · [`mace_device`](#mace) (MACE) · [`mace_fmax`](#mace) (MACE) · [`mace_jobscript`](#mace) (MACE) · [`mace_max_jobs`](#mace) (MACE) · [`mace_model`](#mace) (MACE) · [`mace_pack`](#mace) (MACE) · [`mace_python`](#mace) (MACE) · [`mace_rattle`](#mace) (MACE) · [`mace_steps`](#mace) (MACE) · [`mace_threads`](#mace) (MACE) · [`max_cores`](#runner-settings) (runner) · [`max_jobs`](#runner-settings) (runner) · [`max_nodes`](#runner-settings) (runner) · [`max_restarts`](#runner-settings) (runner) · [`max_walltime`](#runner-settings) (runner) · [`mem_per_core`](#runner-settings) (runner) · [`mem_replicated`](#runner-settings) (runner) · [`mem_safety`](#runner-settings) (runner) · [`model_batch`](#f-lineshapes) (F) · [`model_channels`](#f-lineshapes) (F) · [`model_command`](#f-lineshapes) (F) · [`model_device`](#f-lineshapes) (F) · [`model_epochs`](#f-lineshapes) (F) · [`model_jobscript`](#f-lineshapes) (F) · [`model_max_L`](#f-lineshapes) (F) · [`model_r_max`](#f-lineshapes) (F) · [`model_train_args`](#f-lineshapes) (F) · [`mp_api_key`](#a-host) (A)
 - **N**: [`name`](#general) (general) · [`native_pairs`](#b-candidates-the-screening-and-electronic-cells) (B)
 - **O**: [`omp_threads`](#runner-settings) (runner) · [`%block oxidation_states`](#c-screening-ground-and-excited-states) (C)
 - **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-the-screening-and-electronic-cells) (B) · [`pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`phases_max_steps`](#a-host) (A) · [`phases_molecule_box`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
@@ -1537,6 +1545,7 @@ candidate in every size are by far the most, `%block runner_prerelax` for C1 and
 | `mace_model` | `medium-mpa-0` | B2, C1, C4 | The model: the name of a `mace_mp` foundation model, or a model file of your own. A new model makes B2, C1 and C4 run again (their MACE relaxations are kept per model, so going back to an earlier one reuses them). |
 | `mace_fmax` | `0.05 eV/ang` | B2, C1, C4 | A MACE relaxation stops when the largest force is below this. |
 | `mace_steps` | `500` | B2, C1, C4 | ... or after this many optimiser (LBFGS) steps. |
+| `mace_rattle` | `0.02 ang` | B2, C1 | The standard deviation of the random displacements of a relaxation's start: the atoms within 4 Å of the defect's components, moved the same way every time, so that a defect on a symmetric site isn't held there by its own symmetry. R is still measured from the ideal structure. `0`: no rattle. Part of each relaxation's cache key, so a new value (the first run with this keyword, too) runs B2's and C1's relaxations again; C4's distortions have ShakeNBreak's own rattle. |
 | `mace_device` | `cpu` | — | In `NAME.run`. `cpu`, or `cuda` on a GPU; also F2's models' default (`model_device`). |
 | `mace_threads` | `8` | — | In `NAME.run`. Torch threads per relaxation. |
 | `mace_jobscript` | — | — | In `NAME.run`. A Slurm template (a file, or `%block mace_jobscript`) for running the MACE relaxations (B2, C1, C4) as jobs on compute nodes. It needs one line with `{COMMAND}`, which becomes the workers; whatever is in front of it on that line (e.g. `srun --exact --ntasks=1 --cpus-per-task=8`) goes in front of each. `{JOBNAME}` is filled in too. Without it, the relaxations run where `dwf.py` runs. See [section 7](#7-the-mace-jobscript-template-mace_jobscript). |
@@ -2518,6 +2527,13 @@ relaxation in its cell without a new one, and ran its own from B2's minimum in a
 ladder. A rerun of B2 reused every relaxation, the re-seeded ones too. `scan_test : flat` and
 `supercell` (nothing dropped) were run as well. Not run with the real MACE.
 
+`mace_rattle` was checked with Lennard-Jones standing in for MACE, on an fcc crystal with an atom on
+its octahedral hole: the energy before stays the ideal structure's, only the atoms within 4 Å of
+the defect move (7 there), the same rattle gives the same relaxation, and a MACE job's worker
+applies it from `tasks.json` as a relaxation here does; and with the B2 to C1 stand-in above: every
+first relaxation rattled and no re-seeded one, C1 still reading B2's relaxations in a size of the
+ladder, and a rerun of B2 reusing every one.
+
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's cut on real energies (see 15 below), C4's search with the real MACE (see 8 below), real
 `mace_run_train` trainings with the charge embedding (F2: the command was checked, not run), real
@@ -2654,3 +2670,7 @@ On the first real runs, check:
    the jumps are gone (R on one smooth curve with size). B3's table lists what `scan_unconverged :
    drop` dropped; for a candidate you care about there, its B2 row says why (a pair with too few
    sizes needs more `scan_lengths` or a smaller `pair_max_distance`).
+19. **`mace_rattle`**: the first run with it relaxes B2's and C1's candidates again (their starts
+   are new). The steps per relaxation (the workers' logs, `progress.txt`) should go up only a
+   little; for a few interstitials, compare R with an earlier run's: a larger one means the
+   rattle let it leave a symmetric site.
