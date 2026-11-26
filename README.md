@@ -485,7 +485,8 @@ dwf_CaO_Sb/
                           the phases doped chose, and the Materials Project's replies),
                           jobs/ (converge, relax, bands, dielectric, ref_phases)
   B_candidates/           results.json, summary.txt, ladder.json (the sizes),
-                          mace/ (every MACE relaxation of B2 and C1: one file each),
+                          mace/ (every MACE relaxation of B2 and C1: one file each;
+                          <id>_<size>_seeded.json from the deepest minimum),
                           jobs/mace_scan/ (B2's MACE jobs, with mace_jobscript)
   C_screen/               results.json, summary.txt,
                           mace/ (C4's MACE relaxations: one file each),
@@ -765,10 +766,29 @@ between charge states or against isolated components. With `scan_test : flat` a 
 converged at the smallest size whose R is within `scan_tol` of that of every bigger size, with its
 edge displacement below `scan_edge_tol`. A defect with a big stress tail may never converge that way
 (Sb<sub>Ca</sub> + V<sub>O</sub> in CaO gained about 57 eV / N, still 0.13 eV short at 432 atoms),
-while on the line it converged at 144 atoms. One that never converges (or, with `line`, hasn't three
-bigger sizes on the line) counts as needing the largest size, so give `scan_lengths` three sizes
-beyond where you expect the answer. MACE is cheap next to CASTEP, so every candidate gets its own
-answer instead of one defect's standing in for the rest. `summary.txt` has a table of every
+while on the line it converged at 144 atoms.
+
+A candidate needs enough sizes for the test to pass at all: with `line`, a size and three bigger
+ones. A pair fits only the sizes whose image distance is more than twice its separation (plus
+0.05 Å), so `pair_max_distance` and `scan_lengths` have to agree: before the relaxations B2 warns
+when some pairs fit too few sizes, and says how far apart a pair the ladder can test (half the
+image distance of its fourth-largest size, less 0.05 Å; 6.99 Å for 8 10 12 14 16 18 20 Å).
+`summary.txt` marks those "too few sizes", apart from the ones that were tested and failed.
+
+A candidate that fails the test although it has the sizes has usually reached different minima in
+different sizes, not converged slowly with size: its R jumps between neighbouring sizes (by more
+than 0.3 eV for most of the failures of a CaO run), as each size is relaxed once, from the ideal
+structure, and a cell's shape and symmetry tip the relaxation into one basin or another. So B2
+relaxes it again in each of its other sizes from the deepest minimum it reached (the relaxed
+structure of the size whose R is furthest above the trend with size, the line through all its
+sizes, carried into each other cell around the defect), keeps in each size whichever relaxation
+went deeper (by more than 5 meV; `^` in `summary.txt`'s table) and tests it again; the log says how
+many that converged. This is one more round of MACE jobs, for the failures only. It only puts every
+size in the same minimum: a candidate in the same shallow minimum in every size passes as it is,
+and finding lower minima is C4's job. One still not converged is dropped by B3
+(`scan_unconverged : drop`, the default), or counted as needing the largest size (`largest`). MACE
+is cheap next to CASTEP, so every candidate gets its own answer instead of one defect's standing in
+for the rest. `summary.txt` has a table of every
 candidate's relaxation energy in every size. With `mace : false` or `scan : false` only the ladder
 is made, and B3 goes by the floor (or `supercell`).
 
@@ -783,7 +803,7 @@ smaller, the cell it would have been. The screening cell is the smallest size of
 is at least as big as
 
 - every surviving candidate's converged size (B2): the worst case sets it, and `summary.txt`
-  names the candidate that did, and
+  names the candidate that did (one B2 didn't converge: below), and
 - the **Γ-only floor**: the image distance a cell needs for Γ-point screening to see a defect's
   levels as an isolated defect has them. A level E_b inside the gap decays away from the defect as
   exp(−r/ξ), with 1/ξ² = (2m*/ħ²) E_b (1 − E_b/E_g) in a two-band (Kane) model, and neighbouring
@@ -798,6 +818,14 @@ is at least as big as
   less for a compact one), and deeper levels by much less, as they decay faster. A cell's atoms go
   as the cube of the multiple, so 3 needs under half the atoms of 4. `screen_min_image` gives the
   floor yourself (0: none).
+
+A survivor B2 didn't converge (with too few sizes, or still not after the re-seeding) is dropped
+(`scan_unconverged : drop`, the default): C1 leaves it out, as it does a cut one, and it doesn't
+size the cell; `summary.txt` lists them. So the sizes above the fourth-largest are only there for
+the test, and the screening cell is at most the fourth-largest size (with `scan_test : line`;
+or the floor). With
+`scan_unconverged : largest` such a candidate counts as needing the largest size instead, and one
+is enough to put every C2 run in the largest cell. With `supercell` nothing is dropped.
 
 A floor beyond the ladder gets a cell of its own. `supercell` fixes the screening cell instead (a
 length, `supercell : 14 ang`, or n × transform, `supercell : 3`). `summary.txt` also lists the
@@ -872,7 +900,10 @@ as B2's and C1's do, with `%block runner_distort` for settings of their own.
 than half the shortest image distance apart is left out. With `mace : true` it is relaxed with
 MACE (positions only, `mace_model`): when the screening cell is one of B2's sizes, that is B2's
 relaxation, read from its file in `B_candidates/mace/`; otherwise C1 runs it (on compute nodes
-with `mace_jobscript`). The arrangements B3's `configuration_margin` cut are left out, unbuilt.
+with `mace_jobscript`). A candidate B2 re-seeded is also relaxed from the deepest minimum B2 found
+for it, carried into the screening cell (B2's own relaxation there when the cell is one of its
+sizes), and keeps the deeper of the two (`reseeded` in `results.json`). The arrangements B3's
+`configuration_margin` cut, and the candidates it dropped as not converged, are left out, unbuilt.
 Without B2's scan (`scan : false`) B3 has no energies to cut with, and C1 makes the cut itself:
 arrangements whose configurational energy (MACE energy above the lowest arrangement of the same
 composition) in the screening cell is more than the margin are dropped before any CASTEP run
@@ -1467,7 +1498,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-the-screening-and-electronic-cells) (B) · [`pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`phases_max_steps`](#a-host) (A) · [`phases_molecule_box`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
 - **Q**: [`quench_temperature`](#e-thermodynamics) (E)
 - **R**: [`rattle_dmin`](#c-screening-ground-and-excited-states) (C) · [`rattle_stdev`](#c-screening-ground-and-excited-states) (C) · [`ref_kspacing_factor`](#a-host) (A) · [`ref_polymorph_window`](#a-host) (A) · [`ref_relax`](#a-host) (A) · [`require_bound`](#c-screening-ground-and-excited-states) (C) · [`require_gap_states`](#c-screening-ground-and-excited-states) (C) · [`require_spin`](#c-screening-ground-and-excited-states) (C) · [`%block runner_scan`, `runner_prerelax`, `runner_distort`](#mace) (MACE) · [`%block runner_host`, `runner_screen`, `runner_production`, `runner_<step>`](#runner-settings) (runner)
-- **S**: [`scan`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_edge_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_lengths`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_test`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`screen_charges`](#c-screening-ground-and-excited-states) (C) · [`screen_cutoff`](#c-screening-ground-and-excited-states) (C) · [`screen_max_steps`](#c-screening-ground-and-excited-states) (C) · [`screen_min_image`](#b-candidates-the-screening-and-electronic-cells) (B) · [`%block screen_overrides`](#c-screening-ground-and-excited-states) (C) · [`screen_spins`](#c-screening-ground-and-excited-states) (C) · [`share_rounds`](#c-screening-ground-and-excited-states) (C) · [`site_margin`](#c-screening-ground-and-excited-states) (C) · [`sp_walltime`](#runner-settings) (runner) · [`spin_tol`](#c-screening-ground-and-excited-states) (C) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-the-screening-and-electronic-cells) (B)
+- **S**: [`scan`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_edge_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_lengths`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_test`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_unconverged`](#b-candidates-the-screening-and-electronic-cells) (B) · [`screen_charges`](#c-screening-ground-and-excited-states) (C) · [`screen_cutoff`](#c-screening-ground-and-excited-states) (C) · [`screen_max_steps`](#c-screening-ground-and-excited-states) (C) · [`screen_min_image`](#b-candidates-the-screening-and-electronic-cells) (B) · [`%block screen_overrides`](#c-screening-ground-and-excited-states) (C) · [`screen_spins`](#c-screening-ground-and-excited-states) (C) · [`share_rounds`](#c-screening-ground-and-excited-states) (C) · [`site_margin`](#c-screening-ground-and-excited-states) (C) · [`sp_walltime`](#runner-settings) (runner) · [`spin_tol`](#c-screening-ground-and-excited-states) (C) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-the-screening-and-electronic-cells) (B)
 - **T**: [`tolerate_failures`](#runner-settings) (runner) · [`transform`](#general) (general)
 - **V**: [`vacancies`](#b-candidates-the-screening-and-electronic-cells) (B) · [`validate`](#c-screening-ground-and-excited-states) (C) · [`validate_defects`](#c-screening-ground-and-excited-states) (C) · [`validate_gamma`](#c-screening-ground-and-excited-states) (C) · [`validate_sizes`](#c-screening-ground-and-excited-states) (C) · [`validate_tol`](#c-screening-ground-and-excited-states) (C)
 - **W**: [`walltime`](#runner-settings) (runner) · [`walltime_safety`](#runner-settings) (runner) · [`workdir`](#general) (general)
@@ -1561,9 +1592,10 @@ Details: [Phase B](#phase-b-candidate-defects-the-screening-and-electronic-cells
 | `dopant_pairs` | `false` | B1 | Also pairs of two dopant defects: `true` any two (Sb_Ca + N_O as well as Sb_Ca + Sb_O), `same` only two of the same dopant, so that each dopant meets the host on its own. |
 | `pair_max_distance` | `5.0 ang` | B1 | The largest separation of the pair arrangements, generated or from `all`. A pair farther apart than half a cell's shortest image distance isn't built in it: B2 skips that size, and C1 leaves the pair out if it is the screening cell. |
 | `scan` | `true` | B2 | Scan every candidate with MACE in every size (also needs `mace : true`). With `false`, B2 makes only the size ladder. |
-| `scan_lengths` | `8 10 12 14 16 18 20 ang` (*list*) | B2, B3, B4, C8 | The sizes, as lengths: for each, the most compact supercell whose periodic images are all at least that far apart (doped; n × `transform` with a transform). B2 scans them, B3 and B4 pick their cells from them (B4 goes beyond the largest if it must), and C8's sizes are the next ones above the screening cell. |
+| `scan_lengths` | `8 10 12 14 16 18 20 ang` (*list*) | B2, B3, B4, C8 | The sizes, as lengths: for each, the most compact supercell whose periodic images are all at least that far apart (doped; n × `transform` with a transform). B2 scans them, B3 and B4 pick their cells from them (B4 goes beyond the largest if it must), and C8's sizes are the next ones above the screening cell. With `scan_test : line` a candidate converges at the fourth-largest size at most, and a pair can only be tested if it fits that size: B2 warns when `pair_max_distance` is too big for the ladder. |
 | `scan_tol` | `0.02 eV` | B2 | With `scan_test : line`, the most any size's MACE relaxation energy may be off the line R∞ − c/N through it and the bigger sizes. With `flat`, a candidate's relaxation energy must be within this of that of every bigger size ... |
 | `scan_edge_tol` | `0.05 ang` | B2 | (`scan_test : flat` only) ... and the atoms at the cell's edge (further than 35 % of the image distance from the defect) moved less than this, for it to be converged in that size. |
+| `scan_unconverged` | `drop` | B3 | What B3 does with a candidate B2's size scan didn't converge (with too few sizes for the test, or still not after the re-seeding from its deepest minimum). `drop`: C1 leaves it out, and it doesn't size the screening cell. `largest`: it is screened, in a cell sized as if it needed the largest size. Not used with `supercell`. |
 | `scan_test` | `line` | B2 | How B2 decides a candidate has converged. `line`: the smallest size from which its relaxation energy follows R∞ − c/N (N, the cell's atoms): it and at least three bigger sizes within `scan_tol` of the line through them; the table gives R∞, c and c/N there. `flat`: the smallest size whose relaxation energy is within `scan_tol` of every bigger size's, with the edge atoms moved less than `scan_edge_tol`. |
 | `screen_min_image` | from the band masses | B3 | The Γ-only floor (Å) yourself: the screening cell's images are at least this far apart. `0`: no floor. Without it, B3 estimates the floor from A2.2's effective masses, `deep_level_margin` and `decay_length_multiple`. |
 | `supercell` | — | B3 | Fix the screening cell: a length (`supercell : 14 ang`, the most compact cell for it) or n (`supercell : 3`, n × `transform`). B2's scan is then only reported. |
@@ -2473,6 +2505,19 @@ only shown; a project that still gives `max_formation_energy` is told it has gon
 with C4 `dopant_phases` drops its record and results (its jobs stay), and one of the older layout
 migrates as before, C4 to C6 then running again.
 
+B2's re-seeding and B3's `scan_unconverged` were checked on CaO with Sb<sub>Ca</sub> and
+Sb<sub>Ca</sub> + V<sub>O</sub> 2.4 to 8.0 Å apart, n × n × n cells of 54 to 686 atoms and a
+stand-in for MACE (relaxation energies on a line R∞ − c/N, 0.8 eV less in a shallow minimum that
+one pair's relaxations from the ideal structure fell into in two of its sizes, and another pair
+whose energy wanders by size whatever its start). The pairs 7.2 Å and more apart were reported as
+fitting too few sizes, with the warning (the ladder tests pairs up to 6.78 Å); the jumping pair was
+re-seeded from its deepest size and converged, and the wandering one was re-seeded and didn't. B3
+cut one arrangement, dropped the unconverged survivors, sized the cell for the rest (the floor,
+128 atoms) and with `largest` went to 686 atoms; C1 left out the dropped ones, took B2's re-seeded
+relaxation in its cell without a new one, and ran its own from B2's minimum in a cell outside the
+ladder. A rerun of B2 reused every relaxation, the re-seeded ones too. `scan_test : flat` and
+`supercell` (nothing dropped) were run as well. Not run with the real MACE.
+
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's cut on real energies (see 15 below), C4's search with the real MACE (see 8 below), real
 `mace_run_train` trainings with the charge embedding (F2: the command was checked, not run), real
@@ -2603,3 +2648,9 @@ On the first real runs, check:
    at least 13 Å of vacuum around each, plenty for a small neutral molecule at Γ. To check, relax
    one by hand in a 20 Å box with the same settings (its folder in `A_host/jobs/ref_phases/` has
    them): its energy should change by no more than a few meV.
+18. **B2's re-seeding and B3's drops**: B2's log says how many candidates were re-seeded and how
+   many of them then converged. In B2's table, `^` marks a size whose relaxation from the deepest
+   minimum went deeper, and the last column the size that minimum came from: for a few, check that
+   the jumps are gone (R on one smooth curve with size). B3's table lists what `scan_unconverged :
+   drop` dropped; for a candidate you care about there, its B2 row says why (a pair with too few
+   sizes needs more `scan_lengths` or a smaller `pair_max_distance`).

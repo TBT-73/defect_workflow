@@ -5060,6 +5060,10 @@ EDGE_FRACTION = 0.35
 # B2 (scan_test : line): how many bigger sizes must lie on the R = R_inf - c/N line with a size for
 # a candidate to count as converged there
 SCAN_CONFIRM = 3
+# How much deeper (eV) a relaxation from another size's minimum must go than the one from the ideal
+# structure to take its place (B2's re-seeding, C1): more than two relaxations into one minimum
+# differ by
+SEED_DEEPER = 0.005
 # C2: a Gamma-point gap of the screening cell this much above A2.2's means band edges that don't
 # fold onto Gamma (eV)
 FOLD_GAP_TOL = 0.05
@@ -5219,6 +5223,7 @@ PROJECT_KEYWORDS = {
     "scan": (_b, True), "scan_lengths": (_floats(), [8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0]),
     "scan_tol": (_num("eV"), 0.02), "scan_edge_tol": (_num("ang", "A"), 0.05),
     "scan_test": (_choice("line", "flat"), "line"),
+    "scan_unconverged": (_choice("drop", "largest"), "drop"),
     "supercell": (_size, None), "screen_min_image": (_num("ang", "A"), None),
     "electronic_cell": (_cellsize, None), "electronic_depth": (_num("eV"), 0.25),
     "decay_length_multiple": (_num(), 4.0),
@@ -7052,7 +7057,7 @@ def match_ideal(prim, comps, P, relaxed, label="defect"):
 
 # The displacement field of a defect's relaxed structure (match_ideal without the matching): the
 # ideal Atoms, its info, each ideal atom's displacement and position relative to the centre.
-#   Called by: carry_over(), same_basin()
+#   Called by: carry_over(), same_basin(), step_scan()
 #   Calls:     match_ideal()
 def displacement_field(prim, comps, P, relaxed, label="defect"):
     ideal, info, _, u, v = match_ideal(prim, comps, P, relaxed, label)
@@ -7086,11 +7091,13 @@ def common_atoms(v1, syms1, v2, syms2, radius):
 # in the relaxed structure (displacement_field, common_atoms); the atoms further out stay on their
 # perfect-crystal sites. radius defaults to just under half the smaller cell's shortest image
 # distance, the region the two cells describe in the same way. Works for any host and any pair of
-# supercells of it. Returns (Atoms, info) as build_defect does.
-#   Called by: big_cell(), into_cell(), step_distort(), step_validate()
+# supercells of it. Returns (Atoms, info) as build_defect does. field: the source's
+# displacement_field, when it is known already (B2 carries one structure into many sizes).
+#   Called by: big_cell(), into_cell(), step_distort(), step_prerelax(), step_scan(),
+#              step_validate()
 #   Calls:     build_defect(), common_atoms(), displacement_field(), min_image()
-def carry_over(prim, comps, src_P, src_atoms, dst_P, radius=None, label="defect"):
-    ideal, _, u, v = displacement_field(prim, comps, src_P, src_atoms, label)
+def carry_over(prim, comps, src_P, src_atoms, dst_P, radius=None, label="defect", field=None):
+    ideal, _, u, v = field or displacement_field(prim, comps, src_P, src_atoms, label)
     new, info = build_defect(prim, dst_P, comps, label)
     from ase.geometry import find_mic
     w, _ = find_mic(new.positions - np.asarray(info["centre"]), new.cell, pbc=True)
@@ -7475,6 +7482,14 @@ def mace_key(p, atoms, model=None, head=None, charge=None, fmax=None, steps=None
 #   Called by: step_prerelax(), step_scan()
 def mace_cache(p, cid, tag):
     return p.phase_dir("B") / "mace" / f"{cid}_{tag}.json"
+
+
+# The cache file of a candidate's re-seeded MACE relaxation in one supercell: from the deepest
+# minimum B2 found for it in another size, carried into this one (step_scan's second pass; C1's
+# in the screening cell, the same file when that is a size of the ladder).
+#   Called by: step_prerelax(), step_scan()
+def mace_seed_cache(p, cid, tag):
+    return p.phase_dir("B") / "mace" / f"{cid}_{tag}_seeded.json"
 
 
 # A MACE relaxation's result from its cache file: (relaxed Atoms, energy before, energy after,
@@ -9385,12 +9400,20 @@ def inverse_n_fit(points):
 # composition but not between charge states. With scan_test : flat it is converged at the
 # smallest size whose R is within scan_tol of that of every bigger size, with the atoms at the
 # cell's edge (further than EDGE_FRACTION of the shortest image distance from the defect's centre)
-# moved less than scan_edge_tol; the edge displacement is shown with either test. One that never
-# converges (or, with line, hasn't SCAN_CONFIRM bigger sizes) counts in B3 as needing the largest
-# size. Relaxations that stopped at mace_steps are named in the log.
+# moved less than scan_edge_tol; the edge displacement is shown with either test. A candidate
+# with fewer sizes than the test needs (a pair too far apart for the smaller ones) can't
+# converge: a warning before the relaxations says how far apart a pair this ladder can test may be.
+# One that fails the test although it has the sizes has usually reached different minima in
+# different sizes (R jumps between neighbouring sizes) rather than not converged with size: it is
+# relaxed again in its other sizes from the deepest minimum it reached (the size whose R is
+# furthest above the trend with size, its structure carried into the others: carry_over), each
+# size keeps the deeper of its two relaxations (mace_seed_cache), and the test is made again. One
+# still not converged is dropped in B3 (scan_unconverged : drop, the default), or counted as needing
+# the largest size (largest). Relaxations that stopped at mace_steps are named in the log.
 #   Called by: main() (step B2)
-#   Calls:     Project.host(), build_defect(), fits(), format_table(), inverse_n_fit(),
-#              ladder_table(), mace_cache(), mace_relaxations(), displacements(),
+#   Calls:     Project.host(), build_defect(), carry_over(), displacement_field(), fits(),
+#              format_table(), inverse_n_fit(), ladder_table(), mace_cache(), mace_relaxations(),
+#              mace_seed_cache(), atoms_from_dict(), atoms_to_dict(), displacements(),
 #              get_distances(), size_ladder()
 def step_scan(p):
     prim = p.host()
@@ -9401,6 +9424,9 @@ def step_scan(p):
         return {"ladder": ladder, "candidates": {}, "_table": sizes,
                 "_note": f"{len(ladder)} sizes; no MACE scan (mace or scan is false)"}
     cands = p.out("generate")["candidates"]
+    line, drop = p.s.scan_test == "line", p.s.scan_unconverged == "drop"
+    need = SCAN_CONFIRM + 1 if line else 2         # the sizes a candidate needs for the test
+    by_tag = {cell["tag"]: cell for cell in ladder}
     tasks, plan = [], {}
     for cid, c in cands.items():
         for cell in ladder:
@@ -9412,81 +9438,171 @@ def step_scan(p):
             tasks.append({"atoms": atoms, "cache": cache,
                           "label": f"{cid} {c['name']} in {cell['tag']}"})
             plan[(cid, cell["tag"])] = (atoms, info, cache)
+    few = sorted(cid for cid in cands if sum((cid, t) in plan for t in by_tag) < need)
+    if few:
+        seps = [cands[cid]["separation"] for cid in few if cands[cid]["separation"]]
+        reach = ladder[-need]["L"] / 2 - 0.05 if len(ladder) >= need else None
+        nth = {2: "2nd", 3: "3rd"}.get(need, f"{need}th")
+        log(f"WARNING: B2: {len(few)} candidate{'s fit' if len(few) > 1 else ' fits'} fewer than "
+            f"{need} sizes of the ladder, so the size test can't pass for "
+            + ("them" if len(few) > 1 else "it")
+            + (f" (pairs {min(seps):.2f}-{max(seps):.2f} A apart)" if seps else "") + "; B3 "
+            + ("drops them (scan_unconverged : drop)" if drop else
+               "counts them as needing the largest size (scan_unconverged : largest)") + ". "
+            + (f"This ladder can test pairs up to {reach:.2f} A apart (half its {nth}-largest "
+               "size's image distance, less 0.05 A): a pair_max_distance no bigger, or "
+               if reach is not None else "")
+            + f"scan_lengths with {need - 1} more sizes above where the farthest pair first fits, "
+              "would test every one")
     res = mace_relaxations(p, "scan", tasks)
     if res is None:
         return None
-    line = p.s.scan_test == "line"
-    out, rows, capped = {}, [], []
-    for cid, c in cands.items():
-        seen = []
-        for cell in ladder:
-            if (cid, cell["tag"]) not in plan:
-                continue
-            atoms, info, cache = plan[(cid, cell["tag"])]
-            relaxed, e0, e1, steps = res[str(cache)]
-            moved = displacements(atoms, relaxed)
-            _, r = get_distances(np.array(info["centre"])[None], atoms.positions,
-                                    cell=atoms.cell, pbc=True)
-            edge = moved[r[0] > EDGE_FRACTION * cell["L"]]
-            seen.append({"tag": cell["tag"], "L": cell["L"], "N": cell["natoms"],
-                         "E_relax": round(e0 - e1, 5), "E": round(e1, 5),
-                         "edge": round(float(edge.max()) if edge.size else 0.0, 4),
-                         "steps": steps})
-            if steps >= p.s.mace_steps:
-                capped.append(f"{cid} in {cell['tag']}")
-        conv, fit = None, None
+
+    # A relaxation's numbers in its size: R, the energy before (e0: the ideal structure's, for a
+    # re-seeded one too) less after, the energy after, and the largest move of the atoms at the
+    # cell's edge; seeded: the size it was re-seeded from.
+    def measure(cid, cell, relaxed, e0, e1, steps, seeded=None):
+        atoms, info, _ = plan[(cid, cell["tag"])]
+        moved = displacements(atoms, relaxed)
+        _, r = get_distances(np.array(info["centre"])[None], atoms.positions,
+                             cell=atoms.cell, pbc=True)
+        edge = moved[r[0] > EDGE_FRACTION * cell["L"]]
+        x = {"tag": cell["tag"], "L": cell["L"], "N": cell["natoms"],
+             "E_relax": round(e0 - e1, 5), "E": round(e1, 5),
+             "edge": round(float(edge.max()) if edge.size else 0.0, 4), "steps": steps}
+        return dict(x, seeded=seeded) if seeded else x
+
+    # The test, on a candidate's sizes (smallest first): (the size it has converged at, or None;
+    # the line through it and the bigger sizes, with scan_test : line).
+    def test(seen):
+        if len(seen) < need:
+            return None, None
         if line:                            # the first size on a line with the bigger ones
             for i in range(len(seen) - SCAN_CONFIRM):
                 r_inf, slope, worst = inverse_n_fit(seen[i:])
                 if worst < p.s.scan_tol:
-                    conv = seen[i]["tag"]
-                    fit = {"R_inf": round(r_inf, 4), "c": round(slope, 3),
-                           "worst": round(worst, 4), "sizes": len(seen) - i}
-                    break
-        else:
-            conv = next((x["tag"] for i, x in enumerate(seen[:-1])
-                         if x["edge"] < p.s.scan_edge_tol and
-                         all(abs(y["E_relax"] - x["E_relax"]) < p.s.scan_tol
-                             for y in seen[i + 1:])), None)
-        out[cid] = dict({"sizes": seen, "converged": conv}, **({"fit": fit} if fit else {}))
-        by = {x["tag"]: x for x in seen}
+                    return seen[i]["tag"], {"R_inf": round(r_inf, 4), "c": round(slope, 3),
+                                            "worst": round(worst, 4), "sizes": len(seen) - i}
+            return None, None
+        return next((x["tag"] for i, x in enumerate(seen[:-1])
+                     if x["edge"] < p.s.scan_edge_tol and
+                     all(abs(y["E_relax"] - x["E_relax"]) < p.s.scan_tol
+                         for y in seen[i + 1:])), None), None
+
+    seen = {cid: [measure(cid, cell, *res[str(plan[(cid, cell["tag"])][2])])
+                  for cell in ladder if (cid, cell["tag"]) in plan] for cid in cands}
+    first = {cid: test(seen[cid]) for cid in cands}
+
+    # The second pass. A candidate the test fails although it has the sizes has usually reached
+    # different minima in different sizes (R jumps between neighbouring sizes) rather than not
+    # converged with size. It is relaxed again in each of its other sizes from the deepest minimum
+    # it reached: the relaxed structure of the size whose R is furthest above the trend with size
+    # (the line through all its sizes), carried into the others (carry_over). Each size keeps
+    # whichever of its two relaxations went deeper, and the test is made again.
+    seeds, seed_plan, seed_tasks = {}, {}, []
+    for cid in cands:
+        if first[cid][0] or len(seen[cid]) < need:
+            continue
+        c, xs = cands[cid], seen[cid]
+        r_inf, slope, _ = inverse_n_fit(xs)
+        src = max(xs, key=lambda x: x["E_relax"] - (r_inf - slope / x["N"]))["tag"]
+        src_P = np.array(by_tag[src]["matrix"])
+        # (as its cache file holds it, so that the starts, and their keys, are the same on a rerun)
+        relaxed = atoms_from_dict(atoms_to_dict(res[str(plan[(cid, src)][2])][0]))
+        label = f"{cid} ({c['name']})"
+        try:
+            field = displacement_field(prim, c["comps"], src_P, relaxed, label)
+            starts = {x["tag"]: carry_over(prim, c["comps"], src_P, relaxed,
+                                           np.array(by_tag[x["tag"]]["matrix"]), label=label,
+                                           field=field)[0]
+                      for x in xs if x["tag"] != src}
+        except Exception as err:            # (a structure the matching can't follow)
+            log(f"note: B2: {cid} {c['name']} can't be re-seeded from {src}: {err}")
+            continue
+        seeds[cid] = {"from": src, "matrix": by_tag[src]["matrix"]}
+        for tag, atoms in starts.items():
+            seed_plan[(cid, tag)] = mace_seed_cache(p, cid, tag)
+            seed_tasks.append({"atoms": atoms, "cache": seed_plan[(cid, tag)],
+                               "label": f"{cid} {c['name']} in {tag}, from {src}"})
+    if seed_tasks:
+        log(f"B2: {len(seeds)} candidate{'s' if len(seeds) > 1 else ''} not converged: each "
+            "relaxed again in its other sizes from the deepest minimum it reached "
+            f"({len(seed_tasks)} MACE relaxations)")
+        res2 = mace_relaxations(p, "scan", seed_tasks)
+        if res2 is None:
+            return None
+        for (cid, tag), cache in seed_plan.items():
+            relaxed, _, e1, steps = res2[str(cache)]
+            k = next(i for i, x in enumerate(seen[cid]) if x["tag"] == tag)
+            x = seen[cid][k]
+            if e1 < x["E"] - SEED_DEEPER:   # deeper: this size's relaxation from now on
+                seen[cid][k] = measure(cid, by_tag[tag], relaxed, x["E_relax"] + x["E"], e1,
+                                       steps, seeded=seeds[cid]["from"])
+
+    out, rows, capped = {}, [], []
+    for cid, c in cands.items():
+        conv, fit = test(seen[cid]) if cid in seeds else first[cid]
+        out[cid] = {"sizes": seen[cid], "converged": conv}
+        if fit:
+            out[cid]["fit"] = fit
+        if cid in seeds:
+            out[cid]["seed"] = dict(seeds[cid], deeper=[x["tag"] for x in seen[cid]
+                                                        if x.get("seeded")])
+        if len(seen[cid]) < need:
+            out[cid]["few"] = True
+        capped += [f"{cid} in {x['tag']}" for x in seen[cid] if x["steps"] >= p.s.mace_steps]
+        by = {x["tag"]: x for x in seen[cid]}
         here = by.get(conv)
         row = ([cid, c["name"]]
-               + [f"{by[t]['E_relax']:.3f}" + ("*" if t == conv else "") if t in by else ""
-                  for t in (cell["tag"] for cell in ladder)]
-               + [f"{here['L']:.2f}" if here else "not converged"])
+               + [f"{by[t]['E_relax']:.3f}" + ("^" if by[t].get("seeded") else "")
+                  + ("*" if t == conv else "") if t in by else "" for t in by_tag]
+               + [f"{here['L']:.2f}" if here else
+                  "too few sizes" if len(seen[cid]) < need else "not converged"])
         if line:
             row += ([f"{fit['R_inf']:.3f}", f"{fit['c']:.1f}", f"{fit['c'] / here['N']:.3f}"]
                     if fit else ["", "", ""])
-        rows.append(row + [here["edge"] if here else None])
+        rows.append(row + [here["edge"] if here else None,
+                           seeds[cid]["from"] if cid in seeds else ""])
+    seeded = (f"; ^ where the relaxation from the deepest minimum (re-seeded from that size, for "
+              "a candidate the test failed) went deeper than the one from the ideal structure")
     if line:
         heads = ["converged at L/A", "R_inf/eV", "c/eV", "c/N there/eV", "edge move/A"]
         title = ("MACE relaxation energies R (eV) of each candidate in each size, the cell fixed; "
                  f"* where it has converged: from that size up (it and at least {SCAN_CONFIRM} "
                  f"bigger sizes) R is within scan_tol {p.s.scan_tol:g} eV of a line R_inf - c/N, "
                  "N the cell's atoms. c/N there: the energy of the stress the fixed cell still "
-                 "holds in the converged size; the edge move is shown, not tested")
+                 "holds in the converged size; the edge move is shown, not tested" + seeded)
     else:
         heads = ["converged at L/A", "edge move/A"]
         title = ("MACE relaxation energies (eV) of each candidate in each size; * where it is "
                  f"converged (within scan_tol {p.s.scan_tol:g} eV of every bigger size, edge "
-                 f"atoms moved less than scan_edge_tol {p.s.scan_edge_tol:g} A)")
-    table = format_table(["id", "defect"] + [cell["tag"] for cell in ladder] + heads, rows, title)
+                 f"atoms moved less than scan_edge_tol {p.s.scan_edge_tol:g} A)" + seeded)
+    table = format_table(["id", "defect"] + list(by_tag) + heads + ["re-seeded from"], rows,
+                         title)
     if capped:
         log(f"note: B2: {len(capped)} MACE relaxations stopped at mace_steps "
             f"({p.s.mace_steps}) before their forces were below mace_fmax: "
             + ", ".join(capped[:8]) + (f" and {len(capped) - 8} more" if len(capped) > 8 else "")
             + " (raise mace_steps)")
     bad = sorted(cid for cid, x in out.items() if not x["converged"])
+    nfew = sum(1 for cid in bad if out[cid].get("few"))
+    fixed = sum(1 for cid in seeds if out[cid]["converged"])
+    if seeds:
+        log(f"B2: re-seeding from the deepest minimum converged {fixed} of the {len(seeds)} "
+            "candidates it was tried on")
     if bad:
         log(f"note: B2: {len(bad)} candidates did not converge within the ladder (up to "
-            f"{ladder[-1]['L']:.1f} A): {', '.join(bad)}; B3 counts them as needing the largest "
-            "size" + (f" (the line test needs a size and {SCAN_CONFIRM} bigger ones on the line: "
-                      "longer scan_lengths add sizes)" if line else ""))
+            f"{ladder[-1]['L']:.1f} A)" + (f", {nfew} of them with too few sizes for the test"
+                                           if nfew else "")
+            + ": " + ", ".join(bad[:20]) + (f" and {len(bad) - 20} more" if len(bad) > 20 else "")
+            + "; B3 " + ("drops them (scan_unconverged : drop)" if drop else
+                         "counts them as needing the largest size (scan_unconverged : largest)"))
     return {"ladder": ladder, "candidates": out, "test": p.s.scan_test,
             "_table": sizes + "\n" + table,
             "_note": f"{len(ladder)} sizes, {len(out) - len(bad)} of {len(out)} candidates "
-                     "converged" + (f" ({', '.join(bad)} not)" if bad else "")}
+                     "converged" + (f" ({fixed} after re-seeding)" if fixed else "")
+                     + (f"; {len(bad) - nfew} not converged" if len(bad) > nfew else "")
+                     + (f", {nfew} with too few sizes to test" if nfew else "")}
 
 
 # The band edges of a .bands of the host primitive cell (read_bands; A2.2's) and their effective
@@ -9626,9 +9742,12 @@ def configuration_cut(p, cands, conv, ladder):
 # First configuration_margin's cut (configuration_cut, on B2's MACE energies): the cell is sized
 # for the candidates that survive it, and C1 leaves the others out. Then supercell if given (n x
 # transform, or the most compact cell for a length); otherwise the smallest size of the ladder at
-# least as big as every surviving candidate's converged size (B2; a candidate that never converged
-# counts as needing the largest size) and as the Gamma-only floor (gamma_floor), with what set it,
-# and, when the cut made it smaller, the cell it would have been. A floor beyond the ladder gets a
+# least as big as every surviving candidate's converged size (B2) and as the Gamma-only floor
+# (gamma_floor), with what set it, and, when the cut made it smaller, the cell it would have been.
+# A survivor B2's size scan didn't converge (re-seeded or not, or with too few sizes for the test)
+# is dropped, with scan_unconverged : drop (the default): C1 leaves it out, as it does a cut one,
+# and it doesn't size the cell; with largest it counts as needing the largest size. (With
+# supercell, the scan is only reported and nothing is dropped.) A floor beyond the ladder gets a
 # cell of its own, added to the ladder. Also says whether A2.2's band edges fold onto Gamma of
 # this cell (folds_to_gamma): if not, the Gamma-point screening sees a wider gap (C2 measures
 # it); and how many surviving pairs are too far apart for it (fits), which C1 leaves out.
@@ -9646,6 +9765,16 @@ def step_choose(p):
     conv, set_by = scan.get("candidates") or {}, None
     cut, compared = configuration_cut(p, cands, conv, ladder)
     keep = {cid: r for cid, r in conv.items() if cid not in (cut or {})}
+    drop, dropped = p.s.scan_unconverged == "drop" and not p.s.supercell, {}
+    if drop:                                 # scan_unconverged : drop
+        dropped = {cid: "too few sizes of the ladder for B2's size test" if r.get("few") else
+                        "not converged in B2's size scan"
+                   for cid, r in keep.items() if not r["converged"]}
+        keep = {cid: r for cid, r in keep.items() if cid not in dropped}
+        if conv and not keep:
+            die("B3: no candidate is left once configuration_margin's cut and the candidates "
+                "B2's size scan didn't converge (scan_unconverged : drop) are out: see B2's table "
+                "in B_candidates/summary.txt, or set scan_unconverged : largest")
     without = None                           # (the cell without the cut, what would have set it)
     if p.s.supercell:
         kind, value = p.s.supercell
@@ -9677,7 +9806,8 @@ def step_choose(p):
 
         need, set_by = needed(keep)
         if cut:
-            need_all, by_all = needed(conv)
+            need_all, by_all = needed({cid: r for cid, r in conv.items()
+                                       if r["converged"] or not drop})
             if need_all > need + 1e-6:
                 big = next((c for c in ladder if c["L"] >= need_all - 1e-6), None)
                 without = (big["tag"] if big else f"{need_all:.2f} A", by_all)
@@ -9723,8 +9853,19 @@ def step_choose(p):
                 ["id", "defect", "composition", "compared in", "above the lowest/eV"],
                 [[cid, cands[cid]["name"], cands[cid]["group"], c["size"], c["dE"]]
                  for cid, c in sorted(cut.items())], "Arrangements cut (configuration_margin)")
-    far = sorted(cid for cid in cands
-                 if cid not in (cut or {}) and not fits(cands[cid], cell["L"]))
+    if dropped:
+        nfew = sum(why.startswith("too few") for why in dropped.values())
+        table += (f"\nscan_unconverged : drop: {len(dropped)} of the {len(keep) + len(dropped)} "
+                  + ("candidates the cut kept" if cut else "candidates")
+                  + " didn't converge in B2's size scan"
+                  + (f" ({nfew} of them with too few sizes for the test)" if nfew else "")
+                  + "; C1 leaves them out, and the screening cell is sized for the rest\n")
+        table += format_table(["id", "defect", "composition", "why"],
+                              [[cid, cands[cid]["name"], cands[cid]["group"], why]
+                               for cid, why in sorted(dropped.items())],
+                              "Candidates dropped (scan_unconverged : drop)")
+    far = sorted(cid for cid in cands if cid not in (cut or {}) and cid not in dropped
+                 and not fits(cands[cid], cell["L"]))
     if far:
         table += (f"\n{len(far)} pair{'s have their' if len(far) > 1 else ' has its'} components "
                   f"more than half this cell's image distance ({cell['L']:.2f} A) apart, so C1 "
@@ -9735,10 +9876,12 @@ def step_choose(p):
     return {"matrix": cell["matrix"], "natoms": cell["natoms"], "L_min": cell["L"],
             "tag": cell["tag"], "ladder": ladder, "index": idx, "floor": floor,
             "set_by": set_by, "masses": masses, "fold": fold, "cut": cut,
-            "cut_sizes": compared, "far_pairs": far, "_table": table,
+            "cut_sizes": compared, "dropped": dropped, "far_pairs": far, "_table": table,
             "_note": f"{cell['tag']}: {cell['natoms']} atoms, images {cell['L']:.2f} A apart "
                      f"({why})" + (f"; {len(cut)} arrangement{'s' if len(cut) > 1 else ''} cut "
-                                   "by configuration_margin" if cut else "")}
+                                   "by configuration_margin" if cut else "")
+                     + (f"; {len(dropped)} dropped, not converged in B2 (scan_unconverged)"
+                        if dropped else "")}
 
 
 # How many of each band edge's symmetry-equivalent k-points (its star, band_masses) fold onto
@@ -9912,8 +10055,12 @@ def problem_table(runs):
 # C1: builds every candidate in the screening cell (B3; build_defect) and, with mace : true,
 # relaxes it with MACE (positions only, the cell fixed, mace_model): B2's relaxation in that cell
 # when it ran there (the same cache file), else a new one (mace_relaxations, on compute nodes with
-# mace_jobscript). A pair too far apart for this cell (fits) is left out, and so is an arrangement
-# configuration_margin cut in B3 (configuration_cut, on B2's MACE energies). Only when B3 had
+# mace_jobscript). A candidate B2 re-seeded (its size test failed at first) is also relaxed from
+# the deepest minimum B2 found for it, carried into this cell (carry_over; B2's own relaxation in
+# mace_seed_cache when this cell is a size of the ladder), and keeps the deeper of the two. A pair
+# too far apart for this cell (fits) is left out, and so are an arrangement configuration_margin
+# cut in B3 (configuration_cut, on B2's MACE energies) and a candidate B3 dropped as not converged
+# in B2 (scan_unconverged : drop). Only when B3 had
 # nothing to cut with (no scan) does C1 make that cut itself: arrangements whose configurational
 # energy (MACE energy above the lowest arrangement of the same composition) here is more than
 # configuration_margin are dropped.
@@ -9921,37 +10068,63 @@ def problem_table(runs):
 # its defect is (its centre, each component's position, the anchor atom's index, the vacancies)
 # and its MACE energy.
 #   Called by: main() (step C1)
-#   Calls:     build_defect(), fits(), format_table(), mace_cache(), mace_relaxations(),
-#              save_cell(), screen_setup()
+#   Calls:     build_defect(), carry_over(), fits(), format_table(), mace_cache(), mace_cached(),
+#              mace_key(), mace_relaxations(), mace_seed_cache(), save_cell(), screen_setup()
 def step_prerelax(p):
     cands, prim, P = screen_setup(p)
     d = p.phase_dir("C")
     choose = p.out("choose")
     L, tag, cut = choose["L_min"], choose["tag"], choose.get("cut")
+    dropped = choose.get("dropped") or {}
     built, skipped, energies, defects = {}, {}, {}, {}
     for cid, c in cands.items():
         if cut and cid in cut:
             skipped[cid] = cut[cid]["why"]
             continue
+        if cid in dropped:
+            skipped[cid] = f"{dropped[cid]} (B3, scan_unconverged : drop)"
+            continue
         if not fits(c, L):
             skipped[cid] = f"components {c['separation']:.2f} A apart, too far for this cell"
             continue
         built[cid] = build_defect(prim, P, c["comps"], f"{cid} ({c['name']})")
+    seeded, deeper = {}, []
     if p.s.mace:
-        res = mace_relaxations(p, "prerelax",
-                               [{"atoms": atoms, "cache": mace_cache(p, cid, tag),
-                                 "label": f"{cid} {cands[cid]['name']} in {tag}"}
-                                for cid, (atoms, _) in built.items()])
+        tasks = [{"atoms": atoms, "cache": mace_cache(p, cid, tag),
+                  "label": f"{cid} {cands[cid]['name']} in {tag}"}
+                 for cid, (atoms, _) in built.items()]
+        scan = p.out("scan").get("candidates") or {}
+        for cid in built:                    # B2's deepest minimum, carried into this cell
+            seed = scan.get(cid, {}).get("seed")
+            if not seed or seed["from"] == tag:
+                continue
+            c, src_P = cands[cid], np.array(seed["matrix"])
+            label = f"{cid} ({c['name']})"
+            ideal, _ = build_defect(prim, src_P, c["comps"], label)
+            hit = mace_cached(mace_cache(p, cid, seed["from"]), mace_key(p, ideal))
+            if hit is None:                  # (B2's file is gone: the relaxation from ideal only)
+                continue
+            start, _ = carry_over(prim, c["comps"], src_P, hit[0], P, label=label)
+            seeded[cid] = mace_seed_cache(p, cid, tag)
+            tasks.append({"atoms": start, "cache": seeded[cid],
+                          "label": f"{cid} {c['name']} in {tag}, from {seed['from']}"})
+        res = mace_relaxations(p, "prerelax", tasks)
         if res is None:
             return None
     for cid, (atoms, info) in built.items():
         e = None
         if p.s.mace:
             atoms, _, e, _ = res[str(mace_cache(p, cid, tag))]
-        title = f"{cid} {cands[cid]['name']} in the screening cell" + (", MACE pre-relaxed"
-                                                                        if p.s.mace else "")
+            if cid in seeded and res[str(seeded[cid])][2] < e - SEED_DEEPER:
+                atoms, _, e, _ = res[str(seeded[cid])]
+                deeper.append(cid)
+        title = f"{cid} {cands[cid]['name']} in the screening cell" + (
+            ", MACE pre-relaxed" + (" from B2's deepest minimum" if cid in deeper else "")
+            if p.s.mace else "")
         defects[cid] = dict(structure=save_cell(p, d / "structures" / "candidates" / f"{cid}.cell",
                                                 atoms, title), mace_energy=e, **info)
+        if cid in deeper:
+            defects[cid]["reseeded"] = scan[cid]["seed"]["from"]
         energies[cid] = e
     if p.s.configuration_margin is not None and p.s.mace and cut is None:     # (B3 couldn't)
         groups = {}
@@ -9966,6 +10139,9 @@ def step_prerelax(p):
                     defects.pop(i)
     for cid, why in skipped.items():
         log(f"C1: {cid} {cands[cid]['name']} left out: {why}")
+    if seeded:
+        log(f"C1: {len(deeper)} of the {len(seeded)} candidates B2 re-seeded went deeper from "
+            "B2's deepest minimum than from the ideal structure")
     table = format_table(["id", "defect", "MACE energy/eV", "left out because"],
                          [[cid, cands[cid]["name"], energies.get(cid), skipped.get(cid, "")]
                           for cid in cands]) if skipped or p.s.mace else None
@@ -13531,12 +13707,15 @@ STEPS = [
          keys=("mace", "scan", "scan_lengths", "scan_tol", "scan_edge_tol", "scan_test",
                "mace_model", "mace_fmax", "mace_steps", "transform"), needs=("generate", "relax"),
          owns=("B_candidates/mace", "B_candidates/jobs/mace_scan", "B_candidates/ladder.json"),
-         version=1),                         # 1: each size's relaxed MACE energy (B3's cut)
+         version=2),                         # 1: each size's relaxed MACE energy (B3's cut);
+                                             # 2: the unconverged re-seeded from their deepest
+                                             # minimum, and too few sizes told apart
     Step("choose", "B3", "the screening cell", step_choose,
          keys=("supercell", "transform", "screen_min_image", "deep_level_margin", "scan_lengths",
-               "decay_length_multiple", "configuration_margin", "mace"),
+               "decay_length_multiple", "configuration_margin", "mace", "scan_unconverged"),
          needs=("scan", "relax", "bands", "generate"),
-         version=1),                         # 1: configuration_margin's cut first
+         version=2),                         # 1: configuration_margin's cut first;
+                                             # 2: the unconverged dropped (scan_unconverged)
     Step("electronic", "B4", "the electronic cell (every band-edge valley at Gamma)",
          step_electronic, keys=("electronic_cell", "electronic_depth", "transform",
                                 "decay_length_multiple"),
@@ -13544,7 +13723,7 @@ STEPS = [
     # C: screening, ground and excited states
     Step("prerelax", "C1", "build the candidates and pre-relax them with MACE", step_prerelax,
          keys=("mace", "mace_model", "mace_fmax", "mace_steps", "configuration_margin"),
-         needs=("generate", "choose", "relax"),
+         needs=("generate", "scan", "choose", "relax"),
          owns=("C_screen/structures/candidates", "C_screen/jobs/mace_prerelax")),
     Step("screen", "C2", "cheap CASTEP screening of every candidate", step_screen,
          keys=SCREEN_KEYS + ("screen_charges", "screen_spins"),
