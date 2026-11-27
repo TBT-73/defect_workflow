@@ -5277,6 +5277,7 @@ PROJECT_KEYWORDS = {
     "scan_test": (_choice("line", "flat"), "line"),
     "scan_unconverged": (_choice("drop", "largest"), "drop"),
     "supercell": (_size, None), "screen_min_image": (_num("ang", "A"), None),
+    "screen_coverage": (_num(), 0.95),
     "electronic_cell": (_cellsize, None), "electronic_depth": (_num("eV"), 0.25),
     "decay_length_multiple": (_num(), 4.0),
     # C: screening, ground and excited states
@@ -5641,6 +5642,9 @@ def read_project(path, run_path):
     if not 0 < s.carrier_fraction <= 1:
         die(f"{name}: carrier_fraction is a fraction of the cell's atoms, greater than 0 and at "
             "most 1")
+    if not 0 < s.screen_coverage <= 1:
+        die(f"{name}: screen_coverage is the share of the candidates to be screened that the "
+            "screening cell must take at their converged size (B2): greater than 0 and at most 1")
     if s.screen_min_image is not None and s.screen_min_image < 0:
         die(f"{name}: screen_min_image can't be negative (0 switches the Gamma-only floor off)")
     s.converge_kgrids = kgrid_list(name, s.converge_kgrid_min, s.converge_kgrid_max,
@@ -7064,7 +7068,7 @@ def min_image(cell):
 # Whether a candidate can be built in a supercell whose images are L apart: a pair's components
 # must be less than half of that apart (with 0.05 Ang to spare), or the nearest copy of one of them
 # would be a periodic image of the other.
-#   Called by: step_prerelax(), step_scan(), step_validate()
+#   Called by: coverage_table(), step_choose(), step_prerelax(), step_scan(), step_validate()
 def fits(cand, L):
     return not (cand["separation"] and cand["separation"] > L / 2 - 0.05)
 
@@ -8065,8 +8069,8 @@ def write_json(path, data):
 # A text table for summary.txt and the log: a title, a header row, a rule and the rows, in columns
 # as wide as needed (numbers to the right, text to the left). Floats are shown with 4 decimals,
 # None as blank.
-#   Called by: drelax_ranking(), ladder_table(), limits_table(), problem_table(), step_ccd(),
-#              step_choose(), step_converge(), step_corrections(), step_distort(),
+#   Called by: coverage_table(), drelax_ranking(), ladder_table(), limits_table(), problem_table(),
+#              step_ccd(), step_choose(), step_converge(), step_corrections(), step_distort(),
 #              step_electronic(), step_excite(), step_filter(), step_formation(), step_generate(),
 #              step_interest(), step_limits(), step_lineshape(), step_phases(), step_prerelax(),
 #              step_rank(), step_ref_phases(), step_relaxations(), step_scan(), step_validate(),
@@ -9893,20 +9897,23 @@ def configuration_cut(p, cands, conv, ladder):
 # B3: the screening cell, which every candidate in C1-C3 is built in.
 # First configuration_margin's cut (configuration_cut, on B2's MACE energies): the cell is sized
 # for the candidates that survive it, and C1 leaves the others out. Then supercell if given (n x
-# transform, or the most compact cell for a length); otherwise the smallest size of the ladder at
-# least as big as every surviving candidate's converged size (B2) and as the Gamma-only floor
-# (gamma_floor), with what set it, and, when the cut made it smaller, the cell it would have been.
-# A survivor B2's size scan didn't converge (re-seeded or not, or with too few sizes for the test)
-# is dropped, with scan_unconverged : drop (the default): C1 leaves it out, as it does a cut one,
-# and it doesn't size the cell; with largest it counts as needing the largest size. (With
-# supercell, the scan is only reported and nothing is dropped.) A floor beyond the ladder gets a
-# cell of its own, added to the ladder. Also says whether A2.2's band edges fold onto Gamma of
-# this cell (folds_to_gamma): if not, the Gamma-point screening sees a wider gap (C2 measures
-# it); and how many surviving pairs are too far apart for it (fits), which C1 leaves out.
+# transform, or the most compact cell for a length); otherwise the smallest size of the ladder by
+# which screen_coverage of the candidates to be screened have converged (B2), and at least the
+# Gamma-only floor (gamma_floor), with what set it and, when the cut made it smaller, the cell it
+# would have been. The others are screened in it all the same, missing some of their relaxation:
+# coverage_table gives, for each size, how many have converged by it and what the rest miss in it,
+# and the candidates screened in a cell smaller than their converged size are listed with what they
+# miss (above). A survivor B2's size scan didn't converge (re-seeded or not, or with too few sizes
+# for the test) is dropped, with scan_unconverged : drop (the default): C1 leaves it out, as it
+# does a cut one, and it isn't counted; with largest it is screened, and counts as needing the
+# largest size. (With supercell, the scan is only reported and nothing is dropped.) A floor beyond
+# the ladder gets a cell of its own, added to the ladder. Also says whether A2.2's band edges fold
+# onto Gamma of this cell (folds_to_gamma): if not, the Gamma-point screening sees a wider gap (C2
+# measures it); and how many surviving pairs are too far apart for it (fits), which C1 leaves out.
 #   Called by: main() (step B3)
 #   Calls:     Project.host(), add_cell(), band_masses(), cell_record(), configuration_cut(),
-#              fits(), folds_to_gamma(), format_table(), gamma_floor(), ladder_table(),
-#              read_bands(), size_matrix()
+#              coverage_table(), fits(), folds_to_gamma(), format_table(), gamma_floor(),
+#              ladder_table(), read_bands(), size_matrix()
 def step_choose(p):
     prim = p.host()
     scan = p.out("scan")
@@ -9917,6 +9924,14 @@ def step_choose(p):
     conv, set_by = scan.get("candidates") or {}, None
     cut, compared = configuration_cut(p, cands, conv, ladder)
     keep = {cid: r for cid, r in conv.items() if cid not in (cut or {})}
+    top = ladder[-1]                         # B2's largest size
+
+    # The size a candidate needs: its converged size (B2), or the largest for one B2 didn't
+    # converge that is screened all the same (scan_unconverged : largest, or supercell).
+    def need_of(r):
+        return next(c["L"] for c in ladder if c["tag"] == r["converged"]) if r["converged"] \
+            else top["L"]
+
     drop, dropped = p.s.scan_unconverged == "drop" and not p.s.supercell, {}
     if drop:                                 # scan_unconverged : drop
         dropped = {cid: "too few sizes of the ladder for B2's size test" if r.get("few") else
@@ -9942,27 +9957,23 @@ def step_choose(p):
             die("B3 has nothing to choose the screening cell from: without the MACE scan (mace "
                 "or scan false) give supercell (n, or a length such as 15 ang) or "
                 "screen_min_image")
-        L = {c["tag"]: c["L"] for c in ladder}
-
-        # The size these candidates need (the largest of their converged sizes, or the floor's),
-        # and what sets it.
+        # The size these candidates need: the smallest by which screen_coverage of them have
+        # converged (the k-th smallest of their sizes, k their number times screen_coverage,
+        # rounded up), or the floor if that is bigger; and what sets it ('coverage' or 'floor').
         def needed(rs):
-            need, by = 0.0, None
-            for cid in sorted(rs):
-                x = L[rs[cid]["converged"]] if rs[cid]["converged"] else ladder[-1]["L"]
-                if x > need + 1e-6:
-                    need, by = x, cid
+            ns = sorted(need_of(r) for r in rs.values())
+            need = ns[max(math.ceil(p.s.screen_coverage * len(ns) - 1e-9), 1) - 1] if ns else 0.0
             if floor and floor["L"] > need + 1e-6:
-                need, by = floor["L"], "floor"
-            return need, by
+                return floor["L"], "floor"
+            return need, "coverage"
 
         need, set_by = needed(keep)
         if cut:
-            need_all, by_all = needed({cid: r for cid, r in conv.items()
-                                       if r["converged"] or not drop})
+            need_all, _ = needed({cid: r for cid, r in conv.items()
+                                  if r["converged"] or not drop})
             if need_all > need + 1e-6:
                 big = next((c for c in ladder if c["L"] >= need_all - 1e-6), None)
-                without = (big["tag"] if big else f"{need_all:.2f} A", by_all)
+                without = big["tag"] if big else f"{need_all:.2f} A"
         cell = next((c for c in ladder if c["L"] >= need - 1e-6), None)
         if cell is None:
             log(f"note: B3: the Gamma-only floor ({need:.2f} A) is beyond the ladder (up to "
@@ -9972,10 +9983,10 @@ def step_choose(p):
         if set_by == "floor":
             why = f"the Gamma-only floor, {floor['L']:.2f} A"
         else:
-            r = conv[set_by]
-            why = (f"{set_by} {p.out('generate')['candidates'][set_by]['name']}, "
-                   + (f"converged at {L[r['converged']]:.2f} A" if r["converged"] else
-                      "not converged in the ladder"))
+            n_by = sum(need_of(r) <= cell["L"] + 1e-6 for r in keep.values())
+            why = (f"{n_by} of the {len(keep)} candidates to be screened, "
+                   f"{100 * n_by / len(keep):.1f}%, converged by it; screen_coverage "
+                   f"{p.s.screen_coverage:g}")
     fold = {e: any(folds_to_gamma(k, cell["matrix"]) for k in masses[e]["k"])
             for e in ("vbm", "cbm")}
     if not all(fold.values()):
@@ -9993,13 +10004,31 @@ def step_choose(p):
                    f"{floor['carrier']}, m* {floor['mass']:.3g} m_e, gap {floor['gap']:.2f} eV)"
                    if floor["source"] == "band masses" else "screen_min_image)") + "\n"
                 if floor else "\nGamma-only floor: none\n"))
+    sizes, above = coverage_table(p, scan["ladder"], keep, cands, cell, floor, need_of,
+                                  len(dropped))
+    if sizes:
+        table += "\n" + sizes
+    if above:
+        miss = [x["missed"] for x in above.values()]
+        table += "\n" + format_table(
+            ["id", "defect", "converged at", "L/A", "R missed/eV"],
+            [[cid, cands[cid]["name"], x["converged"] or "not converged",
+              f"{next(c['L'] for c in scan['ladder'] if c['tag'] == x['converged']):.2f}"
+              if x["converged"] else "", f"{x['missed']:.3f}"]
+             for cid, x in sorted(above.items(), key=lambda kv: -kv[1]["missed"])],
+            f"Candidates screened in {cell['tag']} although B2's size scan converged them only "
+            "in a bigger size" + (" (or not at all, counted as needing the largest)"
+                                  if any(not x["converged"] for x in above.values()) else "")
+            + f": {len(above)}, missing a median {np.median(miss):.2f} eV of relaxation energy "
+            f"(MACE) in it, {sum(m > p.s.hull_margin for m in miss)} more than hull_margin "
+            f"({p.s.hull_margin:g} eV); largest first")
     if cut is not None:
         table += (f"\nconfiguration_margin ({p.s.configuration_margin:g} eV): {len(cut)} of "
                   f"{len(conv)} arrangements cut, each compared with the others of its "
                   "composition in the biggest size B2 relaxed them all in; C1 leaves them out, "
                   "and the screening cell is sized for the rest"
-                  + (f". Without the cut it would have been {without[0]}, for {without[1]} "
-                     f"{cands[without[1]]['name']}" if without else "") + "\n")
+                  + (f". Without the cut it would have been {without}" if without else "")
+                  + "\n")
         if cut:
             table += format_table(
                 ["id", "defect", "composition", "compared in", "above the lowest/eV"],
@@ -10028,12 +10057,82 @@ def step_choose(p):
     return {"matrix": cell["matrix"], "natoms": cell["natoms"], "L_min": cell["L"],
             "tag": cell["tag"], "ladder": ladder, "index": idx, "floor": floor,
             "set_by": set_by, "masses": masses, "fold": fold, "cut": cut,
-            "cut_sizes": compared, "dropped": dropped, "far_pairs": far, "_table": table,
+            "cut_sizes": compared, "dropped": dropped, "far_pairs": far, "above": above,
+            "_table": table,
             "_note": f"{cell['tag']}: {cell['natoms']} atoms, images {cell['L']:.2f} A apart "
                      f"({why})" + (f"; {len(cut)} arrangement{'s' if len(cut) > 1 else ''} cut "
                                    "by configuration_margin" if cut else "")
                      + (f"; {len(dropped)} dropped, not converged in B2 (scan_unconverged)"
-                        if dropped else "")}
+                        if dropped else "")
+                     + (f"; {len(above)} screened in it although converged only in a bigger "
+                        "size (listed in summary.txt)" if above else "")}
+
+
+# B3's table of the sizes the screening cell could be (screen_coverage): for each size of B2's
+# ladder from the Gamma-only floor up, how many of the candidates to be screened (keep) have
+# converged by it (need_of), and the relaxation energy R (MACE) each of the others misses in it, as
+# it is screened there all the same: R in the size it needs less R in this one. With the cost of
+# each size next to the chosen cell's ((atoms ratio)^3, plane-wave DFT's scaling for big cells),
+# the median and largest R missed, how many miss more than hull_margin (C3's allowance for the
+# screening's errors), and how many pairs are too far apart for the size (fits), which C1 would
+# leave out; and a line on the largest size B2's test can converge a candidate in (the counts reach
+# all of them there only because the ones it didn't converge are dropped, or counted as needing the
+# largest size). Returns (the table, or '' without a scan; {cid: {'converged', 'missed'}} for the
+# candidates screened in the chosen cell although they need a bigger one).
+#   Called by: step_choose()
+#   Calls:     fits(), format_table()
+def coverage_table(p, sizes, keep, cands, cell, floor, need_of, ndropped):
+    if not keep or not any(r.get("sizes") for r in keep.values()):
+        return "", {}
+    R = {cid: {x["tag"]: x["E_relax"] for x in r["sizes"]} for cid, r in keep.items()}
+    top = sizes[-1]["tag"]
+    ref = {cid: R[cid].get(r["converged"] or top) for cid, r in keep.items()}
+    n, rows, above = len(keep), [], {}
+    for c in sizes:
+        if floor and c["L"] < floor["L"] - 1e-6:
+            continue
+        held = {cid for cid, r in keep.items() if need_of(r) <= c["L"] + 1e-6}
+        far = [cid for cid in keep if not fits(cands[cid], c["L"])]
+        miss = {cid: ref[cid] - R[cid][c["tag"]] for cid in keep
+                if cid not in held and c["tag"] in R[cid] and ref[cid] is not None}
+        here = c["matrix"] == cell["matrix"]
+        if here:
+            above = {cid: {"converged": keep[cid]["converged"], "missed": round(m, 4)}
+                     for cid, m in miss.items()}
+        m = list(miss.values())
+        rows.append([c["tag"] + (" <-" if here else ""), f"{c['L']:.2f}", c["natoms"],
+                     f"{(c['natoms'] / cell['natoms']) ** 3:.2f}", len(held),
+                     f"{100 * len(held) / n:.1f}", len(m),
+                     f"{np.median(m):.2f}" if m else "", f"{max(m):.2f}" if m else "",
+                     sum(x > p.s.hull_margin for x in m) if m else "", len(far) or ""])
+    if not rows:
+        return "", {}
+    title = (f"The sizes the screening cell could be (screen_coverage {p.s.screen_coverage:g}; "
+             + (f"supercell : {p.raw['supercell']} sets it" if p.s.supercell else
+                "the smallest from the Gamma-only floor up by which that share has converged")
+             + f"): of the {n} candidates to be screened (those configuration_margin's cut kept"
+             + (f", less the {ndropped} scan_unconverged : drop dropped" if ndropped else "")
+             + "), how many have converged by each size in B2's size scan, and how many haven't "
+             "but are screened in it all the same, missing the relaxation energy R (MACE) "
+             "between it and the size they need: their converged size (the largest, for one B2 "
+             "didn't converge; negative where this size relaxes it more), the median, the "
+             "largest and how many miss more than hull_margin "
+             f"({p.s.hull_margin:g} eV). cost: the size's atoms over the screening cell's, cubed "
+             "(roughly how a plane-wave run's cost grows); too far apart: pairs C1 would leave "
+             "out, as more than half the size's image distance apart")
+    ceiling = sizes[-(SCAN_CONFIRM + 1) if p.s.scan_test == "line" else -2]
+    nunconv = sum(1 for r in keep.values() if not r["converged"])
+    note = (f"B2's test converges no candidate above {ceiling['tag']} ({ceiling['L']:.2f} A), "
+            + (f"the largest size with {SCAN_CONFIRM} bigger ones to confirm its line"
+               if p.s.scan_test == "line" else "the largest with a bigger one to compare with")
+            + (f": the {ndropped} candidates it didn't converge are dropped (scan_unconverged : "
+               "drop) and aren't counted, so all the others have converged by it" if ndropped else
+               f": the {nunconv} it didn't converge count as needing the largest size" if nunconv
+               else ", and it converged every one")
+            + "\n")
+    return format_table(["size", "L/A", "atoms", "cost", "converged by it", "%", "not yet",
+                         "R missed median/eV", "largest/eV", "over hull_margin",
+                         "too far apart"], rows, title) + note, above
 
 
 # How many of each band edge's symmetry-equivalent k-points (its star, band_masses) fold onto
@@ -10210,7 +10309,10 @@ def problem_table(runs):
 # when it ran there (the same cache file), else a new one (mace_relaxations, on compute nodes with
 # mace_jobscript). A candidate B2 re-seeded (its size test failed at first) is also relaxed from
 # the deepest minimum B2 found for it, carried into this cell (carry_over; B2's own relaxation in
-# mace_seed_cache when this cell is a size of the ladder), and keeps the deeper of the two. A pair
+# mace_seed_cache when this cell is a size of the ladder), and keeps the deeper of the two; so is
+# one screened in a cell smaller than its converged size (B3's above), from B2's relaxation in
+# that size, as B2 relaxed it here only from the ideal structure, which may have fallen into a
+# shallower minimum than the one it reached in the bigger cell. A pair
 # too far apart for this cell (fits) is left out, and so are an arrangement configuration_margin
 # cut in B3 (configuration_cut, on B2's MACE energies) and a candidate B3 dropped as not converged
 # in B2 (scan_unconverged : drop). Only when B3 had
@@ -10242,27 +10344,41 @@ def step_prerelax(p):
             skipped[cid] = f"components {c['separation']:.2f} A apart, too far for this cell"
             continue
         built[cid] = build_defect(prim, P, c["comps"], f"{cid} ({c['name']})")
-    seeded, deeper = {}, []
+    seeded, deeper, source, gain = {}, [], {}, {}
     if p.s.mace:
         tasks = [{"atoms": atoms, "cache": mace_cache(p, cid, tag), "rattle": rattle_spec(p, info),
                   "label": f"{cid} {cands[cid]['name']} in {tag}"}
                  for cid, (atoms, info) in built.items()]
         scan = p.out("scan").get("candidates") or {}
-        for cid in built:                    # B2's deepest minimum, carried into this cell
+        above = choose.get("above") or {}
+        by_tag = {c["tag"]: c for c in choose["ladder"]}
+        for cid in built:                    # a deeper minimum from another size, carried in
             seed = scan.get(cid, {}).get("seed")
-            if not seed or seed["from"] == tag:
+            if seed:                         # B2's deepest minimum
+                src, src_P = seed["from"], np.array(seed["matrix"])
+            elif (above.get(cid) or {}).get("converged") in by_tag:   # its converged size's
+                src = above[cid]["converged"]
+                src_P = np.array(by_tag[src]["matrix"])
+            else:
                 continue
-            c, src_P = cands[cid], np.array(seed["matrix"])
+            if src == tag:
+                continue
+            c = cands[cid]
             label = f"{cid} ({c['name']})"
             ideal, src_info = build_defect(prim, src_P, c["comps"], label)
-            hit = mace_cached(mace_cache(p, cid, seed["from"]),
+            hit = mace_cached(mace_cache(p, cid, src),
                               mace_key(p, ideal, rattle=rattle_spec(p, src_info)))
             if hit is None:                  # (B2's file is gone: the relaxation from ideal only)
                 continue
-            start, _ = carry_over(prim, c["comps"], src_P, hit[0], P, label=label)
+            try:
+                start, _ = carry_over(prim, c["comps"], src_P, hit[0], P, label=label)
+            except Exception as err:         # (a structure the matching can't follow)
+                log(f"note: C1: {cid} {c['name']} can't be carried over from {src}: {err}")
+                continue
             seeded[cid] = mace_seed_cache(p, cid, tag)
+            source[cid] = (src, "seed" if seed else "converged")
             tasks.append({"atoms": start, "cache": seeded[cid],
-                          "label": f"{cid} {c['name']} in {tag}, from {seed['from']}"})
+                          "label": f"{cid} {c['name']} in {tag}, from {src}"})
         res = mace_relaxations(p, "prerelax", tasks)
         if res is None:
             return None
@@ -10271,15 +10387,18 @@ def step_prerelax(p):
         if p.s.mace:
             atoms, _, e, _ = res[str(mace_cache(p, cid, tag))]
             if cid in seeded and res[str(seeded[cid])][2] < e - SEED_DEEPER:
+                gain[cid] = e - res[str(seeded[cid])][2]
                 atoms, _, e, _ = res[str(seeded[cid])]
                 deeper.append(cid)
         title = f"{cid} {cands[cid]['name']} in the screening cell" + (
-            ", MACE pre-relaxed" + (" from B2's deepest minimum" if cid in deeper else "")
+            ", MACE pre-relaxed" + ((" from B2's deepest minimum" if source[cid][1] == "seed" else
+                                     f" from its relaxation in {source[cid][0]}")
+                                    if cid in deeper else "")
             if p.s.mace else "")
         defects[cid] = dict(structure=save_cell(p, d / "structures" / "candidates" / f"{cid}.cell",
                                                 atoms, title), mace_energy=e, **info)
         if cid in deeper:
-            defects[cid]["reseeded"] = scan[cid]["seed"]["from"]
+            defects[cid]["reseeded"] = source[cid][0]
         energies[cid] = e
     if p.s.configuration_margin is not None and p.s.mace and cut is None:     # (B3 couldn't)
         groups = {}
@@ -10294,9 +10413,14 @@ def step_prerelax(p):
                     defects.pop(i)
     for cid, why in skipped.items():
         log(f"C1: {cid} {cands[cid]['name']} left out: {why}")
-    if seeded:
-        log(f"C1: {len(deeper)} of the {len(seeded)} candidates B2 re-seeded went deeper from "
-            "B2's deepest minimum than from the ideal structure")
+    for kind, what in (("seed", "candidates B2 re-seeded went deeper from B2's deepest minimum"),
+                       ("converged", "candidates screened in a cell smaller than their converged "
+                                     "size (B3) went deeper from their relaxation there")):
+        ids = [cid for cid in seeded if source[cid][1] == kind]
+        if ids:
+            g = [gain[cid] for cid in ids if cid in deeper]
+            log(f"C1: {len(g)} of the {len(ids)} {what} than from the ideal structure"
+                + (f", by a median {np.median(g):.2f} eV (largest {max(g):.2f} eV)" if g else ""))
     table = format_table(["id", "defect", "MACE energy/eV", "left out because"],
                          [[cid, cands[cid]["name"], energies.get(cid), skipped.get(cid, "")]
                           for cid in cands]) if skipped or p.s.mace else None
@@ -13869,10 +13993,12 @@ STEPS = [
                                              # along which R falls with size doesn't count
     Step("choose", "B3", "the screening cell", step_choose,
          keys=("supercell", "transform", "screen_min_image", "deep_level_margin", "scan_lengths",
-               "decay_length_multiple", "configuration_margin", "mace", "scan_unconverged"),
+               "decay_length_multiple", "configuration_margin", "mace", "scan_unconverged",
+               "screen_coverage", "hull_margin"),          # (hull_margin: only in the table)
          needs=("scan", "relax", "bands", "generate"),
-         version=2),                         # 1: configuration_margin's cut first;
-                                             # 2: the unconverged dropped (scan_unconverged)
+         version=3),                         # 1: configuration_margin's cut first;
+                                             # 2: the unconverged dropped (scan_unconverged);
+                                             # 3: the cell by screen_coverage, and its table
     Step("electronic", "B4", "the electronic cell (every band-edge valley at Gamma)",
          step_electronic, keys=("electronic_cell", "electronic_depth", "transform",
                                 "decay_length_multiple"),
@@ -13882,7 +14008,9 @@ STEPS = [
          keys=("mace", "mace_model", "mace_fmax", "mace_steps", "mace_rattle",
                "configuration_margin"),
          needs=("generate", "scan", "choose", "relax"),
-         owns=("C_screen/structures/candidates", "C_screen/jobs/mace_prerelax")),
+         owns=("C_screen/structures/candidates", "C_screen/jobs/mace_prerelax"),
+         version=1),                         # 1: a candidate screened in a cell smaller than its
+                                             # converged size also relaxed from its structure there
     Step("screen", "C2", "cheap CASTEP screening of every candidate", step_screen,
          keys=SCREEN_KEYS + ("screen_charges", "screen_spins"),
          needs=("prerelax", "converge", "bands"),
@@ -14073,7 +14201,8 @@ dopant_pairs  : false          # true: any two dopant defects | same: two of the
 # B2: the supercell sizes, as lengths (the shortest distance between periodic images), and
 # the MACE scan of every candidate in each. A candidate is converged at the smallest size from
 # which its MACE relaxation energy R lies on a line R_inf - c/N (N: the cell's atoms): that size
-# and at least 3 bigger ones within scan_tol of it. c/N is the energy of the stress the fixed cell
+# and at least 3 bigger ones within scan_tol of it, R not falling along it by more than scan_tol
+# (a fixed cell only holds a relaxation back). c/N is the energy of the stress the fixed cell
 # holds. B3 uses at most the fourth-largest (the line test needs 3 sizes above the one it
 # picks), and drops a candidate that doesn't converge; B4 goes beyond the largest if it must.
 scan          : true
@@ -14082,9 +14211,11 @@ scan_tol      : 0.02 eV
 scan_test     : line           # line | flat: R within scan_tol of every bigger size's, and the
 scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this (flat only)
 !scan_unconverged : drop       # drop | largest: what B3 does with a candidate B2 didn't converge
-# B3: the screening cell is the smallest size that holds every converged candidate (B2), at least
+# B3: the screening cell is the smallest size by which screen_coverage of the candidates have
+# converged (B2; the rest are screened in it too, and summary.txt says what they miss), at least
 # the Gamma-only floor: decay_length_multiple (below) times the decay length of the shallowest
 # deep level (deep_level_margin, below), from the band edges' effective masses (A2.2).
+!screen_coverage : 0.95        # the share of the candidates the cell must take (1: every one)
 !screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate
 !supercell : 14 ang            # fix the screening cell (a length, or n: n x transform)
 # B4: the electronic cell, where everything from C4 on runs (but C8's test of the screening cell):

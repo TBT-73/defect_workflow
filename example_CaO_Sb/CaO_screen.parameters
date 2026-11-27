@@ -109,9 +109,11 @@ scan_tol      : 0.05 eV
 scan_test     : line           # line | flat: R within scan_tol of every bigger size's, and the
 scan_edge_tol : 0.05 ang       #   atoms at the cell's edge moved less than this (flat only)
 !scan_unconverged : drop       # drop | largest: what B3 does with a candidate B2 didn't converge
-# B3: the screening cell is the smallest size that holds every converged candidate (B2), at least
+# B3: the screening cell is the smallest size by which screen_coverage of the candidates have
+# converged (B2; the rest are screened in it too, and summary.txt says what they miss), at least
 # the Gamma-only floor, estimated from the band edges' effective masses (A2.2) for the
 # shallowest deep level (deep_level_margin, below).
+!screen_coverage : 0.95        # the share of the candidates the cell must take (1: every one)
 !screen_min_image : 12 ang     # the floor yourself (0: none), instead of the estimate
 !supercell : 14 ang            # fix the screening cell (a length, or n: n x transform)
 # B4: the electronic cell, where the survivors go after C3 (C4 to F, all but the optional C8):
