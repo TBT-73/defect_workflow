@@ -774,7 +774,13 @@ a line R∞ − c/N, N being the cell's number of atoms: that size and every big
 of them, all within `scan_tol` of the line fitted through them. A defect that strains the crystal
 leaves the cell, whose lattice vectors are fixed, holding a stress, and the energy of that stress,
 c/N, falls off only as 1/N. Once R follows the line, the cell holds the defect's relaxation and that
-tail is all that still changes with size. The table gives R∞, c and c/N in the converged size: the
+tail is all that still changes with size. So R rises with size (c ≥ 0) and is never negative: a line
+along which R falls by more than `scan_tol` over its sizes, or whose R∞ is below −`scan_tol`,
+doesn't count (the margins are for noise). A fall like that means the sizes relaxed into different
+minima: in a CaO run As<sub>Ca</sub> passed at 432 atoms on a line falling 0.2 eV to 686 atoms, with
+R∞ = −0.18 eV, while R was about 0.33 eV in most sizes from 144 atoms up. Such a candidate fails the
+test and is re-seeded (below), and the log names them. The table gives R∞, c and c/N in the
+converged size: the
 stress energy still in that cell, which cancels between arrangements of one composition but not
 between charge states or against isolated components. With `scan_test : flat` a candidate is
 converged at the smallest size whose R is within `scan_tol` of that of every bigger size, with its
@@ -1614,7 +1620,7 @@ Details: [Phase B](#phase-b-candidate-defects-the-screening-and-electronic-cells
 | `scan_tol` | `0.02 eV` | B2 | With `scan_test : line`, the most any size's MACE relaxation energy may be off the line R∞ − c/N through it and the bigger sizes. With `flat`, a candidate's relaxation energy must be within this of that of every bigger size ... |
 | `scan_edge_tol` | `0.05 ang` | B2 | (`scan_test : flat` only) ... and the atoms at the cell's edge (further than 35 % of the image distance from the defect) moved less than this, for it to be converged in that size. |
 | `scan_unconverged` | `drop` | B3 | What B3 does with a candidate B2's size scan didn't converge (with too few sizes for the test, or still not after the re-seeding from its deepest minimum). `drop`: C1 leaves it out, and it doesn't size the screening cell. `largest`: it is screened, in a cell sized as if it needed the largest size. Not used with `supercell`. |
-| `scan_test` | `line` | B2 | How B2 decides a candidate has converged. `line`: the smallest size from which its relaxation energy follows R∞ − c/N (N, the cell's atoms): it and at least three bigger sizes within `scan_tol` of the line through them; the table gives R∞, c and c/N there. `flat`: the smallest size whose relaxation energy is within `scan_tol` of every bigger size's, with the edge atoms moved less than `scan_edge_tol`. |
+| `scan_test` | `line` | B2 | How B2 decides a candidate has converged. `line`: the smallest size from which its relaxation energy follows R∞ − c/N (N, the cell's atoms): it and at least three bigger sizes within `scan_tol` of the line through them, and the line not falling by more than `scan_tol` over them nor going below −`scan_tol` at R∞ (a fixed cell only holds a relaxation back); the table gives R∞, c and c/N there. `flat`: the smallest size whose relaxation energy is within `scan_tol` of every bigger size's, with the edge atoms moved less than `scan_edge_tol`. |
 | `screen_min_image` | from the band masses | B3 | The Γ-only floor (Å) yourself: the screening cell's images are at least this far apart. `0`: no floor. Without it, B3 estimates the floor from A2.2's effective masses, `deep_level_margin` and `decay_length_multiple`. |
 | `supercell` | — | B3 | Fix the screening cell: a length (`supercell : 14 ang`, the most compact cell for it) or n (`supercell : 3`, n × `transform`). B2's scan is then only reported. |
 | `electronic_cell` | from B4's search | B4 | Fix the electronic cell: a length (`20 ang`), n (n × `transform`), or `screening` (the screening cell). B4 warns if it doesn't fold every valley of the band edges onto Γ. |
@@ -2568,6 +2574,20 @@ each job, also with 995 jobs of a run that had died recorded and never seen to e
 `dwf.py` asked Slurm about each of them in turn before its first log line); with `squeue` failing,
 each job was asked about on its own, and the run finished the same.
 
+B2's turning down of falling lines was checked on the table of a CaO run (4,709 candidates, 14
+sizes from 54 to 686 atoms, `scan_tol` 0.05 eV) and with the B2 stand-in above. On the run's table
+it changed 25 of the 4,647 converged candidates (15 of them kept by B3): 20 converged at a bigger
+size, and 5 failed and would be re-seeded, among them As<sub>Ca</sub> and Be<sub>Ca</sub> +
+V<sub>Ca</sub>, with c/N −0.54 and −0.53 eV at 432 atoms; the 24 candidates where a replay of the
+table didn't match its converged size were all within 0.4 meV of `scan_tol`, from the table's
+rounding. With the stand-in, a pair that fell into a shallower minimum the bigger its size (a line
+falling 0.11 eV from 128 to 686 atoms, which the older `dwf.py` took as converged at 128 atoms) was
+turned down, re-seeded from 128 atoms, went deeper in the three bigger sizes and converged on a
+rising line; one whose R fell as 40/N whatever its start was turned down, re-seeded, still fell and
+was dropped by B3; one falling as 5/N converged one size up, where the fall over its sizes is within
+`scan_tol`; and one near zero with R∞ = −0.01 eV converged. Run over the older `dwf.py`'s B2, only
+the new re-seeded relaxations were made, and a rerun made none. `scan_test : flat` is unchanged.
+
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's cut on real energies (see 15 below), C4's search with the real MACE (see 8 below), real
 `mace_run_train` trainings with the charge embedding (F2: the command was checked, not run), real
@@ -2699,7 +2719,8 @@ On the first real runs, check:
    one by hand in a 20 Å box with the same settings (its folder in `A_host/jobs/ref_phases/` has
    them): its energy should change by no more than a few meV.
 18. **B2's re-seeding and B3's drops**: B2's log says how many candidates were re-seeded and how
-   many of them then converged. In B2's table, `^` marks a size whose relaxation from the deepest
+   many of them then converged, and names those whose only line had R falling with size. In B2's
+   table, `^` marks a size whose relaxation from the deepest
    minimum went deeper, and the last column the size that minimum came from: for a few, check that
    the jumps are gone (R on one smooth curve with size). B3's table lists what `scan_unconverged :
    drop` dropped; for a candidate you care about there, its B2 row says why (a pair with too few

@@ -99,7 +99,8 @@ dopant_pairs  : same           # two defects of one dopant, e.g. Sb_Ca + Sb_O (t
 # B2: the supercell sizes, as lengths (the shortest distance between periodic images), and
 # the MACE scan of every candidate in each. A candidate is converged at the smallest size from
 # which its MACE relaxation energy R lies on a line R_inf - c/N (N: the cell's atoms): that size
-# and at least 3 bigger ones within scan_tol of it. c/N is the energy of the stress the fixed cell
+# and at least 3 bigger ones within scan_tol of it, R not falling along it by more than scan_tol
+# (a fixed cell only holds a relaxation back). c/N is the energy of the stress the fixed cell
 # holds. B3 uses at most the fourth-largest (the line test needs 3 sizes above the one it
 # picks), and drops a candidate that doesn't converge; B4 goes beyond the largest if it must.
 scan          : true

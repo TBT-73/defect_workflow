@@ -9519,29 +9519,31 @@ def inverse_n_fit(points):
 # and scan : true, the MACE scan of every candidate. Each candidate is built in every size it fits
 # (fits) and relaxed with MACE (positions only, the host's lattice vectors kept, as in C and D;
 # mace_model; mace_relaxations, on compute nodes with mace_jobscript), from the ideal structure
-# rattled near the defect (mace_rattle, rattle_spec), so that no relaxation is held at a
-# symmetric start by its own symmetry; R is still measured from the ideal structure. Its relaxation energy R
+# rattled near the defect (mace_rattle, rattle_spec), so that no relaxation is held at a symmetric
+# start by its own symmetry; R is still measured from the ideal structure. Its relaxation energy R
 # (unrelaxed - relaxed) shows whether the cell holds the relaxation. With scan_test : line (the
-# default) a candidate is converged at the smallest size from which R lies on a line
-# R_inf - c/N: that size and every bigger one (at least SCAN_CONFIRM of them) within scan_tol of
-# the line fitted through them (inverse_n_fit). A defect that strains the crystal leaves the
-# fixed cell holding a stress, whose energy, c/N, falls off only as 1/N; once R follows the line,
-# that is all that still changes with size. The table gives R_inf, c, and c/N in the converged
-# size: the stress energy still in that cell, which cancels between arrangements of one
-# composition but not between charge states. With scan_test : flat it is converged at the
-# smallest size whose R is within scan_tol of that of every bigger size, with the atoms at the
-# cell's edge (further than EDGE_FRACTION of the shortest image distance from the defect's centre)
-# moved less than scan_edge_tol; the edge displacement is shown with either test. A candidate
-# with fewer sizes than the test needs (a pair too far apart for the smaller ones) can't
-# converge: a warning before the relaxations says how far apart a pair this ladder can test may be.
-# One that fails the test although it has the sizes has usually reached different minima in
+# default) a candidate is converged at the smallest size from which R lies on a line R_inf - c/N:
+# that size and every bigger one (at least SCAN_CONFIRM of them) within scan_tol of the line fitted
+# through them (inverse_n_fit). A defect that strains the crystal leaves the fixed cell holding a
+# stress, whose energy, c/N, falls off only as 1/N; once R follows the line, that is all that still
+# changes with size. So R rises with size (c >= 0): a line along which R falls by more than
+# scan_tol over its sizes, or whose R_inf is below -scan_tol, doesn't count: a fall like that means
+# the sizes relaxed into different minima, and it counts as failing the test. The table gives
+# R_inf, c, and c/N in the converged size: the stress energy still in that cell, which cancels
+# between arrangements of one composition but not between charge states. With scan_test : flat it
+# is converged at the smallest size whose R is within scan_tol of that of every bigger size, with
+# the atoms at the cell's edge (further than EDGE_FRACTION of the shortest image distance from the
+# defect's centre) moved less than scan_edge_tol; the edge displacement is shown with either test.
+# A candidate with fewer sizes than the test needs (a pair too far apart for the smaller ones)
+# can't converge: a warning before the relaxations says how far apart a pair this ladder can test
+# may be. One that fails the test although it has the sizes has usually reached different minima in
 # different sizes (R jumps between neighbouring sizes) rather than not converged with size: it is
 # relaxed again in its other sizes from the deepest minimum it reached (the size whose R is
 # furthest above the trend with size, its structure carried into the others, not rattled again:
-# carry_over), each
-# size keeps the deeper of its two relaxations (mace_seed_cache), and the test is made again. One
-# still not converged is dropped in B3 (scan_unconverged : drop, the default), or counted as needing
-# the largest size (largest). Relaxations that stopped at mace_steps are named in the log.
+# carry_over), each size keeps the deeper of its two relaxations (mace_seed_cache), and the test is
+# made again. One still not converged is dropped in B3 (scan_unconverged : drop, the default), or
+# counted as needing the largest size (largest). Relaxations that stopped at mace_steps are named
+# in the log.
 #   Called by: main() (step B2)
 #   Calls:     Project.host(), build_defect(), carry_over(), displacement_field(), fits(),
 #              format_table(), inverse_n_fit(), ladder_table(), mace_cache(), mace_relaxations(),
@@ -9605,21 +9607,33 @@ def step_scan(p):
         return dict(x, seeded=seeded) if seeded else x
 
     # The test, on a candidate's sizes (smallest first): (the size it has converged at, or None;
-    # the line through it and the bigger sizes, with scan_test : line).
+    # the line through it and the bigger sizes, with scan_test : line; whether a line within
+    # scan_tol was turned down because R fell along it). A fixed cell only holds a defect's
+    # relaxation back, so R rises with size towards R_inf (c >= 0), and R is never negative: a
+    # line along which R falls by more than scan_tol over its sizes, or whose R_inf is below
+    # -scan_tol, is not taken (the margins are for noise). R falling like that means the sizes
+    # relaxed into different minima, not that the size has converged, so the candidate fails
+    # and is re-seeded.
     def test(seen):
         if len(seen) < need:
-            return None, None
+            return None, None, False
+        fell = False
         if line:                            # the first size on a line with the bigger ones
             for i in range(len(seen) - SCAN_CONFIRM):
                 r_inf, slope, worst = inverse_n_fit(seen[i:])
-                if worst < p.s.scan_tol:
-                    return seen[i]["tag"], {"R_inf": round(r_inf, 4), "c": round(slope, 3),
-                                            "worst": round(worst, 4), "sizes": len(seen) - i}
-            return None, None
+                if worst >= p.s.scan_tol:
+                    continue
+                drop = -slope * (1 / seen[i]["N"] - 1 / seen[-1]["N"])   # R's fall along it
+                if r_inf < -p.s.scan_tol or drop > p.s.scan_tol:
+                    fell = True
+                    continue
+                return seen[i]["tag"], {"R_inf": round(r_inf, 4), "c": round(slope, 3),
+                                        "worst": round(worst, 4), "sizes": len(seen) - i}, fell
+            return None, None, fell
         return next((x["tag"] for i, x in enumerate(seen[:-1])
                      if x["edge"] < p.s.scan_edge_tol and
                      all(abs(y["E_relax"] - x["E_relax"]) < p.s.scan_tol
-                         for y in seen[i + 1:])), None), None
+                         for y in seen[i + 1:])), None), None, False
 
     seen = {cid: [measure(cid, cell, *res[str(plan[(cid, cell["tag"])][2])])
                   for cell in ladder if (cid, cell["tag"]) in plan] for cid in cands}
@@ -9631,6 +9645,12 @@ def step_scan(p):
     # it reached: the relaxed structure of the size whose R is furthest above the trend with size
     # (the line through all its sizes), carried into the others (carry_over). Each size keeps
     # whichever of its two relaxations went deeper, and the test is made again.
+    fell = sorted(cid for cid in cands if first[cid][2] and not first[cid][0])
+    if fell:
+        log(f"B2: {len(fell)} candidate{'s' if len(fell) > 1 else ''} whose sizes lie on a line "
+            "only with R falling as the cell grows (by more than scan_tol, or to R_inf below "
+            "-scan_tol), which a fixed cell can't give: not converged, so re-seeded: "
+            + ", ".join(fell[:12]) + (f" and {len(fell) - 12} more" if len(fell) > 12 else ""))
     seeds, seed_plan, seed_tasks = {}, {}, []
     for cid in cands:
         if first[cid][0] or len(seen[cid]) < need:
@@ -9673,7 +9693,7 @@ def step_scan(p):
 
     out, rows, capped = {}, [], []
     for cid, c in cands.items():
-        conv, fit = test(seen[cid]) if cid in seeds else first[cid]
+        conv, fit, _ = test(seen[cid]) if cid in seeds else first[cid]
         out[cid] = {"sizes": seen[cid], "converged": conv}
         if fit:
             out[cid]["fit"] = fit
@@ -13843,9 +13863,10 @@ STEPS = [
                "mace_model", "mace_fmax", "mace_steps", "mace_rattle", "transform"),
          needs=("generate", "relax"),
          owns=("B_candidates/mace", "B_candidates/jobs/mace_scan", "B_candidates/ladder.json"),
-         version=2),                         # 1: each size's relaxed MACE energy (B3's cut);
+         version=3),                         # 1: each size's relaxed MACE energy (B3's cut);
                                              # 2: the unconverged re-seeded from their deepest
-                                             # minimum, and too few sizes told apart
+                                             # minimum, and too few sizes told apart; 3: a line
+                                             # along which R falls with size doesn't count
     Step("choose", "B3", "the screening cell", step_choose,
          keys=("supercell", "transform", "screen_min_image", "deep_level_margin", "scan_lengths",
                "decay_length_multiple", "configuration_margin", "mace", "scan_unconverged"),
