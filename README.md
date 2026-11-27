@@ -981,6 +981,32 @@ means band edges that don't fold onto Γ of this cell (B3 says which), and C2 wa
 goes on with these Γ-point results, as ADAQ's does: there is no check of the levels' spread on a
 k-point grid (the old C2b).
 
+With `screen_levelless : neutral`, C2 first screens every candidate's neutral state (with the
+pristine cell), and screens a *level-less* one in nothing else. A candidate is level-less when its
+neutral run has no gap level and leaves nothing in the bands, and a single point of its relaxed
+neutral structure with the band weights (`C_screen/jobs/levelless`) shows no state on the defect
+within `carrier_reach` of either band edge: none of the empty states from the CBM to
+`carrier_reach` above it, where a −1 would put its electron, nor of the occupied ones from the VBM
+to `carrier_reach` below it, where a +1 would leave its hole, is spread over at most
+`carrier_fraction` of the cell's atoms. Its charged states would then leave their carrier in a
+band, spread through the cell: band states, which C3's hull leaves out and its band-state test
+turns down (an extra carrier spread through the cell hardly moves the atoms, so the neutral's
+states are what that test would see). So only the charged runs C3 would throw away are skipped,
+and the Fermi-level extension past PBE's conduction band edge (`gap`) and the band-state capture
+work as before for every other candidate: one with a gap level, a carrier in a band, or a state on
+the defect near a band edge gets all of `screen_charges`. So do native defects (E needs their
+charge states) and candidates with their own `q=`, from the start, and a candidate whose neutral
+run or single point gave nothing to judge. A level-less candidate still takes part in C3's hull
+and site comparisons with its neutral state: it may be its composition's lowest arrangement. It
+needs `distort_charges : relevant` (the band-state test is that mode's) and 0 in
+`screen_charges`. Each single point's verdict is kept next to it (`edge_states.json`) and its
+`.pdos_weights`, tens of MB for a few hundred atoms, deleted. `summary.txt` has a table of how
+many candidates were level-less and why the others weren't. What it can miss: a carrier that
+settles on the defect only once the structure relaxes in that charge state (a self-trapped
+polaron, which PBE rarely gives; a DX-like centre starts from a shallow donor, whose neutral leaves
+its electron in the band and so gets all its charge states). It costs two more rounds in the
+queue (the single points, then the charged runs), and `--prepare-only` prepares only the first.
+
 **C3 filter.**
 
 1. *Best state:* for each candidate and charge state, its screening run (the lowest energy over
@@ -1545,7 +1571,7 @@ results change. CASTEP jobs whose inputs have not changed are reused, not repeat
 - **P**: [`pack`](#runner-settings) (runner) · [`pair_max_distance`](#b-candidates-the-screening-and-electronic-cells) (B) · [`pairs`](#b-candidates-the-screening-and-electronic-cells) (B) · [`param`](#general) (general) · [`%block partitions`](#runner-settings) (runner) · [`%block phases`](#a-host) (A) · [`phases_e_above_hull`](#a-host) (A) · [`phases_from`](#a-host) (A) · [`phases_max_steps`](#a-host) (A) · [`phases_molecule_box`](#a-host) (A) · [`poll`](#runner-settings) (runner) · [`%block production_overrides`](#d-production) (D)
 - **Q**: [`quench_temperature`](#e-thermodynamics) (E)
 - **R**: [`rattle_dmin`](#c-screening-ground-and-excited-states) (C) · [`rattle_stdev`](#c-screening-ground-and-excited-states) (C) · [`ref_kspacing_factor`](#a-host) (A) · [`ref_polymorph_window`](#a-host) (A) · [`ref_relax`](#a-host) (A) · [`require_bound`](#c-screening-ground-and-excited-states) (C) · [`require_gap_states`](#c-screening-ground-and-excited-states) (C) · [`require_spin`](#c-screening-ground-and-excited-states) (C) · [`%block runner_scan`, `runner_prerelax`, `runner_distort`](#mace) (MACE) · [`%block runner_host`, `runner_screen`, `runner_production`, `runner_<step>`](#runner-settings) (runner)
-- **S**: [`scan`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_edge_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_lengths`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_test`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_unconverged`](#b-candidates-the-screening-and-electronic-cells) (B) · [`screen_charges`](#c-screening-ground-and-excited-states) (C) · [`screen_cutoff`](#c-screening-ground-and-excited-states) (C) · [`screen_max_steps`](#c-screening-ground-and-excited-states) (C) · [`screen_coverage`](#b-candidates-the-screening-and-electronic-cells) (B) · [`screen_min_image`](#b-candidates-the-screening-and-electronic-cells) (B) · [`%block screen_overrides`](#c-screening-ground-and-excited-states) (C) · [`screen_spins`](#c-screening-ground-and-excited-states) (C) · [`share_rounds`](#c-screening-ground-and-excited-states) (C) · [`site_margin`](#c-screening-ground-and-excited-states) (C) · [`sp_walltime`](#runner-settings) (runner) · [`spin_tol`](#c-screening-ground-and-excited-states) (C) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-the-screening-and-electronic-cells) (B)
+- **S**: [`scan`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_edge_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_lengths`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_test`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_tol`](#b-candidates-the-screening-and-electronic-cells) (B) · [`scan_unconverged`](#b-candidates-the-screening-and-electronic-cells) (B) · [`screen_charges`](#c-screening-ground-and-excited-states) (C) · [`screen_cutoff`](#c-screening-ground-and-excited-states) (C) · [`screen_max_steps`](#c-screening-ground-and-excited-states) (C) · [`screen_coverage`](#b-candidates-the-screening-and-electronic-cells) (B) · [`screen_levelless`](#c-screening-ground-and-excited-states) (C) · [`screen_min_image`](#b-candidates-the-screening-and-electronic-cells) (B) · [`%block screen_overrides`](#c-screening-ground-and-excited-states) (C) · [`screen_spins`](#c-screening-ground-and-excited-states) (C) · [`share_rounds`](#c-screening-ground-and-excited-states) (C) · [`site_margin`](#c-screening-ground-and-excited-states) (C) · [`sp_walltime`](#runner-settings) (runner) · [`spin_tol`](#c-screening-ground-and-excited-states) (C) · [`status_cmd`](#runner-settings) (runner) · [`submit_cmd`](#runner-settings) (runner) · [`supercell`](#b-candidates-the-screening-and-electronic-cells) (B)
 - **T**: [`tolerate_failures`](#runner-settings) (runner) · [`transform`](#general) (general)
 - **V**: [`vacancies`](#b-candidates-the-screening-and-electronic-cells) (B) · [`validate`](#c-screening-ground-and-excited-states) (C) · [`validate_defects`](#c-screening-ground-and-excited-states) (C) · [`validate_gamma`](#c-screening-ground-and-excited-states) (C) · [`validate_sizes`](#c-screening-ground-and-excited-states) (C) · [`validate_tol`](#c-screening-ground-and-excited-states) (C)
 - **W**: [`walltime`](#runner-settings) (runner) · [`walltime_safety`](#runner-settings) (runner) · [`workdir`](#general) (general)
@@ -1664,6 +1690,7 @@ phase D redoes the survivors properly. The screening settings (`screen_cutoff`, 
 |---|---|---|---|
 | `configuration_margin` | — | B3 (C1 without B2's scan) | Before any CASTEP run, and before B3 chooses the screening cell, drop arrangements whose configurational energy (MACE energy above the lowest arrangement of the same composition, compared in the biggest size B2 relaxed them all in) is more than this, e.g. `1.0 eV`; the screening cell is then sized for the rest. Without B2's scan, C1 makes the cut in the screening cell. Off unless given; needs `mace : true`. MACE has no charge or spin, so keep it generous. Replaces `triage` and `triage_window`. |
 | `screen_charges` | `-1 0 1` (*list*) | C2 | The charge states every candidate is screened in, except one with its own `q=` in `%block defects`. |
+| `screen_levelless` | `all` | C2 | `neutral`: screen every candidate's neutral state first, and a level-less one (no gap level or carrier in a band in its neutral run, and no state on the defect within `carrier_reach` of a band edge in a single point with the band weights) in nothing else, as C3 would turn down its charged states; native defects and those with their own `q=` get all theirs. Needs `distort_charges : relevant` and 0 in `screen_charges`. `all`: every candidate in all of `screen_charges`. |
 | `screen_spins` | `triplet` | C2 | The starting spin (unpaired electrons): `triplet` runs once from 2, or from 1 (a doublet) when the electron count is odd; `low` runs once from the lowest the electron count allows (0 or 1); `both` runs from that and from that + 2. A starting value: the results keep the final spin. |
 | `screen_cutoff` | the production cut-off | A3.1, C2, C3, C5, C6, C7 | The cut-off of the screening runs, and of A3.1's reference phases, so that their energies are on one scale. |
 | `screen_max_steps` | `50` | C2, C5, C6, C7 | `geom_max_iter` of the screening relaxations. A run that reaches it is logged as failed but keeps its last energy, marked as not converged. |
@@ -2628,13 +2655,26 @@ shallower minimum came only from the ideal structure, C1 made one new relaxation
 structure at 250 atoms carried into the cell, which went 0.30 eV deeper and was kept (the
 re-seeded candidate used B2's own relaxation in the cell), and a rerun made none.
 
+`screen_levelless : neutral` was checked with `.bands` and `.pdos_weights` files written in
+CASTEP's layout for a 20-atom stand-in, and with C2 run on made-up screening results. A single
+point whose band-edge states were all spread over the cell was level-less; one with a state on two
+atoms 0.5 eV above the CBM, or 0.6 eV below the VBM, wasn't; one with such a state 1.6 eV above
+the CBM (beyond `carrier_reach`) was level-less; one with a gap level, one that failed and one
+without weights weren't judged. Each verdict was kept and its weights deleted, and read back the
+same. In C2, the candidates with a gap level, an electron in the conduction band, a failed neutral
+run, a state on the defect near a band edge or a failed single point got all their charge states,
+the level-less one its neutral state only, and a native defect and one with its own `q=` all
+theirs in the first round; the batch ran as the neutral round, the single points, then the
+charged runs, and a rerun gave the same verdicts from the kept files. With `all`, C2's results
+were the same as before.
+
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's cut on real energies (see 15 below), C4's search with the real MACE (see 8 below), real
 `mace_run_train` trainings with the charge embedding (F2: the command was checked, not run), real
-CASTEP ΔSCF (C7, D2, F1) and `.pdos_weights` files (C3, C7; their layout is taken from CASTEP's
-source), real CASTEP stress tensors (C8), real Slurm for the MACE and model jobs and for job arrays
-(`array`, with `pack` too), a phonon job on a real GPU, and real CASTEP output for the DFPT
-permittivity and the `.bands` of spin-polarised runs.
+CASTEP ΔSCF (C7, D2, F1) and `.pdos_weights` files (C2 with `screen_levelless`, C3, C7; their layout
+is taken from CASTEP's source), real CASTEP stress tensors (C8), real Slurm for the MACE and model
+jobs and for job arrays (`array`, with `pack` too), a phonon job on a real GPU, and real CASTEP
+output for the DFPT permittivity and the `.bands` of spin-polarised runs.
 
 On the first real runs, check:
 
@@ -2778,3 +2818,9 @@ On the first real runs, check:
    a different minimum in the smaller cell. C1's log says how many of these went deeper from their
    structure in their converged size; one that didn't, with a large miss, is screened in a cell
    that holds its relaxation back.
+21. **`screen_levelless : neutral`**: C2's log and table give how many candidates were level-less.
+   On the first single points (`C_screen/jobs/levelless`), check that `edge_states.json` has a
+   participation `P` for each (a missing one means the `.pdos_weights` wasn't read, and that
+   candidate got all its charge states), and look at a few level-less ones you know (an
+   isovalent substitution such as Sr<sub>Ca</sub> should be one; an NV-like X<sub>Ca</sub> +
+   V<sub>O</sub> shouldn't).

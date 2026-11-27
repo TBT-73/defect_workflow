@@ -125,6 +125,8 @@ electronic_depth : 0.25 eV
 
 # =============================================== C: screening, ground and excited states
 screen_charges   : -1 0 1
+!screen_levelless : neutral    # neutral first; a level-less candidate (no level or carrier, and
+                               #   no state on the defect near a band edge) screened neutral only
 screen_spins     : triplet     # the starting spin: triplet (a doublet for an odd electron
                                #   count) | low (0 or 1) | both (low, and low + 2)
 screen_cutoff   : 500 eV      # a lower cut-off for screening (default: production)

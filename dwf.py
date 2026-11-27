@@ -5282,6 +5282,7 @@ PROJECT_KEYWORDS = {
     "decay_length_multiple": (_num(), 4.0),
     # C: screening, ground and excited states
     "screen_charges": (_ints(), [-1, 0, 1]),
+    "screen_levelless": (_choice("all", "neutral"), "all"),
     "screen_spins": (_choice("triplet", "low", "both"), "triplet"),
     "screen_cutoff": (_num("eV"), None), "screen_max_steps": (_num(cast=int), 50),
     "screen_overrides": ("kv", {}),
@@ -5642,6 +5643,13 @@ def read_project(path, run_path):
     if not 0 < s.carrier_fraction <= 1:
         die(f"{name}: carrier_fraction is a fraction of the cell's atoms, greater than 0 and at "
             "most 1")
+    if s.screen_levelless == "neutral" and 0 not in s.screen_charges:
+        die(f"{name}: screen_levelless : neutral screens the neutral state first, so "
+            "screen_charges must include 0")
+    if s.screen_levelless == "neutral" and s.distort_charges != "relevant":
+        die(f"{name}: screen_levelless : neutral leaves out only the charged states C3's "
+            "band-state test would leave out, which only distort_charges : relevant makes: use "
+            "relevant, or screen_levelless : all")
     if not 0 < s.screen_coverage <= 1:
         die(f"{name}: screen_coverage is the share of the candidates to be screened that the "
             "screening cell must take at their converged size (B2): greater than 0 and at most 1")
@@ -7186,8 +7194,9 @@ def same_basin(prim, comps, P1, atoms1, P2, atoms2, label="defect"):
 # Reads a CASTEP .bands file: k-points, weights, eigenvalues (eV, [spin][k-point][band]), the
 # electrons in each spin channel (one number, the total, when the calculation is not spin-
 # polarised) and the Fermi energies (eV).
-#   Called by: band_state_test(), job_summary(), run_screen_jobs(), step_bands(), step_choose(),
-#              step_excite(), step_formation(), step_relaxations(), step_screen(), step_zpl()
+#   Called by: band_state_test(), edge_states(), job_summary(), run_screen_jobs(), step_bands(),
+#              step_choose(), step_excite(), step_formation(), step_relaxations(), step_screen(),
+#              step_zpl()
 def read_bands(path):
     lines = Path(path).read_text().splitlines()
 
@@ -7225,7 +7234,7 @@ def read_bands(path):
 # then how many bands) one record of orbital weights per band. Returns {'species', 'rank', 'l'
 # (per orbital), 'kpts', 'weights': [k][spin] -> array (bands x orbitals)}, or None if the file is
 # missing or not in this form.
-#   Called by: band_state_test(), dscf_result(), step_excite(), step_zpl()
+#   Called by: band_state_test(), dscf_result(), edge_states(), step_excite(), step_zpl()
 def read_pdos_weights(path):
     path = Path(path)
     if not path.exists():
@@ -7269,7 +7278,8 @@ def read_pdos_weights(path):
 # atom's weight the sum over its orbitals (an atom is a species number and rank). About 1 to 10 for
 # a state on a defect and its neighbours; about the number of atoms of the elements a band is made
 # of (half the cell for a rock-salt band) for a host state. Returns [spin] -> array (bands).
-#   Called by: band_state_test(), dscf_result(), step_excite(), step_zpl(), zpl_bands_ok()
+#   Called by: band_state_test(), dscf_result(), edge_states(), step_excite(), step_zpl(),
+#              zpl_bands_ok()
 def participation(pw, k=0):
     keys = np.array(list(zip(pw["species"], pw["rank"])))
     _, atom = np.unique(keys, axis=0, return_inverse=True)
@@ -7288,7 +7298,7 @@ def participation(pw, k=0):
 # counts when CASTEP gives one per spin (or the total, not spin-polarised); otherwise the bands
 # below the Fermi energy at the first k-point.
 #   Called by: band_edges(), band_masses(), carrier_bands(), carriers(), defect_levels(),
-#              gap_levels()
+#              edge_states(), gap_levels()
 def occupied_bands(b):
     if b["nspin"] == 1:
         return [int(round(b["nelec"][0] / 2))]
@@ -8069,12 +8079,12 @@ def write_json(path, data):
 # A text table for summary.txt and the log: a title, a header row, a rule and the rows, in columns
 # as wide as needed (numbers to the right, text to the left). Floats are shown with 4 decimals,
 # None as blank.
-#   Called by: coverage_table(), drelax_ranking(), ladder_table(), limits_table(), problem_table(),
-#              step_ccd(), step_choose(), step_converge(), step_corrections(), step_distort(),
-#              step_electronic(), step_excite(), step_filter(), step_formation(), step_generate(),
-#              step_interest(), step_limits(), step_lineshape(), step_phases(), step_prerelax(),
-#              step_rank(), step_ref_phases(), step_relaxations(), step_scan(), step_validate(),
-#              step_zpl()
+#   Called by: coverage_table(), drelax_ranking(), ladder_table(), levelless_table(),
+#              limits_table(), problem_table(), step_ccd(), step_choose(), step_converge(),
+#              step_corrections(), step_distort(), step_electronic(), step_excite(), step_filter(),
+#              step_formation(), step_generate(), step_interest(), step_limits(), step_lineshape(),
+#              step_phases(), step_prerelax(), step_rank(), step_ref_phases(), step_relaxations(),
+#              step_scan(), step_validate(), step_zpl()
 def format_table(header, rows, title=""):
     cells = [[("" if v is None else (f"{v:.4f}" if isinstance(v, float) else str(v)))
               for v in r] for r in rows]
@@ -10433,17 +10443,27 @@ def step_prerelax(p):
 # C2: the screening pass. One CASTEP relaxation per candidate, charge state (screen_charges) and
 # starting spin (spin_states: by default one, a triplet, or a doublet for an odd electron count;
 # the spin is not held fixed), plus the pristine supercell at the same settings for the band edges
-# and host energy. All at the Gamma point with the screening keywords; failures are flagged, not
-# rescued (runner group 'screen': max_restarts 0, tolerate_failures). The results give each run's
-# energy, final spin, gap levels and the electrons or holes it left in the bands (band_carriers:
-# C3 doesn't judge a candidate on such a band state), and the pristine cell's band edges. The
-# pristine cell's gap at Gamma is checked against A2.2's: one more than FOLD_GAP_TOL wider means
-# band edges that don't fold onto Gamma of this cell (B3 names them), which the Gamma-point levels
-# are measured against.
+# and host energy. With screen_levelless : neutral, the pristine cell and the neutral state of
+# every candidate (but a native defect, is_native, or one with its own q= in %block defects, which
+# get all their charge states at once) go first; a candidate whose neutral run has a gap level or
+# left electrons or holes in a band then gets its charged states, and one with neither gets a
+# single point of its relaxed neutral structure with the band weights (edge_states, in
+# C_screen/jobs/levelless): if a state near a band edge is on the defect, it gets its charged
+# states too, and if none is, it is level-less and screened neutral only. Its charged states would
+# have left their electron or hole in a band, spread through the cell: band states, which C3's hull
+# leaves out and its band-state test (band_state_test) would turn down. The charged runs have the
+# same names as without it, so either way reuses the other's. All at the Gamma point with the
+# screening keywords; failures are flagged, not rescued (runner group 'screen': max_restarts 0,
+# tolerate_failures). The results give each run's energy, final spin, gap levels and the electrons
+# or holes it left in the bands (band_carriers: C3 doesn't judge a candidate on such a band state),
+# and the pristine cell's band edges. The pristine cell's gap at Gamma is checked against A2.2's:
+# one more than FOLD_GAP_TOL wider means band edges that don't fold onto Gamma of this cell (B3
+# names them), which the Gamma-point levels are measured against.
 #   Called by: main() (step C2)
-#   Calls:     Project.batch(), Project.production_param(), band_edges(), host_supercell(),
-#              job_summary(), load_cell(), problem_table(), qtag(), read_bands(), screen_job(),
-#              screen_overrides(), screen_setup(), spin_states()
+#   Calls:     Project.batch(), Project.production_param(), band_edges(), edge_states(),
+#              host_supercell(), is_native(), job_summary(), levelless_table(), load_cell(),
+#              problem_table(), qtag(), read_bands(), screen_job(), screen_overrides(),
+#              screen_setup(), spin_states(), start_spin()
 def step_screen(p):
     cands, prim, P = screen_setup(p)
     d = p.phase_dir("C")
@@ -10451,14 +10471,23 @@ def step_screen(p):
     host = host_supercell(prim, P)
     jobs = [{"name": "host", "atoms": host, "kind": "sp", "kgrid": [1, 1, 1], "symmetry": True,
              "overrides": {k: v for k, v in screen_overrides(p).items() if k != "geom_max_iter"}}]
-    plan = {}
-    for cid, info in defects.items():
-        atoms = load_cell(p, info["structure"])
-        for q in cands[cid].get("charges") or p.s.screen_charges:
-            for S in spin_states(atoms, q, p.s.screen_spins):
-                name = f"{cid}_{qtag(q)}_s{S}"
-                jobs.append(screen_job(p, name, atoms, info, q, S))
-                plan[name] = {"cand": cid, "q": q, "spin_start": S}
+    plan, structures = {}, {}
+    host_el = set(prim.get_chemical_symbols())
+    first = {cid for cid in defects if p.s.screen_levelless == "neutral"
+             and not cands[cid].get("charges") and not is_native(cands[cid], host_el)}
+
+    # Adds a candidate's runs in charge state q, one for each starting spin.
+    def add(cid, q):
+        if cid not in structures:
+            structures[cid] = load_cell(p, defects[cid]["structure"])
+        for S in spin_states(structures[cid], q, p.s.screen_spins):
+            name = f"{cid}_{qtag(q)}_s{S}"
+            jobs.append(screen_job(p, name, structures[cid], defects[cid], q, S))
+            plan[name] = {"cand": cid, "q": q, "spin_start": S}
+
+    for cid in defects:
+        for q in [0] if cid in first else (cands[cid].get("charges") or p.s.screen_charges):
+            add(cid, q)
     res = p.batch("C_screen/jobs/screen", jobs, "screen", p.production_param())
     if not res["complete"]:
         return None
@@ -10480,12 +10509,179 @@ def step_screen(p):
     for name, meta in plan.items():
         runs[name] = dict(meta, **job_summary(p, res, name, (vbm, cbm),
                                               d / "structures" / "screen"))
+    verdict, probe, neutral = {}, {}, {}     # screen_levelless : neutral
+    for r in runs.values():
+        if r["q"] == 0 and r["energy"] is not None:
+            neutral.setdefault(r["cand"], []).append(r)
+    for cid in first:                        # its neutral run: a level or a carrier?
+        r = min(neutral[cid], key=lambda x: x["energy"]) if cid in neutral else None
+        if r is None:
+            verdict[cid] = {"kind": "not judged", "why": "no usable neutral run"}
+        elif r["levels"] is None or r["band"] is None:
+            verdict[cid] = {"kind": "not judged", "why": "its neutral run's levels unread"}
+        elif r["levels"]:
+            n = len(r["levels"])
+            verdict[cid] = {"kind": "gap levels", "why": f"{n} gap level{'s' if n > 1 else ''}"}
+        elif max(r["band"]["electrons"], r["band"]["holes"]) >= BAND_CARRIER:
+            verdict[cid] = {"kind": "band carriers",
+                            "why": f"electrons {r['band']['electrons']:g} and holes "
+                                   f"{r['band']['holes']:g} in the bands"}
+        elif not r.get("structure"):
+            verdict[cid] = {"kind": "not judged", "why": "no final neutral structure"}
+        else:
+            probe[cid] = r
+    if first:
+        log(f"C2: screen_levelless : neutral: of the {len(first)} candidates screened neutral "
+            f"first, {len(first) - len(probe)} get their charged states (a gap level or a "
+            f"carrier in a band, or not judged) and {len(probe)} with neither get a single point "
+            "with the band weights")
+    if probe:
+        sp, which = [], {}
+        for cid, r in sorted(probe.items()):
+            atoms = load_cell(p, r["structure"])
+            name = f"{cid}_q0_bw"
+            job = screen_job(p, name, atoms, defects[cid], 0, start_spin(atoms, 0, r["spin"]))
+            job.update(kind="sp", overrides=dict(job["overrides"], pdos_calculate_weights="true"))
+            sp.append(job)
+            which[name] = (cid, len(atoms))
+        res2 = p.batch("C_screen/jobs/levelless", sp, "screen", p.production_param())
+        if not res2["complete"]:
+            return None
+        for name, (cid, nat) in which.items():
+            verdict[cid] = edge_states(p, res2["jobs"][name], res2["calcs"][name], nat,
+                                       (vbm, cbm))
+        nless = sum(v["kind"] == "level-less" for v in verdict.values())
+        log(f"C2: screen_levelless : neutral: of the {len(probe)} candidates probed, {nless} "
+            "level-less (no state on the defect within carrier_reach of a band edge) are screened "
+            f"neutral only, and the other {len(probe) - nless} get their charged states")
+    for cid in sorted(first):
+        verdict[cid]["charges"] = [0] if verdict[cid]["kind"] == "level-less" else sorted(
+            p.s.screen_charges)
+        for q in verdict[cid]["charges"]:
+            if q:
+                add(cid, q)
+    if len(plan) > len(runs):                # the charged runs of the rest
+        res = p.batch("C_screen/jobs/screen", jobs, "screen", p.production_param())
+        if not res["complete"]:
+            return None
+        for name, meta in plan.items():
+            if name not in runs:
+                runs[name] = dict(meta, **job_summary(p, res, name, (vbm, cbm),
+                                                      d / "structures" / "screen"))
+    if first:
+        order = {cid: k for k, cid in enumerate(defects)}
+        runs = dict(sorted(runs.items(), key=lambda kv: (order[kv[1]["cand"]], kv[1]["q"],
+                                                         kv[1]["spin_start"])))
     bad = sum(r["energy"] is None for r in runs.values())
-    return {"host": host_out, "runs": runs, "_table": problem_table(runs),
+    nless = sum(v["kind"] == "level-less" for v in verdict.values())
+    table = "\n".join(t for t in (levelless_table(verdict, len(defects) - len(first)),
+                                   problem_table(runs)) if t) or None
+    return {"host": host_out, "runs": runs, **({"levelless": verdict} if first else {}),
+            "_table": table,
             "_note": f"{len(runs)} runs, gap {cbm - vbm:.2f} eV at Gamma"
                      + (f" ({wider:+.2f} eV against A2.2: band edges not at Gamma)"
                         if wider > FOLD_GAP_TOL else "")
-                     + (f", {bad} without a usable energy" if bad else "")}
+                     + (f", {bad} without a usable energy" if bad else "")
+                     + (f"; screen_levelless : neutral: {nless} of the {len(first)} candidates "
+                        "screened first level-less, neutral only" if first else "")}
+
+
+# screen_levelless : neutral: whether a candidate with no gap level and no carrier in a band in
+# its neutral run is level-less, from a single point of its relaxed neutral structure with the
+# band weights (r: the job's result, calc: its Calc; nat: the cell's atoms; edges: the pristine
+# cell's VBM and CBM). Its charged states would put their electron in the lowest empty states and
+# their hole in the highest occupied ones; an extra carrier spread through the cell hardly moves the
+# atoms, so these are what C3's band-state test (band_state_test) would see in those charge
+# states. So the empty bands from level_margin below the CBM to carrier_reach above it, and the
+# occupied ones from carrier_reach below the VBM to level_margin above it, are looked at: if one
+# is on the defect (spread over at most carrier_fraction of the cell's atoms: participation), its
+# charged states may pass that test, or bind, and are screened; if none is, it is level-less. A
+# gap level in the single point, or a single point without usable bands or weights, can't call it
+# level-less. The judgement is kept in edge_states.json in the job's directory, and the job's
+# .pdos_weights (tens of MB for a few hundred atoms) deleted once read. Returns {'kind':
+# 'level-less', 'edge state on the defect' or 'not judged', 'why', and 'P' (atoms, the least
+# spread of those states) and 'limit' (carrier_fraction x nat) when it was judged}.
+#   Called by: step_screen()
+#   Calls:     occupied_bands(), participation(), read_bands(), read_pdos_weights()
+def edge_states(p, r, calc, nat, edges):
+    kept = calc.dir / "edge_states.json"
+    if kept.exists():
+        try:
+            return json.loads(kept.read_text())
+        except ValueError:
+            pass
+    out = {"kind": "not judged"}
+    weights = calc.dir / f"{calc.seed}.pdos_weights"
+    bands = calc.dir / f"{calc.seed}.bands"
+    if r["status"] != "done" or r["energy"] is None or not r["scf_converged"]:
+        out["why"] = ("its single point failed ("
+                      + (r["reason"] or "no converged energy").splitlines()[0] + ")")
+        return out
+    pw = read_pdos_weights(weights)
+    if not bands.exists() or pw is None:
+        out["why"] = "its single point wrote no .bands or .pdos_weights"
+        return out
+    b = read_bands(bands)
+    vbm, cbm = edges
+    m, reach, limit = p.s.level_margin, p.s.carrier_reach, round(p.s.carrier_fraction * nat, 1)
+    occ, P, near = occupied_bands(b), participation(pw), []
+    for s in range(b["nspin"]):
+        for n, e in enumerate(b["eig"][s, 0]):
+            if not np.isfinite(e):
+                continue
+            if vbm + m < e < cbm - m:
+                out["why"] = f"a gap level in its single point ({e - vbm:.2f} eV above the VBM)"
+                return out
+            if (n >= occ[s] and e <= cbm + reach) or (n < occ[s] and e >= vbm - reach):
+                near.append((s, n))
+    if not near or any(s >= len(P) or n >= len(P[s]) for s, n in near):
+        out["why"] = "its .pdos_weights has no weights for its band-edge states"
+        return out
+    least = min(float(P[s][n]) for s, n in near)
+    out.update(P=round(least, 1), limit=limit)
+    if least <= limit:
+        out.update(kind="edge state on the defect",
+                   why=f"a state within carrier_reach of a band edge spread over {least:.0f} "
+                       f"atoms (carrier_fraction: at most {limit:g})")
+    else:
+        out.update(kind="level-less",
+                   why=f"its {len(near)} states within carrier_reach of the band edges are spread "
+                       f"over {least:.0f} atoms or more (carrier_fraction: at most {limit:g})")
+    kept.write_text(json.dumps(out))
+    weights.unlink(missing_ok=True)
+    return out
+
+
+# C2's table of what screen_levelless : neutral decided (verdict: {cid: {'kind', 'why',
+# 'charges'}}): how many candidates were screened neutral only (level-less) or in all their charge
+# states, and why, with a few of them; others: the candidates that got all their charge states at
+# once (native defects, and those with their own q=). None without it.
+#   Called by: step_screen()
+#   Calls:     format_table()
+def levelless_table(verdict, others):
+    if not verdict:
+        return None
+    what = {"level-less": "no gap level or carrier, and no state on the defect within "
+                          "carrier_reach of a band edge (single point with band weights)",
+            "gap levels": "a gap level in its neutral run",
+            "band carriers": "electrons or holes left in a band in its neutral run",
+            "edge state on the defect": "a state on the defect within carrier_reach of a band "
+                                        "edge (single point with band weights)",
+            "not judged": "couldn't be judged (a failed run, or no levels or weights read)"}
+    groups = {}
+    for cid, v in sorted(verdict.items()):
+        groups.setdefault(v["kind"], []).append(cid)
+    rows = [["neutral only" if kind == "level-less" else "all", len(groups[kind]), what[kind],
+             ", ".join(groups[kind][:4]) + (" ..." if len(groups[kind]) > 4 else "")]
+            for kind in what if kind in groups]
+    n = len(groups.get("level-less", []))
+    return format_table(
+        ["charge states", "candidates", "because", "e.g."], rows,
+        f"screen_levelless : neutral: of the {len(verdict)} candidates screened neutral first, "
+        f"{n} level-less were screened neutral only (their charged states would have left "
+        "their carrier in a band, spread through the cell, as C3 would judge it); the others got "
+        f"all their charge states" + (f", as did the {others} native defects and candidates with "
+                                      "their own q=, from the start" if others else ""))
 
 
 # --------------------------------------------------------------------------
@@ -10981,7 +11177,7 @@ def neighbours_to_distort(comps, q, ox):
 # The final spin of a charge state's best screening run, as a starting spin with the right parity
 # for its electron count.
 #   Called by: step_ccd(), step_distort(), step_excite(), step_filter(), step_lineshape(),
-#              step_rank(), step_relaxations(), step_zpl(), validate_gamma()
+#              step_rank(), step_relaxations(), step_screen(), step_zpl(), validate_gamma()
 #   Calls:     electron_parity()
 def start_spin(atoms, q, spin):
     par = electron_parity(atoms, q)
@@ -11778,7 +11974,7 @@ def step_rank(p):
 # Whether a candidate is a native defect: every element it adds or removes is one of the host's
 # (vacancies, antisites, self-interstitials and complexes of them). C7 always passes these on to
 # D, because E's formation energies and Fermi level need them, bright or not.
-#   Called by: step_excite(), step_filter()
+#   Called by: step_excite(), step_filter(), step_screen()
 def is_native(cand, host_elements):
     return all(el in host_elements for el in cand["delta"])
 
@@ -14012,9 +14208,10 @@ STEPS = [
          version=1),                         # 1: a candidate screened in a cell smaller than its
                                              # converged size also relaxed from its structure there
     Step("screen", "C2", "cheap CASTEP screening of every candidate", step_screen,
-         keys=SCREEN_KEYS + ("screen_charges", "screen_spins"),
+         keys=SCREEN_KEYS + ("screen_charges", "screen_spins", "screen_levelless",
+                             "carrier_reach", "carrier_fraction"),
          needs=("prerelax", "converge", "bands"),
-         owns=("C_screen/jobs/screen", "C_screen/structures/screen"),
+         owns=("C_screen/jobs/screen", "C_screen/jobs/levelless", "C_screen/structures/screen"),
          version=1),                               # 1: the band carriers of each run
     Step("filter", "C3", "defect hull, sites and property filters", step_filter,
          keys=SCREEN_KEYS + ("hull_margin", "site_margin", "require_gap_states", "require_spin",
@@ -14232,6 +14429,8 @@ decay_length_multiple : 4
 
 # =============================================== C: screening, ground and excited states
 screen_charges   : -1 0 1
+!screen_levelless : neutral    # neutral first; a level-less candidate (no level or carrier, and
+                               #   no state on the defect near a band edge) screened neutral only
 screen_spins     : triplet     # the starting spin: triplet (a doublet for an odd electron
                                #   count) | low (0 or 1) | both (low, and low + 2)
 !screen_cutoff   : 500 eV      # a lower cut-off for screening (default: production)
