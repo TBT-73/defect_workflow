@@ -14438,9 +14438,11 @@ screen_max_steps : 50          # geometry steps per screening relaxation
 %block screen_overrides        # any other .param keywords for the screening runs, and for
                                #   A3.1's phases
 elec_energy_tol : 1e-5
-!fine_gmax : 35 1/ang          # a finer density grid, for hard ultrasoft potentials at a low
-                               #   screen_cutoff: a cell relaxation in A3.1 that keeps
-                               #   reverting, as its energy jumps when the grid changes
+!fine_gmax : 35 1/ang          # a finer density grid, only if A3.1 relaxes cells (ref_relax
+                               #   : cell) at a low screen_cutoff and they keep reverting, as a
+                               #   hard potential's energy jumps when the grid changes; CASTEP's
+                               #   default is already 22.9 1/ang at 500 eV, and 35 needs ~70%
+                               #   more memory in C2's cells
 %endblock screen_overrides
 !configuration_margin : 1.0 eV # B3: drop arrangements this far above the lowest of their
                                # composition by MACE energy (B2's), before the screening cell

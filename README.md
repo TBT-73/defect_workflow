@@ -695,13 +695,16 @@ they are needed to tens of meV/atom, not to A1's 1 meV/atom, and A3.1 keeps them
   was converged for the host: if an insulating host converged on a coarse grid, check the metals'
   grids in the table.
 
-At a low `screen_cutoff`, a hard ultrasoft potential (O, or Be with its 1s electrons in valence)
-may need a finer density grid than CASTEP's default: its energy then jumps whenever the grid
-changes as a cell relaxes, and the relaxation keeps "reverting to earlier configuration" until it
-runs out of steps. `fine_gmax : 35 1/ang` in `%block screen_overrides` gives the screening runs and
-these phases a finer grid alike (it was needed for relaxed cells; for single points it only costs
-time). Without `%block phases` or `phases_from : doped` nothing runs, and C3 makes no cuts across
-composition groups.
+At a low `screen_cutoff`, a hard ultrasoft potential (O, or Be with its 1s electrons in valence) may
+need a finer density grid than CASTEP's default: its energy then jumps whenever the grid changes as
+a cell relaxes, and the relaxation keeps "reverting to earlier configuration" until it runs out of
+steps. `fine_gmax : 35 1/ang` in `%block screen_overrides` gives the screening runs and these phases
+a finer grid alike. Only cell relaxations (`ref_relax : cell`) need it: single points, and the
+screening runs, which keep their cells, never change the grid. And it costs memory and time: CASTEP
+25's default fine grid is already twice the cut-off's wavevector (22.9 1/Å at 500 eV), 35 1/Å has
+3.6 times its points, and CASTEP's serial dry run of a 320-atom CaO screening cell asks 36 GB with
+it against 21 GB without. Without `%block phases` or `phases_from : doped` nothing runs, and C3
+makes no cuts across composition groups.
 
 **A3.2 ref_limits.** A pymatgen phase diagram of A3.1's host and its pure elements (it needs one of
 each). Each corner of the host's stability region is a limit, named after the phases there
@@ -1694,7 +1697,7 @@ phase D redoes the survivors properly. The screening settings (`screen_cutoff`, 
 | `screen_spins` | `triplet` | C2 | The starting spin (unpaired electrons): `triplet` runs once from 2, or from 1 (a doublet) when the electron count is odd; `low` runs once from the lowest the electron count allows (0 or 1); `both` runs from that and from that + 2. A starting value: the results keep the final spin. |
 | `screen_cutoff` | the production cut-off | A3.1, C2, C3, C5, C6, C7 | The cut-off of the screening runs, and of A3.1's reference phases, so that their energies are on one scale. |
 | `screen_max_steps` | `50` | C2, C5, C6, C7 | `geom_max_iter` of the screening relaxations. A run that reaches it is logged as failed but keeps its last energy, marked as not converged. |
-| `%block screen_overrides` | — | A3.1, C2, C3, C5, C6, C7 | Any other `.param` keywords for the screening runs (and A3.1's phases), e.g. a looser `elec_energy_tol`, or `fine_gmax : 35 1/ang`, a finer density grid, for hard ultrasoft potentials at a low `screen_cutoff` (a phase's cell relaxation whose energy jumps as the grid changes, and never converges). |
+| `%block screen_overrides` | — | A3.1, C2, C3, C5, C6, C7 | Any other `.param` keywords for the screening runs (and A3.1's phases), e.g. a looser `elec_energy_tol`, or `fine_gmax : 35 1/ang`, a finer density grid, for hard ultrasoft potentials at a low `screen_cutoff` (a phase's cell relaxation whose energy jumps as the grid changes, and never converges): only with `ref_relax : cell`, as it costs much memory in the screening cells. |
 | `level_margin` | `0.1 eV` | C2, C3, C5, C6, C7 | How far inside the host's band edges (from the pristine cell at the same settings) an eigenvalue must lie to count as a defect level in the gap. Anything closer to an edge, or past it, is in a band: the electrons and holes there make a run a band state (at least 0.5 of either), which C3 doesn't judge by its energy. The eigenvalues aren't aligned to the host's, so raise it if a defect cell's band edges sit visibly off the host's. |
 | `hull_margin` | `0.2 eV` | C3 | Keep an arrangement if its lowest formation energy comes within this of its composition group's defect hull somewhere in the gap. Allow for the error of the screening settings. |
 | `site_margin` | `0.5 eV` | C3 | Keep a defect with dopant atoms if its formation energy comes within this of the lowest of the defects with the same dopant atoms (on any site, with any host atoms added or removed) somewhere in the host's stability region and the gap: the dopant's chemical potential cancels between them. The region is A3.2's, against the host's elements alone; each such set keeps at least its lowest. Needs A3's phases. Native defects aren't compared so. |
@@ -2667,6 +2670,13 @@ the level-less one its neutral state only, and a native defect and one with its 
 theirs in the first round; the batch ran as the neutral round, the single points, then the
 charged runs, and a rerun gave the same verdicts from the kept files. With `all`, C2's results
 were the same as before.
+
+`fine_gmax : 35 1/ang`'s cost was checked with CASTEP 25.12's dry runs (its on-the-fly
+potentials, 500 eV, Γ, spin-polarised, an O vacancy in CaO): 36.1 GB against 21.3 GB with
+CASTEP's default fine grid (22.9 1/Å there) for a 320-atom cell, 10.9 against 4.9 GB for 128
+atoms, and 3.4 against 1.7 GB for 64, most of it the per-atom data on the fine grid. Single points
+and fixed-cell relaxations don't change the grid, so the examples now leave it out (A3.1's
+phases have been single points by default since `ref_relax`).
 
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's cut on real energies (see 15 below), C4's search with the real MACE (see 8 below), real
