@@ -2880,10 +2880,10 @@ def job_active(jobid, args):
 
 
 # The queue's state of all the user's jobs, from one squeue call with one line per array task
-# (-r), for array : N, where a step may have hundreds of jobs and array tasks queued: {job id:
+# (-r), for array : N and the MACE jobs, where a step may have hundreds of jobs queued: {job id:
 # state}, an array task's job id being <array job id>_<task>. None if squeue failed or didn't
 # answer within 2 minutes, so that every job counts as still there.
-#   Called by: wait_for()
+#   Called by: mace_jobs(), wait_for()
 def queue_states():
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
     try:
@@ -7721,8 +7721,9 @@ def mace_python(p, step=None):
 # through. (A job holds its node until its last worker ends. With a list fixed for each worker
 # beforehand, that was the slowest list, as a relaxation's cost goes with its steps, which nothing
 # knows in advance; with the shared queue it is only the last relaxation or two.) The jobs go in
-# jobs.json there; waiting polls Slurm's queue (status_cmd) every poll seconds, like the CASTEP
-# jobs, and the project's STOP file stops it; every PROGRESS_EVERY seconds the log says how
+# jobs.json there; waiting polls Slurm's queue every poll seconds, one squeue call for all the jobs
+# (queue_states; each job on its own with status_cmd or another scheduler, job_active), and the
+# project's STOP file stops it; every PROGRESS_EVERY seconds the log says how
 # many of the step's relaxations are done (done_before: those done before this call, which aren't
 # in todo), and each job's progress.txt how many of its own are (mace_progress). The relaxations
 # a job leaves (e.g. it ran out of time) wait for a place to come free and go into the next jobs,
@@ -7737,8 +7738,8 @@ def mace_python(p, step=None):
 #   Called by: mace_relaxations()
 #   Calls:     Project.mace_model_file(), Project.mace_runner(), Project.mace_settings(),
 #              Project.mace_template(), Project.model_path(), atoms_to_dict(), claim_file(),
-#              mace_cached(), mace_python(), add_sbatch_option(), job_active(), send_job(),
-#              write_json()
+#              mace_cached(), mace_python(), add_sbatch_option(), job_active(), queue_states(),
+#              send_job(), write_json()
 def mace_jobs(p, step, todo, done_before=0):
     args = p.mace_runner()
     d = p.phase_dir(STEP_INDEX[step].phase) / "jobs" / f"mace_{step}"
@@ -7762,11 +7763,21 @@ def mace_jobs(p, step, todo, done_before=0):
 
     # Whether a job is over: not in the queue, and either its end mark is there or it was
     # submitted long enough ago that the queue must know it (so a slow queue isn't taken for a
-    # job that has ended).
-    def ended(job):
-        if job_active(job["jobid"], args):
+    # job that has ended). states: the whole queue from one squeue call (queue_states), read once
+    # a poll for all the jobs; None (squeue didn't answer, or another scheduler or status_cmd):
+    # the job is asked about on its own (job_active).
+    def ended(job, states):
+        jid = str(job["jobid"])
+        if states is not None:
+            there = jid in states and not any(x in states[jid] for x in END_STATES)
+        else:
+            there = job_active(jid, args)
+        if there:
             return False
         return (Path(job["dir"]) / "finished").exists() or time.time() - job["time"] > 120
+
+    slurm = not getattr(args, "status_cmd", None) and "sbatch" in getattr(args, "submit_cmd",
+                                                                            "sbatch")
 
     # How a job that left relaxations undone ended, from its folder: stopped by Slurm at its time
     # limit (its Slurm output says so), or else the last line of the first of its workers' logs,
@@ -7837,8 +7848,10 @@ def mace_jobs(p, step, todo, done_before=0):
                 log(f"{label}: the MACE jobs have finished ({total:,}/{total:,} relaxations done)")
             return True
         missing = {str(t["cache"]): t["key"] for t in left}
-        for job in state["jobs"]:
-            if not job.get("ended") and ended(job):
+        unended = [job for job in state["jobs"] if not job.get("ended")]
+        states = queue_states() if unended and slurm else None     # (one squeue call a poll)
+        for job in unended:
+            if ended(job, states):
                 job["ended"] = True
                 if job.get("count") == "end":          # (an older dwf.py's counted at submission)
                     claims = Path(job["dir"]) / "claims"

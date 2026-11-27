@@ -182,7 +182,9 @@ as they finish: its first line, e.g. `200/398 relaxations done, the last at 14:0
 for each with the count so far (`[14:02:11] 200/398  d555 ...: 432 atoms, 11 steps, 326 s`), so
 `tail -f` follows it. While it waits, `dwf.py` logs how many of the step's are done every 10
 minutes (`B2: 5,231/19,920 MACE relaxations done (26%); 50 jobs queued or running`). The jobs wait in the queue, and `--no-wait`,
-`--prepare-only` and the `STOP` file work, as for the CASTEP jobs. A foundation model is downloaded
+`--prepare-only` and the `STOP` file work, as for the CASTEP jobs. To see which jobs have ended, `dwf.py` reads the whole queue once a poll, in one
+`squeue` call (each job on its own with `status_cmd` or another scheduler), however many jobs it has
+recorded. A foundation model is downloaded
 where `dwf.py` runs and copied into `<workdir>/mace_models/`, where the compute nodes can read it.
 B2, C1 and C4 can each have settings of their own for these jobs, in `%block runner_scan`,
 `%block runner_prerelax` and `%block runner_distort` in `NAME.run` ([MACE](#mace)): B2 relaxes every
@@ -2560,6 +2562,11 @@ done, as with `--resubmit-failed` (`max_restarts : 0`) resubmitting the packs' c
 stopped with restarts held sent them on its next run as they were, without planning them again
 from their dry runs; and with job arrays (one calculation a task) the queue stayed at `max_jobs`
 too.
+
+The MACE jobs' queue reads were checked with a stand-in queue: one read a poll and no call for
+each job, also with 995 jobs of a run that had died recorded and never seen to end (the older
+`dwf.py` asked Slurm about each of them in turn before its first log line); with `squeue` failing,
+each job was asked about on its own, and the run finished the same.
 
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's cut on real energies (see 15 below), C4's search with the real MACE (see 8 below), real
