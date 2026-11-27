@@ -389,7 +389,8 @@ Every restart:
 
 - uses the longest walltime;
 - renames the old `.err` files;
-- plans the job again with the memory measured so far, so a badly placed job can move to a fuller layout or another partition.
+- plans the job again with the memory measured so far, so a badly placed job can move to a fuller layout or another partition;
+- in batch mode (`--batch`, and every CASTEP step of `dwf.py`), waits for a place under `max_jobs`: it is made ready at once, and sent as soon as there is room, before any job that hasn't run yet. A pack or job-array task that ran out of time restarts one job per calculation, so without this a round of packs reaching their time limit together could put many times `max_jobs` jobs in the queue (a size series, `--conv`, sends its restarts straight away, as it always has).
 
 The script stops with an explanation if a job made no progress, already had the longest
 walltime, and can't be given more processes.
@@ -578,7 +579,7 @@ directory, then `srun --nodes=1 --ntasks=n --cpus-per-task=c --exact --mem=...M`
 the template's CASTEP line - and `wait`. Each job's output, including `slurm-<job id>.out`, stays
 in its own directory, and its `job_info.json` records the pack. When fewer than N jobs are left
 they share the node evenly; a job left on its own is planned for whole nodes. A job that needs a
-restart runs on its own. The template's CASTEP line must use `srun`. With `array` as well, the
+restart runs on its own, when `max_jobs` leaves a place. The template's CASTEP line must use `srun`. With `array` as well, the
 packs go as job arrays, one pack a task (below).
 
 **Job arrays (`array : N`).** For thousands of jobs, on Slurm: the jobs waiting to go are
@@ -591,7 +592,7 @@ place of the CASTEP line it reads the task's directory and seed from `tasks.txt`
 `SLURM_ARRAY_TASK_ID` + 1: the directory, a tab, the seed), goes there and runs CASTEP on that
 seed, with the output in `slurm-<array job id>_<task>.out` there. Each job is recorded with its
 task's job id, `<array job id>_<task>`, so `squeue`, `sacct`, timings and restarts work as for a job
-of its own; a restart goes as a job of its own. `max_jobs` still counts every task, as Slurm does
+of its own; a restart goes as a job of its own, when `max_jobs` leaves a place. `max_jobs` still counts every task, as Slurm does
 against its per-user limits: the queue holds at most `max_jobs` tasks and is topped up with a new
 array once `array_min` places are free (by default a quarter of N, or of `max_jobs` if that is
 smaller; capped at N and `max_jobs`), or room for all the jobs left. A bigger `array_min` sends

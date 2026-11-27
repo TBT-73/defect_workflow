@@ -2139,7 +2139,8 @@ def write_inputs(calc, ctx, args):
 # with dryrun_pack : N, up to N of them go in one job (even_groups, submit_dryrun_pack). With
 # shared dry runs (batch mode), a calculation whose dry run would be the same as another's
 # (dryrun_key) gets a copy of that one instead of its own. show=False plans without logging each
-# plan. Returns False if --no-wait and dry runs are still queued.
+# plan. A calculation held for a restart (restart_ready: restart planned it already) is left as it
+# is. Returns False if --no-wait and dry runs are still queued.
 #   Called by: series_main(), run_batch()
 #   Calls:     Calc.done(), dryrun_output(), dryrun_script(), even_groups(), finalize(),
 #              local_dryrun(), prerelax_settings(), submit(), submit_dryrun_pack(), wait_for(),
@@ -2167,7 +2168,7 @@ def prepare_all(calcs, ctx, args, show=True):
 
     queued, leaders, send = [], {}, []
     for c in calcs:
-        if c.done() or c.info().get("jobid"):
+        if c.done() or c.info().get("jobid") or c.info().get("restart_ready"):
             continue
         info = c.info()                     # (re)write the inputs if prerelax was changed
         if "kgrid" not in info or info.get("prerelax") != (
@@ -3022,13 +3023,16 @@ def planning_dryrun(calc, ctx):
 # - for a single point, renames the .castep and starts again;
 # - renames the .err files, asks for the longest walltime (add_sbatch_option), sets a new run_time
 #   (run_time_for; the margin doubles if the job was killed), counts the restart in
-#   job_info.json and resubmits the job (submit).
+#   job_info.json and resubmits the job (submit); with defer (batch mode: handle_failure) it
+#   marks it restart_ready instead, without a job, and run_batch submits it when max_jobs leaves
+#   a place (so a pack or array that ran out of time, whose jobs restart one by one, can't put
+#   many more jobs in the queue than max_jobs).
 #   Called by: handle_failure()
 #   Calls:     Calc.err_files(), Calc.run_text(), add_sbatch_option(), calibrate(), cell_options(),
 #              file_size(), finalize(), killed_at_time_limit(), last_geometry(), planning_dryrun(),
 #              run_time_for(), sbatch_value(), set_param(), slurm_seconds(), submit(),
 #              write_cell()
-def restart(calc, args):
+def restart(calc, args, defer=False):
     """Resubmit a job that stopped before the end, when it can carry on:
      - CASTEP stopped itself at run_time: a relaxation carries on from its .check file
        (continuation : default);
@@ -3148,35 +3152,58 @@ def restart(calc, args):
     how = ("from its .check file" if use_check else
            f"from the structure of its last geometry step (step {steps})" if steps else
            "from the structure in its .cell file" if geom else "from the start")
-    log(f"{what} {why} - resubmitting it {how}" + (f" with walltime {tmax}" if tmax else ""))
+    log(f"{what} {why} - resubmitting it {how}" + (f" with walltime {tmax}" if tmax else "")
+        + (" when max_jobs leaves a place" if defer else ""))
     layout = [info.get(k) for k in ("nodes", "tasks_per_node", "ncores", "cpus_per_task",
                                     "partition")]
     if desc and layout != old_layout:
         log(f"  {calc.name} planned again (mem_replicated {args.mem_replicated:g}): {desc}")
-    submit(calc, args)
+    if defer:
+        hold_restart(calc)
+    else:
+        submit(calc, args)
     return True
+
+
+# Holds a job ready to go again (restart, or --resubmit-failed's resubmission of its job.sh) for
+# run_batch to submit when max_jobs leaves a place: restart_ready in job_info.json, and no job
+# id (so it is neither a job to wait for nor one to plan from its dry run again).
+#   Called by: handle_failure(), restart()
+def hold_restart(calc):
+    info = calc.info()
+    info.pop("jobid", None)
+    info["restart_ready"] = True
+    calc.save(info)
 
 
 # Deals with a job or dry run that left the queue without finishing (or wrote a .err file).
 # For a job, restart is tried first. Then, with --resubmit-failed, the existing jobscript is
-# resubmitted once (the old .castep and .err files are renamed). Otherwise the script stops with an
+# resubmitted once (the old .castep and .err files are renamed). In batch mode a job is not
+# submitted from here but held for run_batch (restart's defer, hold_restart), which sends it
+# within max_jobs. Otherwise the script stops with an
 # explanation: a relaxation that ran out of time with max_restarts : 0, one that reached
 # geom_max_iter, or anything else (with the end of the .castep and the .err files).
 #   Called by: wait_for()
-#   Calls:     Calc.err_files(), Calc.output(), Calc.run_text(), restart(), submit()
+#   Calls:     Calc.err_files(), Calc.output(), Calc.run_text(), hold_restart(), restart(),
+#              submit()
 def handle_failure(calc, args, resubmitted, key="jobid"):
     script = JOBSCRIPT if key == "jobid" else DRYRUN_SCRIPT
     what = f"{calc.name}{'' if key == 'jobid' else ' dry run'} (job {calc.info().get(key)})"
-    if key == "jobid" and args.max_restarts and restart(calc, args):
+    hold = key == "jobid" and bool((getattr(args, "ctx", None) or {}).get("batch"))
+    if key == "jobid" and args.max_restarts and restart(calc, args, defer=hold):
         return
     if args.resubmit_failed and calc.name not in resubmitted:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         for f in [calc.castep] + calc.err_files():
             if f.exists():
                 f.rename(f.with_name(f"{f.name}.failed-{stamp}"))
-        log(f"{what} failed - resubmitting the existing {script}")
+        log(f"{what} failed - resubmitting the existing {script}"
+            + (" when max_jobs leaves a place" if hold else ""))
         resubmitted.add(calc.name)
-        submit(calc, args, script, key)
+        if hold:
+            hold_restart(calc)
+        else:
+            submit(calc, args, script, key)
         return
     out = calc.output()
     seg = calc.run_text() if key == "jobid" else out
@@ -3207,7 +3234,8 @@ def handle_failure(calc, args, resubmitted, key="jobid"):
 # tolerate_failures a job handle_failure would stop the script for is marked failed instead
 # (mark_failed) and counts as finished. With array : N the queue is read once a poll for all the
 # jobs (queue_states) instead of a squeue call for each. progress (run_batch's) is called on every
-# poll, once the jobs have been checked.
+# poll, once the jobs have been checked. A job handle_failure held for a restart (restart_ready)
+# is no longer waited for, and wait_for returns, so run_batch can send it within max_jobs.
 #   Called by: series_main(), prepare_all(), run_batch()
 #   Calls:     Calc.done(), Calc.err_files(), dryrun_output(), handle_failure(), job_active(),
 #              mark_failed(), queue_states(), remove_check()
@@ -3219,7 +3247,7 @@ def wait_for(calcs, args, key="jobid", any_done=False, progress=None):
         is_done, what = (lambda c: c.done() or bool(c.peek().get("failed"))), ""
     else:
         is_done, what = (lambda c: dryrun_output(c) is not None), " dry run"
-    gone, resubmitted, announced = {c.name: 0 for c in calcs}, set(), False
+    gone, resubmitted, announced, held = {c.name: 0 for c in calcs}, set(), False, False
     stop = getattr(args, "stop_file", None)
     while True:
         if stop and stop.exists():
@@ -3253,11 +3281,14 @@ def wait_for(calcs, args, key="jobid", any_done=False, progress=None):
                         mark_failed(c, err)        # note it and carry on with the others
                         waiting.remove(c)
                     gone[c.name] = 0
+                    if c.peek().get("restart_ready"):   # back to run_batch, to go within max_jobs
+                        waiting.remove(c)
+                        held = True
             else:
                 gone[c.name] = 0
         if progress:
             progress()
-        if not waiting:
+        if not waiting or held:
             return True
         if any_done and len(waiting) < len(calcs):
             return True
@@ -3522,7 +3553,10 @@ def job_spec(job, base):
 # It works as the size series does: inputs, dry runs and plans first (prepare_all, at most max_jobs
 # dry-run jobs queued at once; with dryrun_pack : N, N dry runs to a job), then the jobs, submitted
 # at most max_jobs at a time, each planned again just before it goes (so it uses the timings and
-# memory measured so far), waited for (wait_for), restarted as usual. With pack : N, jobs planned on
+# memory measured so far), waited for (wait_for), restarted as usual - but a restart (restart,
+# from wait_for) is only prepared there and held (restart_ready), and goes from here, before any
+# new job, as a job of its own when max_jobs leaves a place: a pack or array task that ran out of
+# time restarts one job a calculation, and max_jobs holds for those too. With pack : N, jobs planned on
 # a share of a node go N at a time (or fewer, as evenly as the jobs left allow, each then getting
 # more of the node) in one job (submit_pack); one left on its own is planned again for whole nodes.
 # With charging : core, up to N jobs on part of a node go in one job, the first in the queue and
@@ -3669,10 +3703,13 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
                            + (f" ({failed:,} failed)" if failed else "")
                            + (f", the last at {now}" if new else ""), lines)
         busy = sum(1 for c in todo if not state[c.name] and c.peek().get("jobid"))
+        ready = sum(1 for c in todo if not state[c.name] and c.peek().get("restart_ready"))
         if busy and done != shown["done"] and time.time() - shown["time"] >= PROGRESS_EVERY:
             log(f"{name}: {done:,}/{len(todo):,} CASTEP calculations done "
                 f"({100 * done / len(todo):.0f}%)" + (f", {failed:,} failed" if failed else "")
-                + f"; {busy:,} queued or running (each listed in {pfile.name} as it finishes)")
+                + f"; {busy:,} queued or running"
+                + (f", {ready:,} restarts waiting for a place (max_jobs)" if ready else "")
+                + f" (each listed in {pfile.name} as it finishes)")
             shown.update(done=done, time=time.time())
 
     if args.resubmit_failed:                       # start failed jobs again from the beginning
@@ -3692,7 +3729,8 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
     measure_times(calcs, keys)                     # walltime : auto, from finished jobs
     for c in todo:                                 # delete_check : true
         remove_check(c, args)
-    unplanned = [c for c in todo if not finished(c) and not c.info().get("jobid")]
+    unplanned = [c for c in todo if not finished(c) and not c.info().get("jobid")
+                 and not c.info().get("restart_ready")]
     chunk = (args.max_jobs * args.dryrun_pack if args.max_jobs else len(unplanned)) or 1
     for k in range(0, len(unplanned), chunk):      # dry runs, at most max_jobs jobs at a time
         if not prepare_all(unplanned[k:k + chunk], ctx, args, show=False):
@@ -3771,8 +3809,18 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
         calibrate(calcs, keys, args)
         measure_times(calcs, keys)
         active = [c for c in todo if c.peek().get("jobid") and not finished(c)]
-        queue = [c for c in todo if not c.peek().get("jobid") and not finished(c)]
+        held = [c for c in todo if c.peek().get("restart_ready") and not finished(c)]
+        queue = [c for c in todo if not c.peek().get("jobid") and not finished(c)
+                 and not c.peek().get("restart_ready")]
         running = {c.peek()["jobid"] for c in active}          # jobs, not calculations
+        while held and (not args.max_jobs or len(running) < args.max_jobs):
+            c = held.pop(0)                    # restarts first: each a job of its own, planned
+            info = c.info()                    # by restart (a pack's restart on its own)
+            info.pop("restart_ready", None)
+            c.save(info)
+            submit(c, args)
+            running.add(c.info()["jobid"])
+            active.append(c)
         progress()
         if getattr(args, "array", 1) > 1:          # array : N - the queue as job arrays
             free = (args.max_jobs - len(running)) if args.max_jobs else len(queue)
@@ -3822,7 +3870,7 @@ def run_batch(workdir, jobs, args, cell_text, param_text, geom_param_text=None, 
             running.add(c.info()["jobid"])
         if not active:
             return results(True)
-        if not wait_for(active, args, any_done=bool(queue), progress=progress):
+        if not wait_for(active, args, any_done=bool(queue or held), progress=progress):
             return results(False)
 
 
@@ -7659,9 +7707,10 @@ def mace_python(p, step=None):
 
 # The MACE relaxations a step still needs (mace_relaxations), run as batch jobs on compute nodes, in
 # <phase>/jobs/mace_<step>/job_NNN/, with the step's MACE settings (mace_settings: the .run file's,
-# or its own block's, %block runner_scan or runner_prerelax). The relaxations are shared out
-# between at most mace_max_jobs jobs, biggest first, onto whichever job has the fewest atoms so
-# far. Each job is its mace_jobscript template with its {COMMAND} line made into up to mace_pack
+# or its own block's, %block runner_scan or runner_prerelax). At most mace_max_jobs jobs are queued
+# or running at once; the relaxations are shared out between as many new jobs as there are places
+# free, but no more than one per mace_pack relaxations (write_jobs), biggest first, onto whichever
+# job has the fewest atoms so far. Each job is its mace_jobscript template with its {COMMAND} line made into up to mace_pack
 # workers, each running  <python> dwf.py --mace-worker tasks.json  (the python from mace_python())
 # in the background with mace_threads threads (whatever is in front of {COMMAND} on its line, e.g.
 # srun ..., goes in front of each), then wait; a {NCORES} in the template becomes the cores those
@@ -7675,16 +7724,21 @@ def mace_python(p, step=None):
 # jobs.json there; waiting polls Slurm's queue (status_cmd) every poll seconds, like the CASTEP
 # jobs, and the project's STOP file stops it; every PROGRESS_EVERY seconds the log says how
 # many of the step's relaxations are done (done_before: those done before this call, which aren't
-# in todo), and each job's progress.txt how many of its own are (mace_progress). A
-# relaxation still missing once its job has ended (e.g. it ran out of time) goes into a new job, at
-# most MACE_ATTEMPTS times; then the run stops, with how the last of its jobs ended (why_ended).
-# --resubmit-failed gives those relaxations another MACE_ATTEMPTS jobs. Returns True when every
+# in todo), and each job's progress.txt how many of its own are (mace_progress). The relaxations
+# a job leaves (e.g. it ran out of time) wait for a place to come free and go into the next jobs,
+# packed into as few as there are places. One that a worker had started (its claim file:
+# claim_file) but not finished counts an attempt when its job ends; every one the job left counts,
+# if it started none (a job that can't run at all). At MACE_ATTEMPTS the run stops, with how the
+# last of its jobs ended (why_ended); --resubmit-failed gives those relaxations another
+# MACE_ATTEMPTS. (A job written by an older dwf.py counted an attempt for each of its relaxations
+# when it was submitted, and is left at that.) Returns True when every
 # relaxation is done, False while jobs are queued (--no-wait) or after --prepare-only (the job
 # scripts are then in prepared/).
 #   Called by: mace_relaxations()
 #   Calls:     Project.mace_model_file(), Project.mace_runner(), Project.mace_settings(),
-#              Project.mace_template(), Project.model_path(), atoms_to_dict(), mace_cached(),
-#              mace_python(), add_sbatch_option(), job_active(), send_job(), write_json()
+#              Project.mace_template(), Project.model_path(), atoms_to_dict(), claim_file(),
+#              mace_cached(), mace_python(), add_sbatch_option(), job_active(), send_job(),
+#              write_json()
 def mace_jobs(p, step, todo, done_before=0):
     args = p.mace_runner()
     d = p.phase_dir(STEP_INDEX[step].phase) / "jobs" / f"mace_{step}"
@@ -7730,10 +7784,11 @@ def mace_jobs(p, step, todo, done_before=0):
         return "its workers' logs and Slurm output are empty"
 
     # Writes the scripts of new jobs for some relaxations into a folder each (job.sh and the job's
-    # queue, tasks.json, biggest first, which its workers share); returns
+    # queue, tasks.json, biggest first, which its workers share): at most places jobs, and no more
+    # than one per mace_pack relaxations, so a few left over don't become many small jobs; returns
     # [(folder, [cache files])].
-    def write_jobs(tasks, where):
-        n_jobs = min(run.mace_max_jobs, math.ceil(len(tasks) / pack))
+    def write_jobs(tasks, where, places):
+        n_jobs = max(1, min(places, math.ceil(len(tasks) / pack)))
         shares = [{"tasks": [], "atoms": 0} for _ in range(n_jobs)]
         for t in sorted(tasks, key=lambda t: -len(t["atoms"])):
             s = min(shares, key=lambda s: s["atoms"])
@@ -7781,46 +7836,59 @@ def mace_jobs(p, step, todo, done_before=0):
             if announced:
                 log(f"{label}: the MACE jobs have finished ({total:,}/{total:,} relaxations done)")
             return True
+        missing = {str(t["cache"]): t["key"] for t in left}
         for job in state["jobs"]:
             if not job.get("ended") and ended(job):
                 job["ended"] = True
+                if job.get("count") == "end":          # (an older dwf.py's counted at submission)
+                    claims = Path(job["dir"]) / "claims"
+                    gone = [c for c in job["caches"]   # (read again: it may have finished since)
+                            if c in missing and mace_cached(c, missing[c]) is None]
+                    started = claims.is_dir() and any(claims.iterdir())
+                    for c in gone:
+                        if not started or claim_file(claims, Path(c).resolve()).exists():
+                            state["tries"][c] = state["tries"].get(c, 0) + 1
         active = [j for j in state["jobs"] if not j.get("ended")]
         busy = {c for j in active for c in j["caches"]}
         new = [t for t in left if str(t["cache"]) not in busy]
+        places = run.mace_max_jobs - len(active)       # (mace_max_jobs queued or running at most)
         if new:
             worn = [t for t in new if state["tries"].get(str(t["cache"]), 0) >= MACE_ATTEMPTS]
             if worn:
                 names, caches = [t["label"] for t in worn], {str(t["cache"]) for t in worn}
                 last = next((Path(j["dir"]) for j in reversed(state["jobs"])
                              if caches & set(j["caches"])), None)
+                write_json(state_file, state)          # (the attempts, for --resubmit-failed)
                 die(f"{label}: the MACE jobs ended {MACE_ATTEMPTS} times without these "
                     f"relaxations: {', '.join(names[:8])}"
                     + (f" and {len(names) - 8} more" if len(names) > 8 else "")
                     + (f". The last of their jobs, {last.name}: {why_ended(last)}" if last else "")
                     + f". The workers' logs and Slurm output are in {d}/job_*/; once the cause is "
                     "fixed, rerun with --resubmit-failed")
-            if p.cl.prepare_only:
-                shutil.rmtree(d / "prepared", ignore_errors=True)
-                write_jobs(new, lambda j: d / "prepared" / f"job_{j + 1:03d}")
-                log(f"{label}: the scripts of the MACE jobs for {len(new)} relaxations are in "
-                    f"{d / 'prepared'} - check them, then rerun without --prepare-only")
-                return False
+        if new and p.cl.prepare_only:
+            shutil.rmtree(d / "prepared", ignore_errors=True)
+            write_jobs(new, lambda j: d / "prepared" / f"job_{j + 1:03d}", run.mace_max_jobs)
+            log(f"{label}: the scripts of the MACE jobs for {len(new)} relaxations are in "
+                f"{d / 'prepared'} - check them, then rerun without --prepare-only")
+            return False
+        if new and places > 0:
             first = 1 + max([int(x.name[4:]) for x in d.glob("job_*") if x.name[4:].isdigit()],
                             default=0)
-            for jdir, caches in write_jobs(new, lambda j: d / f"job_{first + j:03d}"):
+            for jdir, caches in write_jobs(new, lambda j: d / f"job_{first + j:03d}", places):
                 jobid = send_job(jdir, "job.sh", args)
                 state["jobs"].append({"jobid": jobid, "dir": str(jdir), "caches": caches,
-                                      "time": time.time()})
-                for c in caches:
-                    state["tries"][c] = state["tries"].get(c, 0) + 1
+                                      "time": time.time(), "count": "end"})
                 log(f"{label}: submitted MACE job {jobid} ({jdir.name}: {len(caches)} "
                     f"relaxation{'s' if len(caches) > 1 else ''})")
             write_json(state_file, state)
             continue
+        waiting = len(new)                             # (no place free for them yet)
         write_json(state_file, state)
         if p.cl.no_wait:
             log(f"{label}: {len(left)} MACE relaxations still queued or running (jobs "
-                + ", ".join(j["jobid"] for j in active) + "); rerun the same command later")
+                + ", ".join(j["jobid"] for j in active) + ")"
+                + (f", {waiting} of them waiting for a place (mace_max_jobs "
+                   f"{run.mace_max_jobs})" if waiting else "") + "; rerun the same command later")
             return False
         if stop.exists():
             stop.unlink()
@@ -7835,17 +7903,26 @@ def mace_jobs(p, step, todo, done_before=0):
         done = total - len(left)
         if done != last_done and time.time() - last_time >= PROGRESS_EVERY:
             log(f"{label}: {done:,}/{total:,} MACE relaxations done ({100 * done / total:.0f}%); "
-                f"{len(active)} job{'s' if len(active) != 1 else ''} queued or running")
+                f"{len(active)} job{'s' if len(active) != 1 else ''} queued or running"
+                + (f", {waiting:,} relaxations waiting for a place" if waiting else ""))
             last_done, last_time = done, time.time()
         time.sleep(args.poll)
 
 
+# A relaxation's claim file in a MACE job's claims/ folder (cache: its cache file, as the job's
+# tasks.json names it, resolved).
+#   Called by: mace_claim(), mace_jobs()
+def claim_file(folder, cache):
+    return Path(folder) / hashlib.md5(str(cache).encode()).hexdigest()[:16]
+
+
 # Takes a relaxation of a MACE job's queue for this worker: creates its claim file in the job's
-# claims/ folder, which only one worker can do (O_CREAT | O_EXCL is atomic, Lustre's too).
-# Returns whether this worker got it.
+# claims/ folder (claim_file), which only one worker can do (O_CREAT | O_EXCL is atomic, Lustre's
+# too). Returns whether this worker got it.
 #   Called by: mace_worker()
+#   Calls:     claim_file()
 def mace_claim(folder, cache):
-    f = folder / hashlib.md5(str(cache).encode()).hexdigest()[:16]
+    f = claim_file(folder, cache)
     try:
         fd = os.open(f, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:

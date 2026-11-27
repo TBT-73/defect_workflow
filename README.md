@@ -153,24 +153,31 @@ mix: start that step again with `--redo STEP` (its old folders are kept, renamed
 
 **The CASTEP jobs** all go through the job runner (`run_batch`), which plans each job (dry run,
 cores or nodes, memory, walltime), submits it, waits and restarts a relaxation that runs out of
-time.
+time, never with more than `max_jobs` jobs queued or running: a restart waits for a place, so a
+pack (or array task) that ran out of time, whose calculations restart one job each, can't fill the
+queue.
 Every step uses its batch mode, which runs the structures `dwf.py` builds.
 
 **The MACE jobs.** With `mace_jobscript`, the MACE relaxations (B2, C1, C4) run as Slurm jobs made
 from that template: its `{COMMAND}` line becomes up to `mace_pack` workers side by side
 (default `cores_per_node` / `mace_threads`: 36 on Cirrus, 16 on ARCHER2), each running
-`python3 dwf.py --mace-worker tasks.json` with `mace_threads` threads. The relaxations are shared
-out between at most `mace_max_jobs` jobs, biggest first, and a job's workers share its queue,
+`python3 dwf.py --mace-worker tasks.json` with `mace_threads` threads. At most `mace_max_jobs` jobs
+are queued or running at once, the relaxations are shared out between them, biggest first, and a
+job's workers share its queue,
 `tasks.json`: each takes the next relaxation no other worker has taken (a claim file in the job's
 `claims/`), until none are left. A job holds its node until its last worker ends, so this keeps
 the node busy to the end: with a list fixed for each worker beforehand, the node waited for the
 slowest list, as a relaxation's cost goes with its steps, which nothing knows in advance. A `{NCORES}` in the template becomes
 the cores the job's workers use (workers × `mace_threads`), so on Cirrus a job asks for, and is
 charged for, just those. Each result goes into its own cache file as soon as it is done, so a job
-that runs out of time loses only the relaxations it hadn't finished: they go into a new job, three
-times at most. After that the run stops and says how the last of those jobs ended (Slurm's time
-limit, or the last line of a worker's log, e.g. a Python error); once that is fixed,
-`--resubmit-failed` gives them three more jobs. Each job's `progress.txt` counts its relaxations
+that runs out of time loses only the relaxations it hadn't finished. They wait for a place to come
+free and go into the next jobs, packed into as few as there are places (and no more than one job
+per `mace_pack` relaxations), so a whole round of jobs that reach their time limit together
+becomes a new round of as many jobs, not hundreds of small ones. A relaxation that a worker had
+started but not finished (its claim file) counts an attempt; every one a job left counts, if it
+started none (a job that can't run at all, e.g. a Python it can't find). After three, the run
+stops and says how the last of those jobs ended (Slurm's time limit, or the last line of a
+worker's log, e.g. a Python error); once that is fixed, `--resubmit-failed` gives them three more. Each job's `progress.txt` counts its relaxations
 as they finish: its first line, e.g. `200/398 relaxations done, the last at 14:02:11`, then a line
 for each with the count so far (`[14:02:11] 200/398  d555 ...: 432 atoms, 11 steps, 326 s`), so
 `tail -f` follows it. While it waits, `dwf.py` logs how many of the step's are done every 10
@@ -1550,7 +1557,7 @@ candidate in every size are by far the most, `%block runner_prerelax` for C1 and
 | `mace_threads` | `8` | — | In `NAME.run`. Torch threads per relaxation. |
 | `mace_jobscript` | — | — | In `NAME.run`. A Slurm template (a file, or `%block mace_jobscript`) for running the MACE relaxations (B2, C1, C4) as jobs on compute nodes. It needs one line with `{COMMAND}`, which becomes the workers; whatever is in front of it on that line (e.g. `srun --exact --ntasks=1 --cpus-per-task=8`) goes in front of each. `{JOBNAME}` is filled in too. Without it, the relaxations run where `dwf.py` runs. See [section 7](#7-the-mace-jobscript-template-mace_jobscript). |
 | `mace_pack` | `cores_per_node` / `mace_threads` | — | In `NAME.run`. Relaxations side by side in one MACE job (36 on Cirrus, 16 on ARCHER2, with 8 threads each). |
-| `mace_max_jobs` | `4` | — | In `NAME.run`. The most MACE jobs a step's relaxations are shared out between (biggest first). |
+| `mace_max_jobs` | `4` | — | In `NAME.run`. The most MACE jobs a step has queued or running at once; its relaxations are shared out between them, biggest first, and what a job leaves (it ran out of time) goes into the next jobs as places come free. Give the jobs time for their share (`max_walltime` in the step's block): a round that runs out leaves most of its relaxations to the next. |
 | `mace_python` | the Python running `dwf.py` | — | In `NAME.run`. The Python the MACE jobs run, with mace-torch. On Cirrus and ARCHER2 it must be on `/work`. A linked folder in its path (e.g. a `~/shared` that links to `/work/...`) is followed, so the jobs get the `/work` path. |
 | `%block runner_scan` | — | B2 | In `NAME.run`. B2's own settings for its MACE jobs, over those above: any of `mace_jobscript`, `mace_pack`, `mace_max_jobs`, `mace_threads`, `mace_python` and `mace_device`, and `max_walltime`, each job's `--time` (without it, the template's). B2 relaxes every candidate in every size it fits, thousands of relaxations for a big screen, so e.g. `mace_max_jobs : 40` with `max_walltime : 12:00:00`. Its `mace_pack` × `mace_threads` must fit on a node (`cores_per_node`). |
 | `%block runner_prerelax` | — | C1 | In `NAME.run`. The same for C1's MACE jobs (the relaxations C1 runs itself: all of them when the screening cell isn't one of B2's sizes). |
@@ -2533,6 +2540,26 @@ the defect move (7 there), the same rattle gives the same relaxation, and a MACE
 applies it from `tasks.json` as a relaxation here does; and with the B2 to C1 stand-in above: every
 first relaxation rattled and no re-seeded one, C1 still reading B2's relaxations in a size of the
 ladder, and a rerun of B2 reusing every one.
+
+The MACE jobs' limit was checked with Slurm and the workers stood in for: 120 relaxations,
+`mace_max_jobs` 4 and `mace_pack` 5, every job reaching its time limit after 12 relaxations with 3
+more started. Never more than 4 jobs were queued at once, the leftovers went into rounds of 4 jobs
+(30, then about 19, then about 6 relaxations each), and an attempt was counted for exactly the
+relaxations started and not finished; jobs that started nothing stopped the run after three, with
+the attempts kept for `--resubmit-failed`, which then finished them; and a job of the older
+`dwf.py` (its attempts counted when it was submitted) was not counted again. (The older `dwf.py`
+gave each finished job's leftovers up to `mace_max_jobs` new jobs of `mace_pack` relaxations, on
+top of those still queued: 50 jobs that reached a 4-hour limit together became 995 jobs of about
+20, until Slurm's job limit stopped the run.)
+
+The CASTEP runner's restarts were checked the same way, through `run_batch` with Slurm and CASTEP
+stood in for: 30 single points in packs of 5, `max_jobs` 3, every pack running out of time once.
+The older `dwf.py` restarted each pack's calculations straight away, one job each, and had 15 jobs
+queued at once; now the restarts waited for places and there were never more than 3, with all 30
+done, as with `--resubmit-failed` (`max_restarts : 0`) resubmitting the packs' calculations. A run
+stopped with restarts held sent them on its next run as they were, without planning them again
+from their dry runs; and with job arrays (one calculation a task) the queue stayed at `max_jobs`
+too.
 
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's cut on real energies (see 15 below), C4's search with the real MACE (see 8 below), real
