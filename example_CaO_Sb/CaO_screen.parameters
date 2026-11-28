@@ -132,7 +132,9 @@ screen_spins     : triplet     # the starting spin: triplet (a doublet for an od
 screen_cutoff   : 500 eV      # a lower cut-off for screening (default: production)
 screen_max_steps : 50          # geometry steps per screening relaxation
 %block screen_overrides        # any other .param keywords for the screening runs, and for
-                               #   A3.1's phases
+                               #   A3.1's phases (C2's and C3's runs already have
+                               #   write_checkpoint : none, write_cst_esp : false and
+                               #   finite_basis_corr : 0; set them here to change that)
 elec_energy_tol : 1e-5
 !fine_gmax : 35 1/ang          # a finer density grid, only if A3.1 relaxes cells (ref_relax
                                #   : cell) at a low screen_cutoff and they keep reverting, as a

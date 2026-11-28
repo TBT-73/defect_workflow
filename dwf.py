@@ -10273,6 +10273,25 @@ def screen_job(p, name, atoms, info, q, S):
             "overrides": o}
 
 
+# The .param keywords that keep a screening run's files small, for the runs nothing carries on
+# from (C2's relaxations and pristine cell, screen_levelless's single points, C3's band-state
+# single points): no .check, .check_bak or .castep_bin (write_checkpoint : none; several GB each
+# for a few hundred atoms, rewritten during a relaxation), no .cst_esp, and no finite basis set
+# correction (finite_basis_corr : 0: its extra SCFs at lower cut-offs only correct the stress, which
+# a fixed cell doesn't use, and the corrected total energy, which nothing reads). A relaxation that
+# runs out of time carries on from its last geometry step instead of a .check (restart). C5, C6,
+# C7 and the production runs keep theirs: their restarts and C7's excited states start from them.
+SCREEN_LEAN = {"write_checkpoint": "none", "write_cst_esp": "false", "finite_basis_corr": "0"}
+
+
+# A job (screen_job's, or the pristine cell's) with SCREEN_LEAN under its own .param keywords:
+# %block screen_overrides, already in them, can set any of these itself.
+#   Called by: step_filter(), step_screen()
+def lean(job):
+    job["overrides"] = dict(SCREEN_LEAN, **job["overrides"])
+    return job
+
+
 # What a finished screening-type job gave: energy (None unless the last SCF converged), whether
 # its geometry converged, final spin, defect levels in the gap and the electrons or holes it left in
 # the bands (both from its .bands against the host's band edges at the same settings), and its
@@ -10461,16 +10480,17 @@ def step_prerelax(p):
 # names them), which the Gamma-point levels are measured against.
 #   Called by: main() (step C2)
 #   Calls:     Project.batch(), Project.production_param(), band_edges(), edge_states(),
-#              host_supercell(), is_native(), job_summary(), levelless_table(), load_cell(),
-#              problem_table(), qtag(), read_bands(), screen_job(), screen_overrides(),
+#              host_supercell(), is_native(), job_summary(), lean(), levelless_table(),
+#              load_cell(), problem_table(), qtag(), read_bands(), screen_job(), screen_overrides(),
 #              screen_setup(), spin_states(), start_spin()
 def step_screen(p):
     cands, prim, P = screen_setup(p)
     d = p.phase_dir("C")
     defects = p.out("prerelax")["defects"]
     host = host_supercell(prim, P)
-    jobs = [{"name": "host", "atoms": host, "kind": "sp", "kgrid": [1, 1, 1], "symmetry": True,
-             "overrides": {k: v for k, v in screen_overrides(p).items() if k != "geom_max_iter"}}]
+    jobs = [lean({"name": "host", "atoms": host, "kind": "sp", "kgrid": [1, 1, 1], "symmetry": True,
+                  "overrides": {k: v for k, v in screen_overrides(p).items()
+                                if k != "geom_max_iter"}})]
     plan, structures = {}, {}
     host_el = set(prim.get_chemical_symbols())
     first = {cid for cid in defects if p.s.screen_levelless == "neutral"
@@ -10482,7 +10502,7 @@ def step_screen(p):
             structures[cid] = load_cell(p, defects[cid]["structure"])
         for S in spin_states(structures[cid], q, p.s.screen_spins):
             name = f"{cid}_{qtag(q)}_s{S}"
-            jobs.append(screen_job(p, name, structures[cid], defects[cid], q, S))
+            jobs.append(lean(screen_job(p, name, structures[cid], defects[cid], q, S)))
             plan[name] = {"cand": cid, "q": q, "spin_start": S}
 
     for cid in defects:
@@ -10540,7 +10560,8 @@ def step_screen(p):
         for cid, r in sorted(probe.items()):
             atoms = load_cell(p, r["structure"])
             name = f"{cid}_q0_bw"
-            job = screen_job(p, name, atoms, defects[cid], 0, start_spin(atoms, 0, r["spin"]))
+            job = lean(screen_job(p, name, atoms, defects[cid], 0,
+                                  start_spin(atoms, 0, r["spin"])))
             job.update(kind="sp", overrides=dict(job["overrides"], pdos_calculate_weights="true"))
             sp.append(job)
             which[name] = (cid, len(atoms))
@@ -10879,8 +10900,8 @@ def band_state_test(p, r, calc, nat, host):
 #   Called by: main() (step C3)
 #   Calls:     Project.batch(), Project.production_param(), band_state_test(), best_states(),
 #              carriers_text(), correction(), duplicates(), format_table(), host_supercell(),
-#              in_band(), internal_pair(), is_native(), load_cell(), qtag(), relative_formation(),
-#              screen_job(), screen_setup(), site_distance(), start_spin()
+#              in_band(), internal_pair(), is_native(), lean(), load_cell(), qtag(),
+#              relative_formation(), screen_job(), screen_setup(), site_distance(), start_spin()
 def step_filter(p):
     cands, prim, P = screen_setup(p)
     scr = p.out("screen")
@@ -11010,8 +11031,8 @@ def step_filter(p):
                 continue
             atoms = load_cell(p, src["structure"])
             name = f"{cid}_{qtag(q)}_bw"
-            job = screen_job(p, name, atoms, p.out("prerelax")["defects"][cid], q,
-                             start_spin(atoms, q, src["spin"]))
+            job = lean(screen_job(p, name, atoms, p.out("prerelax")["defects"][cid], q,
+                                  start_spin(atoms, q, src["spin"])))
             job.update(kind="sp", overrides=dict(job["overrides"], pdos_calculate_weights="true"))
             jobs.append(job)
             which[name] = (cid, q, len(atoms))
@@ -14436,7 +14457,9 @@ screen_spins     : triplet     # the starting spin: triplet (a doublet for an od
 !screen_cutoff   : 500 eV      # a lower cut-off for screening (default: production)
 screen_max_steps : 50          # geometry steps per screening relaxation
 %block screen_overrides        # any other .param keywords for the screening runs, and for
-                               #   A3.1's phases
+                               #   A3.1's phases (C2's and C3's runs already have
+                               #   write_checkpoint : none, write_cst_esp : false and
+                               #   finite_basis_corr : 0; set them here to change that)
 elec_energy_tol : 1e-5
 !fine_gmax : 35 1/ang          # a finer density grid, only if A3.1 relaxes cells (ref_relax
                                #   : cell) at a low screen_cutoff and they keep reverting, as a

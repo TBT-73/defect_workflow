@@ -984,6 +984,18 @@ means band edges that don't fold onto Γ of this cell (B3 says which), and C2 wa
 goes on with these Γ-point results, as ADAQ's does: there is no check of the levels' spread on a
 k-point grid (the old C2b).
 
+C2's runs (and the single points of `screen_levelless` and of C3's band-state test) write no
+`.check`, `.check_bak` or `.castep_bin` (`write_checkpoint : none`) and no `.cst_esp`
+(`write_cst_esp : false`): nothing carries on from them, and a few hundred atoms' `.check` is
+several GB, rewritten as a relaxation goes, so a few hundred jobs at once fill a quota. They keep
+their `.bands`, `.geom`, `.castep` (and `.pdos_weights`), a few MB a relaxation. One that runs out
+of time carries on from its last geometry step instead of a `.check`. Nor do they make the finite
+basis set correction (`finite_basis_corr : 0`, whatever the production `.param` says): its extra
+SCFs at lower cut-offs correct only the stress, which a fixed cell doesn't use, and a corrected
+total energy, which nothing reads (the `Final energy` lines are the same either way). `%block
+screen_overrides` can set any of these itself. C5–C7 and the production runs keep their `.check`
+files: their restarts, and C7's excited states, start from them.
+
 With `screen_levelless : neutral`, C2 first screens every candidate's neutral state (with the
 pristine cell), and screens a *level-less* one in nothing else. A candidate is level-less when its
 neutral run has no gap level and leaves nothing in the bands, and a single point of its relaxed
@@ -1697,7 +1709,7 @@ phase D redoes the survivors properly. The screening settings (`screen_cutoff`, 
 | `screen_spins` | `triplet` | C2 | The starting spin (unpaired electrons): `triplet` runs once from 2, or from 1 (a doublet) when the electron count is odd; `low` runs once from the lowest the electron count allows (0 or 1); `both` runs from that and from that + 2. A starting value: the results keep the final spin. |
 | `screen_cutoff` | the production cut-off | A3.1, C2, C3, C5, C6, C7 | The cut-off of the screening runs, and of A3.1's reference phases, so that their energies are on one scale. |
 | `screen_max_steps` | `50` | C2, C5, C6, C7 | `geom_max_iter` of the screening relaxations. A run that reaches it is logged as failed but keeps its last energy, marked as not converged. |
-| `%block screen_overrides` | — | A3.1, C2, C3, C5, C6, C7 | Any other `.param` keywords for the screening runs (and A3.1's phases), e.g. a looser `elec_energy_tol`, or `fine_gmax : 35 1/ang`, a finer density grid, for hard ultrasoft potentials at a low `screen_cutoff` (a phase's cell relaxation whose energy jumps as the grid changes, and never converges): only with `ref_relax : cell`, as it costs much memory in the screening cells. |
+| `%block screen_overrides` | — | A3.1, C2, C3, C5, C6, C7 | Any other `.param` keywords for the screening runs (and A3.1's phases), e.g. a looser `elec_energy_tol`, or `fine_gmax : 35 1/ang`, a finer density grid, for hard ultrasoft potentials at a low `screen_cutoff` (a phase's cell relaxation whose energy jumps as the grid changes, and never converges): only with `ref_relax : cell`, as it costs much memory in the screening cells. C2's runs and C3's band-state single points default to `write_checkpoint : none`, `write_cst_esp : false` and `finite_basis_corr : 0` (C2 above); set them here to change that. |
 | `level_margin` | `0.1 eV` | C2, C3, C5, C6, C7 | How far inside the host's band edges (from the pristine cell at the same settings) an eigenvalue must lie to count as a defect level in the gap. Anything closer to an edge, or past it, is in a band: the electrons and holes there make a run a band state (at least 0.5 of either), which C3 doesn't judge by its energy. The eigenvalues aren't aligned to the host's, so raise it if a defect cell's band edges sit visibly off the host's. |
 | `hull_margin` | `0.2 eV` | C3 | Keep an arrangement if its lowest formation energy comes within this of its composition group's defect hull somewhere in the gap. Allow for the error of the screening settings. |
 | `site_margin` | `0.5 eV` | C3 | Keep a defect with dopant atoms if its formation energy comes within this of the lowest of the defects with the same dopant atoms (on any site, with any host atoms added or removed) somewhere in the host's stability region and the gap: the dopant's chemical potential cancels between them. The region is A3.2's, against the host's elements alone; each such set keeps at least its lowest. Needs A3's phases. Native defects aren't compared so. |
@@ -2677,6 +2689,16 @@ CASTEP's default fine grid (22.9 1/Å there) for a 320-atom cell, 10.9 against 4
 atoms, and 3.4 against 1.7 GB for 64, most of it the per-atom data on the fine grid. Single points
 and fixed-cell relaxations don't change the grid, so the examples now leave it out (A3.1's
 phases have been single points by default since `ref_relax`).
+
+C2's lighter runs were checked with CASTEP 25.12 on a CaO cell: by default a relaxation wrote a
+`.check`, a `.check_bak`, a `.castep_bin` and a `.cst_esp`; with `write_checkpoint : none` and
+`write_cst_esp : false`, only its `.bands`, `.geom`, `.castep` and `.bib`, and a single point its
+`.pdos_weights` too. With `finite_basis_corr : automatic` a single point ran SCFs at 389, 394.5 and
+400 eV (48 SCF cycles against 18) for the same 400 eV `Final energy` (to 10⁻⁷ eV), the corrected
+total on a line of its own. C2's stand-in jobs (the pristine cell, the relaxations, the single
+points with the band weights) all got the three keywords, `%block screen_overrides` won over them,
+and a production `.param` with `finite_basis_corr   automatic` was written with `: 0` in its
+place.
 
 Not tested: real Cirrus jobs (see 10 below), `phases_from : doped` (no Materials Project access
 here), C3's cut on real energies (see 15 below), C4's search with the real MACE (see 8 below), real
